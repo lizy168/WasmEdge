@@ -2,10 +2,32 @@
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
 #include "linker/link_graph.h"
+#include "linker/object_reader.h"
 
 #include <gtest/gtest.h>
 
+#include <llvm/Config/llvm-config.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Module.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Support/CodeGen.h>
+#if LLVM_VERSION_MAJOR >= 19
+#include <llvm/TargetParser/Host.h>
+#else
+#include <llvm/Support/Host.h>
+#endif
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Target/TargetOptions.h>
+
+#include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -13,6 +35,86 @@
 namespace {
 
 using namespace WasmEdge::LLVM::Linker;
+
+std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
+  static const bool Initialized = [] {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    return true;
+  }();
+  (void)Initialized;
+  const llvm::Triple Triple(llvm::sys::getDefaultTargetTriple());
+  std::string Error;
+  const llvm::Target *NativeTarget =
+      llvm::TargetRegistry::lookupTarget(Triple.str(), Error);
+  EXPECT_NE(NativeTarget, nullptr) << Error;
+  if (NativeTarget == nullptr) {
+    return {};
+  }
+  llvm::TargetOptions Options;
+  std::unique_ptr<llvm::TargetMachine> Machine(
+      NativeTarget->createTargetMachine(
+#if LLVM_VERSION_MAJOR >= 21
+          Triple,
+#else
+          Triple.str(),
+#endif
+          "generic", "", Options, llvm::Reloc::PIC_));
+  EXPECT_NE(Machine, nullptr);
+  if (Machine == nullptr) {
+    return {};
+  }
+
+  llvm::LLVMContext Context;
+  llvm::Module Module("object-reader-test", Context);
+#if LLVM_VERSION_MAJOR >= 21
+  Module.setTargetTriple(Triple);
+#else
+  Module.setTargetTriple(Triple.str());
+#endif
+  Module.setDataLayout(Machine->createDataLayout());
+  auto *I32 = llvm::Type::getInt32Ty(Context);
+  auto *Value = new llvm::GlobalVariable(
+      Module, I32, false, llvm::GlobalValue::ExternalLinkage,
+      Undefined ? nullptr : llvm::ConstantInt::get(I32, 7), "value");
+  auto *Zero = new llvm::GlobalVariable(Module, I32, false,
+                                        llvm::GlobalValue::InternalLinkage,
+                                        llvm::ConstantInt::get(I32, 0), "zero");
+  Zero->setAlignment(llvm::Align(16));
+  auto *F0 =
+      llvm::Function::Create(llvm::FunctionType::get(I32, false),
+                             llvm::GlobalValue::ExternalLinkage, "f0", Module);
+  llvm::IRBuilder<> Builder(llvm::BasicBlock::Create(Context, "entry", F0));
+  Builder.CreateRet(Builder.CreateLoad(I32, Value));
+
+  llvm::SmallVector<char, 0> Storage;
+  llvm::raw_svector_ostream Stream(Storage);
+  llvm::legacy::PassManager Passes;
+#if LLVM_VERSION_MAJOR >= 18
+  const auto FileType = llvm::CodeGenFileType::ObjectFile;
+#else
+  const auto FileType = llvm::CGFT_ObjectFile;
+#endif
+  EXPECT_FALSE(Machine->addPassesToEmitFile(Passes, Stream, nullptr, FileType));
+  Passes.run(Module);
+  return std::vector<WasmEdge::Byte>(Storage.begin(), Storage.end());
+}
+
+Target nativeTarget() {
+#if defined(__x86_64__) || defined(_M_X64)
+  return Target::X86_64;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  return Target::AArch64;
+#elif defined(__arm__) || defined(_M_ARM)
+  return Target::ARM;
+#elif defined(__riscv) && __riscv_xlen == 64
+  return Target::RISCV64;
+#elif defined(__s390x__)
+  return Target::S390X;
+#else
+#error Unsupported test host
+#endif
+}
 
 static_assert(sizeof(Target) == sizeof(uint8_t));
 static_assert(sizeof(Endianness) == sizeof(uint8_t));
@@ -306,6 +408,69 @@ TEST(LinkGraphTest, SectionOffsetsDefaultToZero) {
   EXPECT_EQ(Value.Address, 0U);
   EXPECT_EQ(Value.FileOffset, 0U);
   EXPECT_EQ(Value.VirtualSize, 0U);
+}
+
+TEST(ObjectReaderTest, RejectsMalformedBytes) {
+  const std::vector<WasmEdge::Byte> Bytes{0x01, 0x02, 0x03, 0x04};
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, NormalizesNativeObject) {
+  const auto Bytes = makeNativeObject();
+  auto Result = ObjectReader::read(Bytes, nativeTarget());
+  ASSERT_TRUE(Result);
+  EXPECT_EQ(Result->target(), nativeTarget());
+#if defined(__s390x__)
+  EXPECT_EQ(Result->endianness(), Endianness::Big);
+#else
+  EXPECT_EQ(Result->endianness(), Endianness::Little);
+#endif
+  EXPECT_FALSE(Result->sections().empty());
+  const auto Text =
+      std::find_if(Result->sections().begin(), Result->sections().end(),
+                   [](const Section &Value) { return Value.Name == ".text"; });
+  ASSERT_NE(Text, Result->sections().end());
+  EXPECT_EQ(Text->Kind, SectionKind::Text);
+  EXPECT_EQ(Text->VirtualSize, Text->Content.size());
+  EXPECT_GT(Text->Alignment, 0U);
+  const auto Bss = std::find_if(
+      Result->sections().begin(), Result->sections().end(),
+      [](const Section &Value) { return Value.Kind == SectionKind::BSS; });
+  ASSERT_NE(Bss, Result->sections().end());
+  EXPECT_TRUE(Bss->Content.empty());
+  EXPECT_GE(Bss->VirtualSize, 4U);
+  EXPECT_GE(Bss->Alignment, 16U);
+  const auto F0 =
+      std::find_if(Result->symbols().begin(), Result->symbols().end(),
+                   [](const Symbol &Value) { return Value.Name == "f0"; });
+  ASSERT_NE(F0, Result->symbols().end());
+  EXPECT_TRUE(F0->Exported);
+  EXPECT_GT(F0->Size, 0U);
+  ASSERT_FALSE(Result->relocations().empty());
+#if defined(__x86_64__) && !defined(__APPLE__) && !defined(_WIN32)
+  EXPECT_EQ(Result->relocations()[0].Addend, -4);
+  EXPECT_FALSE(Result->relocations()[0].AddendIsImplicit);
+#endif
+}
+
+TEST(ObjectReaderTest, RejectsUndefinedExternal) {
+  EXPECT_FALSE(ObjectReader::read(makeNativeObject(true), nativeTarget()));
+}
+
+TEST(ObjectReaderTest, RejectsTargetMismatch) {
+  const Target Other =
+      nativeTarget() == Target::X86_64 ? Target::AArch64 : Target::X86_64;
+  EXPECT_FALSE(ObjectReader::read(makeNativeObject(), Other));
+}
+
+TEST(ObjectReaderTest, RejectsEmptyAndArchiveBuffers) {
+  EXPECT_FALSE(ObjectReader::read({}, nativeTarget()));
+  const std::string Archive = "!<arch>\n";
+  EXPECT_FALSE(ObjectReader::read(
+      WasmEdge::Span<const WasmEdge::Byte>(
+          reinterpret_cast<const WasmEdge::Byte *>(Archive.data()),
+          Archive.size()),
+      nativeTarget()));
 }
 
 } // namespace

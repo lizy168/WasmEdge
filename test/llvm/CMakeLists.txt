@@ -19,6 +19,12 @@ target_include_directories(wasmedgeLLVMCoreTests
   ${PROJECT_SOURCE_DIR}/lib/llvm
 )
 
+target_include_directories(wasmedgeLLVMCoreTests
+  SYSTEM
+  PRIVATE
+  $<TARGET_PROPERTY:wasmedgeLLVM,INCLUDE_DIRECTORIES>
+)
+
 wasmedge_add_executable(wasmedgeLazyJITTests
   LazyJITTest.cpp
 )

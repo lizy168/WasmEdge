@@ -28,6 +28,7 @@ set(WASMEDGE_LLVM_SOURCES
   jit.cpp
   lazyjit.cpp
   linker/link_graph.cpp
+  linker/object_reader.cpp
   llvm.cpp
 )
 
@@ -79,6 +80,7 @@ else()
     lto
     native
     nativecodegen
+    object
     option
     passes
     support

@@ -52,6 +52,7 @@ struct Relocation {
   uint32_t Type;
   SymbolId Symbol;
   int64_t Addend;
+  bool AddendIsImplicit = false;
 };
 
 struct Rebase {
