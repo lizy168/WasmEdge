@@ -85,6 +85,7 @@ public:
   LinkExpect<void> addRelocation(Relocation Value);
   LinkExpect<void> addRebase(Rebase Value);
   LinkExpect<void> validate() const;
+  LinkExpect<Section *> section(SectionId Id);
 
   Target target() const noexcept { return TargetValue; }
   Endianness endianness() const noexcept { return EndianValue; }
@@ -93,7 +94,9 @@ public:
   const std::vector<Relocation> &relocations() const noexcept {
     return Relocations;
   }
+  std::vector<Relocation> &relocations() noexcept { return Relocations; }
   const std::vector<Rebase> &rebases() const noexcept { return Rebases; }
+  std::vector<Rebase> &rebases() noexcept { return Rebases; }
 
 private:
   Target TargetValue;

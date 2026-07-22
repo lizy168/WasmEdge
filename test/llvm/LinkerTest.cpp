@@ -75,6 +75,18 @@ TEST(LinkGraphTest, RejectsInvalidSectionAlignment) {
             "section alignment must be a non-zero power of two");
 }
 
+TEST(LinkGraphTest, RejectsContentBeyondSectionVirtualSize) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+
+  auto Result =
+      Graph.addSection(Section{".data", SectionKind::Data, 1, 1, 0, 0, {1, 2}});
+  ASSERT_FALSE(Result);
+  EXPECT_EQ(Result.error().SectionName, ".data");
+  EXPECT_EQ(Result.error().Message,
+            "section content exceeds section virtual size");
+}
+
 TEST(LinkGraphTest, RejectsDuplicateSymbolDefinitions) {
   LinkGraph Graph(Target::RISCV64, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("input.o"));
@@ -147,6 +159,101 @@ TEST(LinkGraphTest, StoresRelocationsAndRebases) {
   EXPECT_EQ(Graph.relocations()[0].Symbol, *TargetSymbol);
   ASSERT_EQ(Graph.rebases().size(), 1U);
   EXPECT_EQ(Graph.rebases()[0].Addend, 8);
+}
+
+TEST(LinkGraphTest, RejectsInvalidPatchSections) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text =
+      Graph.addSection(Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}});
+  ASSERT_TRUE(Text);
+  auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+  ASSERT_TRUE(TargetSymbol);
+
+  auto RelocationResult = Graph.addRelocation(
+      Relocation{InvalidSectionId, 0, 42, *TargetSymbol, 0});
+  ASSERT_FALSE(RelocationResult);
+  EXPECT_EQ(RelocationResult.error().Message, "invalid section ID");
+  auto RebaseResult = Graph.addRebase(Rebase{InvalidSectionId, 0, 7, 0});
+  ASSERT_FALSE(RebaseResult);
+  EXPECT_EQ(RebaseResult.error().Message, "invalid section ID");
+}
+
+TEST(LinkGraphTest, RejectsPatchOffsetsOutsideSectionContent) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text =
+      Graph.addSection(Section{".text", SectionKind::Text, 1, 4, 0, 0, {0}});
+  ASSERT_TRUE(Text);
+  auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+  ASSERT_TRUE(TargetSymbol);
+
+  auto RelocationResult =
+      Graph.addRelocation(Relocation{*Text, 1, 42, *TargetSymbol, 0});
+  ASSERT_FALSE(RelocationResult);
+  EXPECT_EQ(RelocationResult.error().Offset, 1U);
+  EXPECT_EQ(RelocationResult.error().Message,
+            "relocation offset is outside section content");
+  auto RebaseResult = Graph.addRebase(Rebase{*Text, 1, 7, 0});
+  ASSERT_FALSE(RebaseResult);
+  EXPECT_EQ(RebaseResult.error().Offset, 1U);
+  EXPECT_EQ(RebaseResult.error().Message,
+            "rebase offset is outside section content");
+}
+
+TEST(LinkGraphTest, ProvidesCheckedMutableGraphAccess) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text =
+      Graph.addSection(Section{".text", SectionKind::Text, 1, 2, 0, 0, {0, 0}});
+  ASSERT_TRUE(Text);
+  auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+  ASSERT_TRUE(TargetSymbol);
+  ASSERT_TRUE(Graph.addRelocation(Relocation{*Text, 0, 42, *TargetSymbol, 0}));
+  ASSERT_TRUE(Graph.addRebase(Rebase{*Text, 1, 7, 0}));
+
+  auto MutableSection = Graph.section(*Text);
+  ASSERT_TRUE(MutableSection);
+  (*MutableSection)->Address = 64;
+  Graph.relocations()[0].Addend = 8;
+  Graph.rebases()[0].Addend = 16;
+  EXPECT_EQ(Graph.sections()[*Text].Address, 64U);
+  EXPECT_EQ(Graph.relocations()[0].Addend, 8);
+  EXPECT_EQ(Graph.rebases()[0].Addend, 16);
+
+  auto Invalid = Graph.section(InvalidSectionId);
+  ASSERT_FALSE(Invalid);
+  EXPECT_EQ(Invalid.error().Message, "invalid section ID");
+}
+
+TEST(LinkGraphTest, ValidatesMutatedPatchOffsets) {
+  LinkGraph RelocationGraph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(RelocationGraph.beginInput("input.o"));
+  auto Text = RelocationGraph.addSection(
+      Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}});
+  ASSERT_TRUE(Text);
+  auto TargetSymbol =
+      RelocationGraph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+  ASSERT_TRUE(TargetSymbol);
+  ASSERT_TRUE(RelocationGraph.addRelocation(
+      Relocation{*Text, 0, 42, *TargetSymbol, 0}));
+  RelocationGraph.relocations()[0].Offset = 1;
+  auto RelocationResult = RelocationGraph.validate();
+  ASSERT_FALSE(RelocationResult);
+  EXPECT_EQ(RelocationResult.error().Message,
+            "relocation offset is outside section content");
+
+  LinkGraph RebaseGraph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(RebaseGraph.beginInput("input.o"));
+  Text = RebaseGraph.addSection(
+      Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}});
+  ASSERT_TRUE(Text);
+  ASSERT_TRUE(RebaseGraph.addRebase(Rebase{*Text, 0, 7, 0}));
+  RebaseGraph.rebases()[0].Offset = 1;
+  auto RebaseResult = RebaseGraph.validate();
+  ASSERT_FALSE(RebaseResult);
+  EXPECT_EQ(RebaseResult.error().Message,
+            "rebase offset is outside section content");
 }
 
 TEST(LinkGraphTest, SymbolIdsRemainStableAcrossVectorGrowth) {

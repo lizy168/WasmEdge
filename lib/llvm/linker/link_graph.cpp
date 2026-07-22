@@ -4,7 +4,6 @@
 #include "linker/link_graph.h"
 
 #include <algorithm>
-#include <limits>
 #include <utility>
 
 namespace WasmEdge {
@@ -38,7 +37,12 @@ LinkExpect<SectionId> LinkGraph::addSection(Section Value) {
     Diag.SectionName = Value.Name;
     return fail<SectionId>(std::move(Diag));
   }
-  if (Sections.size() > std::numeric_limits<uint32_t>::max()) {
+  if (Value.Content.size() > Value.VirtualSize) {
+    Diagnostic Diag{"section content exceeds section virtual size"};
+    Diag.SectionName = Value.Name;
+    return fail<SectionId>(std::move(Diag));
+  }
+  if (Sections.size() >= InvalidSectionId) {
     return fail<SectionId>(Diagnostic{"too many sections"});
   }
   const SectionId Id{static_cast<uint32_t>(Sections.size())};
@@ -79,7 +83,7 @@ LinkExpect<SymbolId> LinkGraph::addSymbol(Symbol Value) {
     Diag.Offset = Value.Offset;
     return fail<SymbolId>(std::move(Diag));
   }
-  if (Symbols.size() > std::numeric_limits<uint32_t>::max()) {
+  if (Symbols.size() >= InvalidSymbolId) {
     return fail<SymbolId>(Diagnostic{"too many symbols"});
   }
   const SymbolId Id{static_cast<uint32_t>(Symbols.size())};
@@ -103,6 +107,14 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
     Diag.Offset = Value.Offset;
     return fail<void>(std::move(Diag));
   }
+  if (Value.Offset >= Sections[Value.Section].Content.size()) {
+    Diagnostic Diag{"relocation offset is outside section content"};
+    Diag.Section = Value.Section;
+    Diag.Symbol = Value.Symbol;
+    Diag.RelocationType = Value.Type;
+    Diag.Offset = Value.Offset;
+    return fail<void>(std::move(Diag));
+  }
   Relocations.push_back(Value);
   return {};
 }
@@ -110,6 +122,13 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
 LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
   if (Value.Section >= Sections.size()) {
     Diagnostic Diag{"invalid section ID"};
+    Diag.Section = Value.Section;
+    Diag.RelocationType = Value.Type;
+    Diag.Offset = Value.Offset;
+    return fail<void>(std::move(Diag));
+  }
+  if (Value.Offset >= Sections[Value.Section].Content.size()) {
+    Diagnostic Diag{"rebase offset is outside section content"};
     Diag.Section = Value.Section;
     Diag.RelocationType = Value.Type;
     Diag.Offset = Value.Offset;
@@ -123,12 +142,12 @@ LinkExpect<void> LinkGraph::validate() const {
   if (!InputName) {
     return fail<void>(Diagnostic{"link graph requires one input object"});
   }
-  for (uint32_t I = 0; I < Symbols.size(); ++I) {
+  for (size_t I = 0; I < Symbols.size(); ++I) {
     const auto &Value = Symbols[I];
     if (Value.Section >= Sections.size()) {
       Diagnostic Diag{"invalid section ID"};
       Diag.Section = Value.Section;
-      Diag.Symbol = I;
+      Diag.Symbol = static_cast<SymbolId>(I);
       Diag.SymbolName = Value.Name;
       Diag.Offset = Value.Offset;
       return fail<void>(std::move(Diag));
@@ -137,13 +156,64 @@ LinkExpect<void> LinkGraph::validate() const {
                       Sections[Value.Section].VirtualSize)) {
       Diagnostic Diag{"symbol extends beyond section virtual size"};
       Diag.Section = Value.Section;
-      Diag.Symbol = I;
+      Diag.Symbol = static_cast<SymbolId>(I);
       Diag.SymbolName = Value.Name;
       Diag.Offset = Value.Offset;
       return fail<void>(std::move(Diag));
     }
   }
+  for (const auto &Value : Relocations) {
+    if (Value.Section >= Sections.size()) {
+      Diagnostic Diag{"invalid section ID"};
+      Diag.Section = Value.Section;
+      Diag.Symbol = Value.Symbol;
+      Diag.RelocationType = Value.Type;
+      Diag.Offset = Value.Offset;
+      return fail<void>(std::move(Diag));
+    }
+    if (Value.Symbol >= Symbols.size()) {
+      Diagnostic Diag{"invalid symbol ID"};
+      Diag.Section = Value.Section;
+      Diag.Symbol = Value.Symbol;
+      Diag.RelocationType = Value.Type;
+      Diag.Offset = Value.Offset;
+      return fail<void>(std::move(Diag));
+    }
+    if (Value.Offset >= Sections[Value.Section].Content.size()) {
+      Diagnostic Diag{"relocation offset is outside section content"};
+      Diag.Section = Value.Section;
+      Diag.Symbol = Value.Symbol;
+      Diag.RelocationType = Value.Type;
+      Diag.Offset = Value.Offset;
+      return fail<void>(std::move(Diag));
+    }
+  }
+  for (const auto &Value : Rebases) {
+    if (Value.Section >= Sections.size()) {
+      Diagnostic Diag{"invalid section ID"};
+      Diag.Section = Value.Section;
+      Diag.RelocationType = Value.Type;
+      Diag.Offset = Value.Offset;
+      return fail<void>(std::move(Diag));
+    }
+    if (Value.Offset >= Sections[Value.Section].Content.size()) {
+      Diagnostic Diag{"rebase offset is outside section content"};
+      Diag.Section = Value.Section;
+      Diag.RelocationType = Value.Type;
+      Diag.Offset = Value.Offset;
+      return fail<void>(std::move(Diag));
+    }
+  }
   return {};
+}
+
+LinkExpect<Section *> LinkGraph::section(SectionId Id) {
+  if (Id >= Sections.size()) {
+    Diagnostic Diag{"invalid section ID"};
+    Diag.Section = Id;
+    return fail<Section *>(std::move(Diag));
+  }
+  return &Sections[Id];
 }
 
 } // namespace Linker
