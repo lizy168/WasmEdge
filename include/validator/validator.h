@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include "ast/component/component.h"
 #include "ast/module.h"
 #include "common/configure.h"
 #include "validator/component_context.h"
@@ -28,7 +29,7 @@ namespace Validator {
 /// Validator flow control class.
 class Validator {
 public:
-  Validator(const Configure &Conf) noexcept;
+  Validator(const Configure &Conf) noexcept : Conf(Conf) {}
   ~Validator() noexcept = default;
 
   /// Validate AST::Module.
@@ -76,9 +77,11 @@ private:
 
   /// \name Validate Component Model AST nodes
   /// @{
-  // Validate component
+  // Validate a component body in a fresh scope (nested components recurse),
+  // materializing its external view into the caller-provided Info.
   Expect<void>
-  validateComponent(const AST::Component::Component &Comp) noexcept;
+  validateComponent(const AST::Component::Component &Comp,
+                    ComponentContext::ComponentShape &Info) noexcept;
   // Validate component sections
   Expect<void>
   validate(const AST::Component::CoreModuleSection &ModSec) noexcept;
@@ -108,10 +111,8 @@ private:
   Expect<void> validate(const AST::Component::DefType &DType) noexcept;
   // Validate component canonical
   Expect<void> validate(const AST::Component::Canonical &Canon) noexcept;
-  Expect<void>
-  validateCanonOptions(ComponentCanonOpCode Code,
-                       Span<const AST::Component::CanonOpt> Opts) noexcept;
-  // Per-opcode canonical built-in validators.
+  Expect<void> validateCanonOptions(const AST::Component::Canonical &Canon,
+                                    bool IsLift) noexcept;
   Expect<void>
   validateCanonLift(const AST::Component::Canonical &Canon) noexcept;
   Expect<void>
@@ -122,48 +123,36 @@ private:
   validateCanonResourceRep(const AST::Component::Canonical &Canon) noexcept;
   Expect<void>
   validateCanonResourceDrop(const AST::Component::Canonical &Canon) noexcept;
-  // Validate component import
+  Expect<void>
+  validateCanonAsyncBuiltin(const AST::Component::Canonical &Canon) noexcept;
+  // Validate component import/export
   Expect<void> validate(const AST::Component::Import &Im) noexcept;
-  // Validate component export
   Expect<void> validate(const AST::Component::Export &Ex) noexcept;
-  // Validate component descs
-  Expect<void> validate(const AST::Component::CoreImportDesc &Desc) noexcept;
-  Expect<void> validate(const AST::Component::ExternDesc &Desc) noexcept;
-  // Validate component decls
-  Expect<void> validate(const AST::Component::CoreImportDecl &Decl) noexcept;
-  Expect<void> validate(const AST::Component::CoreExportDecl &Decl) noexcept;
-  Expect<void> validate(const AST::Component::CoreModuleDecl &Decl) noexcept;
-  Expect<void> validate(const AST::Component::ImportDecl &Decl) noexcept;
-  Expect<void> validate(const AST::Component::ExportDecl &Decl) noexcept;
-  Expect<void> validate(const AST::Component::InstanceDecl &Decl) noexcept;
-  Expect<void> validate(const AST::Component::ComponentDecl &Decl) noexcept;
+  // Resolve + validate descriptors into typed views. Sub-resource type
+  // bounds allocate a fresh abstract resource id (import- or export-side).
+  Expect<ComponentContext::CoreExternInfo>
+  validate(const AST::Component::CoreImportDesc &Desc) noexcept;
+  Expect<ComponentContext::ExternInfo>
+  validate(const AST::Component::ExternDesc &Desc, bool ImportSide) noexcept;
+  // Validate type declaration bodies into the caller-provided Info view.
+  Expect<void>
+  validateModuleType(Span<const AST::Component::CoreModuleDecl> Decls,
+                     ComponentContext::CoreShape &Info) noexcept;
+  Expect<void>
+  validateInstanceType(const AST::Component::InstanceType &IT,
+                       ComponentContext::ComponentShape &Info) noexcept;
+  Expect<void>
+  validateComponentType(const AST::Component::ComponentType &CT,
+                        ComponentContext::ComponentShape &Info) noexcept;
+  Expect<void> validate(const AST::Component::InstanceDecl &Decl,
+                        ComponentContext::ExternMap &Exports) noexcept;
+  Expect<void> validate(const AST::Component::ComponentDecl &Decl,
+                        ComponentContext::ComponentShape &Info) noexcept;
   // Validate component value types and type definitions
   Expect<void> validate(const ComponentValType &VT) noexcept;
   Expect<void> validate(const AST::Component::DefValType &DVT) noexcept;
   Expect<void> validate(const AST::Component::FuncType &FT) noexcept;
-  Expect<void> validate(const AST::Component::InstanceType &IT) noexcept;
-  Expect<void> validate(const AST::Component::ComponentType &CT) noexcept;
   Expect<void> validate(const AST::Component::ResourceType &RT) noexcept;
-  bool containsBorrow(const ComponentValType &VT) const noexcept;
-  bool containsBorrow(const AST::Component::DefValType &DVT) const noexcept;
-
-  // Populate the export table of an instance slot from an InstanceType.
-  void
-  populateInstanceFromType(uint32_t InstIdx,
-                           const AST::Component::InstanceType &IT) noexcept;
-  // Structural subtype on InstanceTypes (sort-kind for non-instance exports).
-  bool isInstanceSubtype(const AST::Component::InstanceType &S,
-                         const AST::Component::InstanceType &T) const noexcept;
-  // True iff a provided export satisfies a required-decl entry.
-  bool
-  exportSatisfies(const AST::Component::InstanceType &RequiredCtx,
-                  const ComponentContext::InstanceExport &Provided,
-                  const AST::Component::ExternDesc &Required) const noexcept;
-  // Name of the first required export of `RequiredIT` not satisfied by the
-  // instance at `ProvidedInstIdx`; nullopt ⇒ all satisfied.
-  std::optional<std::string> findMissingRequiredExport(
-      uint32_t ProvidedInstIdx,
-      const AST::Component::InstanceType &RequiredIT) const noexcept;
   /// @}
 
   /// Memory page limit for WASM32 and WASM64
@@ -175,9 +164,6 @@ private:
   FormChecker Checker;
   /// Context for Component validation
   ComponentContext CompCtx;
-  /// Pre-defined core function SubTypes
-  const AST::SubType CoreFuncType_I32_I32;  // [i32] -> [i32]
-  const AST::SubType CoreFuncType_I32_Void; // [i32] -> []
 };
 
 } // namespace Validator
