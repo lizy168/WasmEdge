@@ -7,8 +7,17 @@ if [[ $# -ne 3 ]]; then
   exit 1
 fi
 
-wasmedgec=$(realpath "$1")
-input=$(realpath "$2")
+canonicalize() {
+  local path=$1
+  local directory
+  local filename
+  directory=$(dirname "$path")
+  filename=$(basename "$path")
+  printf '%s/%s\n' "$(cd "$directory" && pwd -P)" "$filename"
+}
+
+wasmedgec=$(canonicalize "$1")
+input=$(canonicalize "$2")
 output_dir=$3
 
 mkdir -p "$output_dir"
