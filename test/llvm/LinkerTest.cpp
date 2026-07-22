@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
+#include "linker/layout.h"
 #include "linker/link_graph.h"
 #include "linker/object_reader.h"
 
@@ -32,6 +33,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -502,6 +504,179 @@ TEST(LinkGraphTest, SectionOffsetsDefaultToZero) {
   EXPECT_EQ(Value.Address, 0U);
   EXPECT_EQ(Value.FileOffset, 0U);
   EXPECT_EQ(Value.VirtualSize, 0U);
+}
+
+TEST(LayoutTest, GroupsAndAlignsSections) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Data = Graph.addSection(
+      Section{".data", SectionKind::Data, 8, 4, 0, 0, {1, 2, 3, 4}});
+  auto Unwind = Graph.addSection(
+      Section{".eh_frame", SectionKind::Unwind, 4, 3, 0, 0, {1, 2, 3}});
+  auto ReadOnly = Graph.addSection(
+      Section{".rodata", SectionKind::ReadOnly, 2, 2, 0, 0, {1, 2}});
+  auto TextZ = Graph.addSection(
+      Section{".text.z", SectionKind::Text, 4, 3, 0, 0, {1, 2, 3}});
+  auto TextA =
+      Graph.addSection(Section{".text.a", SectionKind::Text, 8, 1, 0, 0, {1}});
+  ASSERT_TRUE(Data && Unwind && ReadOnly && TextZ && TextA);
+
+  ASSERT_TRUE(layout(Graph));
+  EXPECT_EQ(Graph.sections()[*TextA].Address, 0U);
+  EXPECT_EQ(Graph.sections()[*TextA].FileOffset, 0U);
+  EXPECT_EQ(Graph.sections()[*TextZ].Address, 4U);
+  EXPECT_EQ(Graph.sections()[*TextZ].FileOffset, 4U);
+  EXPECT_EQ(Graph.sections()[*ReadOnly].Address, 8U);
+  EXPECT_EQ(Graph.sections()[*ReadOnly].FileOffset, 8U);
+  EXPECT_EQ(Graph.sections()[*Unwind].Address, 12U);
+  EXPECT_EQ(Graph.sections()[*Unwind].FileOffset, 12U);
+  EXPECT_EQ(Graph.sections()[*Data].Address, 16U);
+  EXPECT_EQ(Graph.sections()[*Data].FileOffset, 16U);
+}
+
+TEST(LayoutTest, BssConsumesVirtualButNotFileSpace) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto First =
+      Graph.addSection(Section{"a", SectionKind::Data, 1, 3, 0, 0, {1, 2, 3}});
+  auto Second =
+      Graph.addSection(Section{"z", SectionKind::Data, 4, 1, 0, 0, {1}});
+  auto Bss = Graph.addSection(Section{"b", SectionKind::BSS, 8, 9});
+  ASSERT_TRUE(First && Second && Bss);
+
+  ASSERT_TRUE(layout(Graph));
+  EXPECT_EQ(Graph.sections()[*First].Address, 0U);
+  EXPECT_EQ(Graph.sections()[*Second].Address, 4U);
+  EXPECT_EQ(Graph.sections()[*Bss].Address, 8U);
+  EXPECT_EQ(Graph.sections()[*Bss].FileOffset, 5U);
+  EXPECT_EQ(Graph.sections()[*Bss].Address + Graph.sections()[*Bss].VirtualSize,
+            17U);
+}
+
+TEST(LayoutTest, IsIndependentOfInsertionOrderForUniqueNames) {
+  auto MakeGraph = [](bool Reverse) {
+    LinkGraph Graph(Target::X86_64, Endianness::Little);
+    EXPECT_TRUE(Graph.beginInput("input.o"));
+    Section A{"a", SectionKind::ReadOnly, 4, 2, 0, 0, {1, 2}};
+    Section Z{"z", SectionKind::ReadOnly, 8, 3, 0, 0, {1, 2, 3}};
+    EXPECT_TRUE(Graph.addSection(Reverse ? Z : A));
+    EXPECT_TRUE(Graph.addSection(Reverse ? A : Z));
+    return Graph;
+  };
+  auto First = MakeGraph(false);
+  auto Second = MakeGraph(true);
+
+  ASSERT_TRUE(layout(First));
+  ASSERT_TRUE(layout(Second));
+  for (const auto &Section : First.sections()) {
+    const auto Other = std::find_if(
+        Second.sections().begin(), Second.sections().end(),
+        [&](const auto &Value) { return Value.Name == Section.Name; });
+    ASSERT_NE(Other, Second.sections().end());
+    EXPECT_EQ(Other->Address, Section.Address);
+    EXPECT_EQ(Other->FileOffset, Section.FileOffset);
+  }
+}
+
+TEST(LayoutTest, OrdersDuplicateNamesByOriginalOrdinal) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto First =
+      Graph.addSection(Section{"same", SectionKind::Text, 1, 2, 0, 0, {1, 2}});
+  auto Second =
+      Graph.addSection(Section{"same", SectionKind::Text, 4, 1, 0, 0, {1}});
+  ASSERT_TRUE(First && Second);
+
+  ASSERT_TRUE(layout(Graph));
+  EXPECT_EQ(Graph.sections()[*First].Address, 0U);
+  EXPECT_EQ(Graph.sections()[*Second].Address, 4U);
+}
+
+TEST(LayoutTest, AppliesNonzeroImageBase) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text =
+      Graph.addSection(Section{"text", SectionKind::Text, 16, 2, 0, 0, {1, 2}});
+  ASSERT_TRUE(Text);
+
+  ASSERT_TRUE(layout(Graph, 0x1003));
+  EXPECT_EQ(Graph.sections()[*Text].Address, 0x1010U);
+  EXPECT_EQ(Graph.sections()[*Text].FileOffset, 0U);
+}
+
+TEST(LayoutTest, IsIdempotent) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  ASSERT_TRUE(Graph.addSection(
+      Section{"text", SectionKind::Text, 8, 3, 0, 0, {1, 2, 3}}));
+  ASSERT_TRUE(Graph.addSection(Section{"bss", SectionKind::BSS, 16, 7}));
+  ASSERT_TRUE(layout(Graph, 0x1000));
+  const auto Sections = Graph.sections();
+
+  ASSERT_TRUE(layout(Graph, 0x1000));
+  EXPECT_EQ(Graph.sections()[0].Address, Sections[0].Address);
+  EXPECT_EQ(Graph.sections()[0].FileOffset, Sections[0].FileOffset);
+  EXPECT_EQ(Graph.sections()[1].Address, Sections[1].Address);
+  EXPECT_EQ(Graph.sections()[1].FileOffset, Sections[1].FileOffset);
+}
+
+TEST(LayoutTest, RejectsAlignmentOverflow) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  ASSERT_TRUE(Graph.addSection(Section{"text", SectionKind::Text, 2, 0}));
+
+  auto Result = layout(Graph, std::numeric_limits<uint64_t>::max());
+  ASSERT_FALSE(Result);
+  EXPECT_EQ(Result.error().Message, "section address alignment overflows");
+  EXPECT_EQ(Result.error().SectionName, "text");
+}
+
+TEST(LayoutTest, RejectsSectionSizeAndImageBaseOverflow) {
+  LinkGraph SizeGraph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(SizeGraph.beginInput("input.o"));
+  ASSERT_TRUE(SizeGraph.addSection(Section{
+      "first", SectionKind::Text, 1, std::numeric_limits<uint64_t>::max()}));
+  ASSERT_TRUE(SizeGraph.addSection(Section{"second", SectionKind::Text, 1, 1}));
+  auto SizeResult = layout(SizeGraph);
+  ASSERT_FALSE(SizeResult);
+  EXPECT_EQ(SizeResult.error().Message, "section virtual size overflows");
+  EXPECT_EQ(SizeResult.error().SectionName, "second");
+
+  LinkGraph BaseGraph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(BaseGraph.beginInput("input.o"));
+  ASSERT_TRUE(BaseGraph.addSection(Section{"text", SectionKind::Text, 1, 3}));
+  auto BaseResult = layout(BaseGraph, std::numeric_limits<uint64_t>::max() - 1);
+  ASSERT_FALSE(BaseResult);
+  EXPECT_EQ(BaseResult.error().Message, "section virtual size overflows");
+  EXPECT_EQ(BaseResult.error().SectionName, "text");
+}
+
+TEST(LayoutTest, RejectsInvalidMutatedGraphBeforeLayout) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  ASSERT_TRUE(Graph.addSection(Section{"text", SectionKind::Text, 1, 0}));
+  auto &Sections = const_cast<std::vector<Section> &>(Graph.sections());
+  Sections[0].Alignment = 0;
+
+  auto Result = layout(Graph);
+  ASSERT_FALSE(Result);
+  EXPECT_EQ(Result.error().Message,
+            "section alignment must be a non-zero power of two");
+}
+
+TEST(LayoutTest, RetainsAllSectionsIncludingEmptySections) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  ASSERT_TRUE(Graph.addSection(Section{"empty", SectionKind::Text, 8, 0}));
+  ASSERT_TRUE(Graph.addSection(
+      Section{"unused", SectionKind::ReadOnly, 4, 1, 0, 0, {1}}));
+  ASSERT_TRUE(Graph.addSection(Section{"zero", SectionKind::BSS, 16, 0}));
+
+  ASSERT_TRUE(layout(Graph));
+  ASSERT_EQ(Graph.sections().size(), 3U);
+  EXPECT_EQ(Graph.sections()[0].Address, 0U);
+  EXPECT_EQ(Graph.sections()[1].Address, 0U);
+  EXPECT_EQ(Graph.sections()[2].Address, 16U);
 }
 
 TEST(ObjectReaderTest, RejectsMalformedBytes) {
