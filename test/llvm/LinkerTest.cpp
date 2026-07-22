@@ -14,6 +14,9 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/MC/TargetRegistry.h>
+#if LLVM_VERSION_MAJOR >= 19
+#include <llvm/MC/MCELFExtras.h>
+#endif
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/CodeGen.h>
 #if LLVM_VERSION_MAJOR >= 19
@@ -27,6 +30,7 @@
 #include <llvm/Target/TargetOptions.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -158,6 +162,32 @@ size_t elf64RelocationSectionHeader(const std::vector<WasmEdge::Byte> &Bytes) {
   EXPECT_NE(Index, 0U);
   return static_cast<size_t>(read64le(Bytes, 40) + Index * 64);
 }
+
+#if LLVM_VERSION_MAJOR >= 19
+std::vector<WasmEdge::Byte> makeX86_64CrelObject() {
+  auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
+  const auto Header = elf64RelocationSectionHeader(Bytes);
+  const auto Offset = read64le(Bytes, Header + 24);
+  const auto Info = read64le(Bytes, Offset + 8);
+  const auto Addend = static_cast<int64_t>(read64le(Bytes, Offset + 16));
+  const std::array<llvm::ELF::Elf_Crel<true>, 1> Relocations{{
+      {read64le(Bytes, Offset), static_cast<uint32_t>(Info >> 32),
+       static_cast<uint32_t>(Info), Addend},
+  }};
+  llvm::SmallVector<char, 16> Encoded;
+  llvm::raw_svector_ostream Stream(Encoded);
+  llvm::ELF::encodeCrel<true>(
+      Stream, Relocations, [](const auto &Relocation) { return Relocation; });
+  std::copy(Encoded.begin(), Encoded.end(), Bytes.begin() + Offset);
+  Bytes[Header + 4] = 0x14;
+  Bytes[Header + 5] = 0x00;
+  Bytes[Header + 6] = 0x00;
+  Bytes[Header + 7] = 0x40;
+  write64le(Bytes, Header + 32, Encoded.size());
+  write64le(Bytes, Header + 56, 1);
+  return Bytes;
+}
+#endif
 
 std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
   return makeObject(llvm::Triple(llvm::sys::getDefaultTargetTriple()),
@@ -627,6 +657,25 @@ TEST(ObjectReaderTest, RejectsELFRelocationWithInvalidSymbolIndex) {
   write64le(Bytes, RelocationOffset + 8, UINT64_C(0xFFFFFFFF00000000));
   EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
 }
+
+#if LLVM_VERSION_MAJOR >= 19
+TEST(ObjectReaderTest, NormalizesELFCrelRelocation) {
+  auto Result = ObjectReader::read(makeX86_64CrelObject(), Target::X86_64);
+  ASSERT_TRUE(Result);
+  ASSERT_EQ(Result->relocations().size(), 1U);
+  EXPECT_EQ(Result->relocations()[0].Offset, 3U);
+  EXPECT_EQ(Result->relocations()[0].Type, 42U);
+  EXPECT_EQ(Result->relocations()[0].Addend, -4);
+  EXPECT_FALSE(Result->relocations()[0].AddendIsImplicit);
+}
+
+TEST(ObjectReaderTest, RejectsTruncatedELFCrelRelocation) {
+  auto Bytes = makeX86_64CrelObject();
+  const auto Header = elf64RelocationSectionHeader(Bytes);
+  write64le(Bytes, Header + 32, 1);
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
+}
+#endif
 
 TEST(ObjectReaderTest, MarksELFRelAddendsImplicit) {
   auto Result = ObjectReader::read(

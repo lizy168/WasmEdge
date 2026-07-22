@@ -197,17 +197,19 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
     if (!readSection(I, Type, Offset, Size, Link, EntrySize)) {
       return false;
     }
-    if (Type != llvm::ELF::SHT_REL && Type != llvm::ELF::SHT_RELA) {
+    const bool IsCrel =
 #if LLVM_VERSION_MAJOR >= 19
-      if (Type == llvm::ELF::SHT_CREL) {
-        return false;
-      }
+        Type == llvm::ELF::SHT_CREL;
+#else
+        false;
 #endif
+    if (Type != llvm::ELF::SHT_REL && Type != llvm::ELF::SHT_RELA && !IsCrel) {
       continue;
     }
     const uint64_t ExpectedEntrySize =
-        Is64 ? (Type == llvm::ELF::SHT_RELA ? 24 : 16)
-             : (Type == llvm::ELF::SHT_RELA ? 12 : 8);
+        IsCrel ? 1
+        : Is64 ? (Type == llvm::ELF::SHT_RELA ? 24 : 16)
+               : (Type == llvm::ELF::SHT_RELA ? 12 : 8);
     uint32_t SymbolType = 0;
     uint32_t SymbolLink = 0;
     uint64_t SymbolOffset = 0;
@@ -225,6 +227,38 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
       return false;
     }
     const uint64_t SymbolCount = SymbolSize / SymbolEntrySize;
+    if (IsCrel) {
+#if LLVM_VERSION_MAJOR >= 19
+      uint64_t DeclaredCount = 0;
+      uint64_t DecodedCount = 0;
+      bool ValidSymbols = true;
+      const auto Content =
+          llvm::ArrayRef<uint8_t>(Buffer.data() + Offset, Size);
+      auto Error =
+          Is64 ? llvm::object::decodeCrel<true>(
+                     Content,
+                     [&](uint64_t Count, bool) { DeclaredCount = Count; },
+                     [&](const auto &Relocation) {
+                       ++DecodedCount;
+                       ValidSymbols &= Relocation.r_symidx < SymbolCount;
+                     })
+               : llvm::object::decodeCrel<false>(
+                     Content,
+                     [&](uint64_t Count, bool) { DeclaredCount = Count; },
+                     [&](const auto &Relocation) {
+                       ++DecodedCount;
+                       ValidSymbols &= Relocation.r_symidx < SymbolCount;
+                     });
+      if (Error) {
+        llvm::consumeError(std::move(Error));
+        return false;
+      }
+      if (!ValidSymbols || DecodedCount != DeclaredCount) {
+        return false;
+      }
+#endif
+      continue;
+    }
     for (uint64_t J = 0; J < Size / EntrySize; ++J) {
       const uint64_t InfoOffset = Offset + J * EntrySize + (Is64 ? 8 : 4);
       uint64_t Info = 0;
