@@ -624,6 +624,14 @@ Expect<void> CodeGen::codegen(Span<const Byte> WasmData, Data D,
       return Unexpect(ErrCode::Value::IllegalPath);
     }
 
+    if (Conf.getCompilerConfigure().isDumpIR()) {
+      std::ofstream OS("wasm.o", std::ios_base::binary);
+      if (!OS ||
+          !OS.write(OSVec.data(), static_cast<std::streamsize>(OSVec.size()))) {
+        return Unexpect(ErrCode::Value::IllegalPath);
+      }
+    }
+
     if (Conf.getCompilerConfigure().getOutputFormat() ==
         CompilerConfigure::OutputFormat::Wasm) {
       EXPECTED_TRY(outputWasmLibrary(LLContext, OutputPath, WasmData, OSVec));
