@@ -410,15 +410,15 @@ Expect<void> Executor::runI31GetOp(ValVariant &Val,
 }
 
 Expect<RefVariant>
-Executor::structNew(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
+Executor::structNew(const Runtime::Instance::ModuleInstance *ModInstArg,
+                    const uint32_t TypeIdx,
                     Span<const ValVariant> Args) const noexcept {
   /// TODO: The array and struct instances are currently owned by the module
   /// instance because they refer to the defined types of the module instances.
   /// This may be changed after applying the garbage collection mechanism.
-  const auto &CompType = getCompositeTypeByIdx(StackMgr, TypeIdx);
+  const auto &CompType = getCompositeTypeByIdx(ModInstArg, TypeIdx);
   uint32_t N = static_cast<uint32_t>(CompType.getFieldTypes().size());
-  Runtime::Instance::ModuleInstance *ModInst =
-      const_cast<Runtime::Instance::ModuleInstance *>(StackMgr.getModule());
+  auto *ModInst = const_cast<Runtime::Instance::ModuleInstance *>(ModInstArg);
   std::vector<ValVariant> Vals(N);
   for (uint32_t I = 0; I < N; I++) {
     const auto &VType = CompType.getFieldTypes()[I].getStorageType();
@@ -426,7 +426,7 @@ Executor::structNew(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
       Vals[I] = packVal(VType, Args[I]);
     } else {
       Vals[I] = VType.isRefType()
-                    ? ValVariant(RefVariant(toBottomType(StackMgr, VType)))
+                    ? ValVariant(RefVariant(toBottomType(ModInstArg, VType)))
                     : ValVariant(static_cast<uint128_t>(0U));
     }
   }
@@ -435,47 +435,66 @@ Executor::structNew(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
   return RefVariant(Inst->getDefType(), Inst);
 }
 
+Expect<RefVariant>
+Executor::structNew(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
+                    Span<const ValVariant> Args) const noexcept {
+  return structNew(StackMgr.getModule(), TypeIdx, Args);
+}
+
+Expect<ValVariant>
+Executor::structGet(const Runtime::Instance::ModuleInstance *ModInst,
+                    const RefVariant Ref, const uint32_t TypeIdx,
+                    const uint32_t Off, const bool IsSigned) const noexcept {
+  const auto *Inst = Ref.getPtr<Runtime::Instance::StructInstance>();
+  if (Inst == nullptr) {
+    return Unexpect(ErrCode::Value::AccessNullStruct);
+  }
+  const auto &VType = getStructStorageTypeByIdx(ModInst, TypeIdx, Off);
+  return unpackVal(VType, Inst->getField(Off), IsSigned);
+}
+
 Expect<ValVariant> Executor::structGet(Runtime::StackManager &StackMgr,
                                        const RefVariant Ref,
                                        const uint32_t TypeIdx,
                                        const uint32_t Off,
                                        const bool IsSigned) const noexcept {
-  const auto *Inst = Ref.getPtr<Runtime::Instance::StructInstance>();
+  return structGet(StackMgr.getModule(), Ref, TypeIdx, Off, IsSigned);
+}
+
+Expect<void>
+Executor::structSet(const Runtime::Instance::ModuleInstance *ModInst,
+                    const RefVariant Ref, const ValVariant Val,
+                    const uint32_t TypeIdx, const uint32_t Off) const noexcept {
+  auto *Inst = Ref.getPtr<Runtime::Instance::StructInstance>();
   if (Inst == nullptr) {
     return Unexpect(ErrCode::Value::AccessNullStruct);
   }
-  const auto &VType = getStructStorageTypeByIdx(StackMgr, TypeIdx, Off);
-  return unpackVal(VType, Inst->getField(Off), IsSigned);
+  const auto &VType = getStructStorageTypeByIdx(ModInst, TypeIdx, Off);
+  Inst->getField(Off) = packVal(VType, Val);
+  return {};
 }
 
 Expect<void> Executor::structSet(Runtime::StackManager &StackMgr,
                                  const RefVariant Ref, const ValVariant Val,
                                  const uint32_t TypeIdx,
                                  const uint32_t Off) const noexcept {
-  auto *Inst = Ref.getPtr<Runtime::Instance::StructInstance>();
-  if (Inst == nullptr) {
-    return Unexpect(ErrCode::Value::AccessNullStruct);
-  }
-  const auto &VType = getStructStorageTypeByIdx(StackMgr, TypeIdx, Off);
-  Inst->getField(Off) = packVal(VType, Val);
-  return {};
+  return structSet(StackMgr.getModule(), Ref, Val, TypeIdx, Off);
 }
 
 Expect<RefVariant>
-Executor::arrayNew(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
-                   const uint32_t Length,
+Executor::arrayNew(const Runtime::Instance::ModuleInstance *ModInstArg,
+                   const uint32_t TypeIdx, const uint32_t Length,
                    Span<const ValVariant> Args) const noexcept {
   /// TODO: The array and struct instances are currently owned by the module
   /// instance because they refer to the defined types of the module instances.
   /// This may be changed after applying the garbage collection mechanism.
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
+  const auto &VType = getArrayStorageTypeByIdx(ModInstArg, TypeIdx);
   WasmEdge::Runtime::Instance::ArrayInstance *Inst = nullptr;
-  Runtime::Instance::ModuleInstance *ModInst =
-      const_cast<Runtime::Instance::ModuleInstance *>(StackMgr.getModule());
+  auto *ModInst = const_cast<Runtime::Instance::ModuleInstance *>(ModInstArg);
   if (Args.size() == 0) {
     // New and fill with default values.
     auto InitVal = VType.isRefType()
-                       ? ValVariant(RefVariant(toBottomType(StackMgr, VType)))
+                       ? ValVariant(RefVariant(toBottomType(ModInstArg, VType)))
                        : ValVariant(static_cast<uint128_t>(0U));
     Inst = ModInst->newArray(TypeIdx, Length, InitVal);
   } else if (Args.size() == 1) {
@@ -491,19 +510,26 @@ Executor::arrayNew(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
 }
 
 Expect<RefVariant>
-Executor::arrayNewData(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
-                       const uint32_t DataIdx, const uint32_t Start,
+Executor::arrayNew(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
+                   const uint32_t Length,
+                   Span<const ValVariant> Args) const noexcept {
+  return arrayNew(StackMgr.getModule(), TypeIdx, Length, Args);
+}
+
+Expect<RefVariant>
+Executor::arrayNewData(const Runtime::Instance::ModuleInstance *ModInstArg,
+                       const uint32_t TypeIdx, const uint32_t DataIdx,
+                       const uint32_t Start,
                        const uint32_t Length) const noexcept {
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
+  const auto &VType = getArrayStorageTypeByIdx(ModInstArg, TypeIdx);
   const uint32_t BSize = VType.getBitWidth() / 8;
-  auto *DataInst = getDataInstByIdx(StackMgr, DataIdx);
+  auto *DataInst = getDataInstByIdx(ModInstArg, DataIdx);
   assuming(DataInst);
   if (static_cast<uint64_t>(Start) + static_cast<uint64_t>(Length) * BSize >
       DataInst->getData().size()) {
     return Unexpect(ErrCode::Value::MemoryOutOfBounds);
   }
-  Runtime::Instance::ModuleInstance *ModInst =
-      const_cast<Runtime::Instance::ModuleInstance *>(StackMgr.getModule());
+  auto *ModInst = const_cast<Runtime::Instance::ModuleInstance *>(ModInstArg);
   std::vector<ValVariant> Args;
   Args.reserve(Length);
   for (uint32_t Idx = 0; Idx < Length; Idx++) {
@@ -516,11 +542,19 @@ Executor::arrayNewData(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
 }
 
 Expect<RefVariant>
-Executor::arrayNewElem(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
-                       const uint32_t ElemIdx, const uint32_t Start,
+Executor::arrayNewData(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
+                       const uint32_t DataIdx, const uint32_t Start,
                        const uint32_t Length) const noexcept {
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
-  auto *ElemInst = getElemInstByIdx(StackMgr, ElemIdx);
+  return arrayNewData(StackMgr.getModule(), TypeIdx, DataIdx, Start, Length);
+}
+
+Expect<RefVariant>
+Executor::arrayNewElem(const Runtime::Instance::ModuleInstance *ModInstArg,
+                       const uint32_t TypeIdx, const uint32_t ElemIdx,
+                       const uint32_t Start,
+                       const uint32_t Length) const noexcept {
+  const auto &VType = getArrayStorageTypeByIdx(ModInstArg, TypeIdx);
+  auto *ElemInst = getElemInstByIdx(ModInstArg, ElemIdx);
   assuming(ElemInst);
   auto ElemSrc = ElemInst->getRefs();
   if (static_cast<uint64_t>(Start) + static_cast<uint64_t>(Length) >
@@ -529,18 +563,23 @@ Executor::arrayNewElem(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
   }
   std::vector<ValVariant> Refs(ElemSrc.begin() + Start,
                                ElemSrc.begin() + Start + Length);
-  Runtime::Instance::ModuleInstance *ModInst =
-      const_cast<Runtime::Instance::ModuleInstance *>(StackMgr.getModule());
+  auto *ModInst = const_cast<Runtime::Instance::ModuleInstance *>(ModInstArg);
   WasmEdge::Runtime::Instance::ArrayInstance *Inst =
       ModInst->newArray(TypeIdx, packVals(VType, std::move(Refs)));
   return RefVariant(Inst->getDefType(), Inst);
 }
 
-Expect<ValVariant> Executor::arrayGet(Runtime::StackManager &StackMgr,
-                                      const RefVariant &Ref,
-                                      const uint32_t TypeIdx,
-                                      const uint32_t Idx,
-                                      const bool IsSigned) const noexcept {
+Expect<RefVariant>
+Executor::arrayNewElem(Runtime::StackManager &StackMgr, const uint32_t TypeIdx,
+                       const uint32_t ElemIdx, const uint32_t Start,
+                       const uint32_t Length) const noexcept {
+  return arrayNewElem(StackMgr.getModule(), TypeIdx, ElemIdx, Start, Length);
+}
+
+Expect<ValVariant>
+Executor::arrayGet(const Runtime::Instance::ModuleInstance *ModInst,
+                   const RefVariant &Ref, const uint32_t TypeIdx,
+                   const uint32_t Idx, const bool IsSigned) const noexcept {
   const auto *Inst = Ref.getPtr<Runtime::Instance::ArrayInstance>();
   if (Inst == nullptr) {
     return Unexpect(ErrCode::Value::AccessNullArray);
@@ -548,14 +587,22 @@ Expect<ValVariant> Executor::arrayGet(Runtime::StackManager &StackMgr,
   if (Idx >= Inst->getLength()) {
     return Unexpect(ErrCode::Value::ArrayOutOfBounds);
   }
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
+  const auto &VType = getArrayStorageTypeByIdx(ModInst, TypeIdx);
   return unpackVal(VType, Inst->getData(Idx), IsSigned);
 }
 
-Expect<void> Executor::arraySet(Runtime::StackManager &StackMgr,
-                                const RefVariant &Ref, const ValVariant &Val,
-                                const uint32_t TypeIdx,
-                                const uint32_t Idx) const noexcept {
+Expect<ValVariant> Executor::arrayGet(Runtime::StackManager &StackMgr,
+                                      const RefVariant &Ref,
+                                      const uint32_t TypeIdx,
+                                      const uint32_t Idx,
+                                      const bool IsSigned) const noexcept {
+  return arrayGet(StackMgr.getModule(), Ref, TypeIdx, Idx, IsSigned);
+}
+
+Expect<void>
+Executor::arraySet(const Runtime::Instance::ModuleInstance *ModInst,
+                   const RefVariant &Ref, const ValVariant &Val,
+                   const uint32_t TypeIdx, const uint32_t Idx) const noexcept {
   auto *Inst = Ref.getPtr<Runtime::Instance::ArrayInstance>();
   if (Inst == nullptr) {
     return Unexpect(ErrCode::Value::AccessNullArray);
@@ -563,15 +610,23 @@ Expect<void> Executor::arraySet(Runtime::StackManager &StackMgr,
   if (Idx >= Inst->getLength()) {
     return Unexpect(ErrCode::Value::ArrayOutOfBounds);
   }
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
+  const auto &VType = getArrayStorageTypeByIdx(ModInst, TypeIdx);
   Inst->getData(Idx) = packVal(VType, Val);
   return {};
 }
 
-Expect<void> Executor::arrayFill(Runtime::StackManager &StackMgr,
-                                 const RefVariant &Ref, const ValVariant &Val,
-                                 const uint32_t TypeIdx, const uint32_t Idx,
-                                 const uint32_t Cnt) const noexcept {
+Expect<void> Executor::arraySet(Runtime::StackManager &StackMgr,
+                                const RefVariant &Ref, const ValVariant &Val,
+                                const uint32_t TypeIdx,
+                                const uint32_t Idx) const noexcept {
+  return arraySet(StackMgr.getModule(), Ref, Val, TypeIdx, Idx);
+}
+
+Expect<void>
+Executor::arrayFill(const Runtime::Instance::ModuleInstance *ModInst,
+                    const RefVariant &Ref, const ValVariant &Val,
+                    const uint32_t TypeIdx, const uint32_t Idx,
+                    const uint32_t Cnt) const noexcept {
   auto *Inst = Ref.getPtr<Runtime::Instance::ArrayInstance>();
   if (Inst == nullptr) {
     return Unexpect(ErrCode::Value::AccessNullArray);
@@ -580,17 +635,23 @@ Expect<void> Executor::arrayFill(Runtime::StackManager &StackMgr,
       Inst->getLength()) {
     return Unexpect(ErrCode::Value::ArrayOutOfBounds);
   }
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
+  const auto &VType = getArrayStorageTypeByIdx(ModInst, TypeIdx);
   auto Arr = Inst->getArray();
   std::fill(Arr.begin() + Idx, Arr.begin() + Idx + Cnt, packVal(VType, Val));
   return {};
 }
 
-Expect<void>
-Executor::arrayInitData(Runtime::StackManager &StackMgr, const RefVariant &Ref,
-                        const uint32_t TypeIdx, const uint32_t DataIdx,
-                        const uint32_t DstIdx, const uint32_t SrcIdx,
-                        const uint32_t Cnt) const noexcept {
+Expect<void> Executor::arrayFill(Runtime::StackManager &StackMgr,
+                                 const RefVariant &Ref, const ValVariant &Val,
+                                 const uint32_t TypeIdx, const uint32_t Idx,
+                                 const uint32_t Cnt) const noexcept {
+  return arrayFill(StackMgr.getModule(), Ref, Val, TypeIdx, Idx, Cnt);
+}
+
+Expect<void> Executor::arrayInitData(
+    const Runtime::Instance::ModuleInstance *ModInst, const RefVariant &Ref,
+    const uint32_t TypeIdx, const uint32_t DataIdx, const uint32_t DstIdx,
+    const uint32_t SrcIdx, const uint32_t Cnt) const noexcept {
   auto *Inst = Ref.getPtr<Runtime::Instance::ArrayInstance>();
   if (Inst == nullptr) {
     return Unexpect(ErrCode::Value::AccessNullArray);
@@ -599,9 +660,9 @@ Executor::arrayInitData(Runtime::StackManager &StackMgr, const RefVariant &Ref,
       Inst->getLength()) {
     return Unexpect(ErrCode::Value::ArrayOutOfBounds);
   }
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
+  const auto &VType = getArrayStorageTypeByIdx(ModInst, TypeIdx);
   const uint32_t BSize = VType.getBitWidth() / 8;
-  auto *DataInst = getDataInstByIdx(StackMgr, DataIdx);
+  auto *DataInst = getDataInstByIdx(ModInst, DataIdx);
   assuming(DataInst);
   if (static_cast<uint64_t>(SrcIdx) + static_cast<uint64_t>(Cnt) * BSize >
       DataInst->getData().size()) {
@@ -617,10 +678,18 @@ Executor::arrayInitData(Runtime::StackManager &StackMgr, const RefVariant &Ref,
 }
 
 Expect<void>
-Executor::arrayInitElem(Runtime::StackManager &StackMgr, const RefVariant &Ref,
-                        const uint32_t TypeIdx, const uint32_t ElemIdx,
+Executor::arrayInitData(Runtime::StackManager &StackMgr, const RefVariant &Ref,
+                        const uint32_t TypeIdx, const uint32_t DataIdx,
                         const uint32_t DstIdx, const uint32_t SrcIdx,
                         const uint32_t Cnt) const noexcept {
+  return arrayInitData(StackMgr.getModule(), Ref, TypeIdx, DataIdx, DstIdx,
+                       SrcIdx, Cnt);
+}
+
+Expect<void> Executor::arrayInitElem(
+    const Runtime::Instance::ModuleInstance *ModInst, const RefVariant &Ref,
+    const uint32_t TypeIdx, const uint32_t ElemIdx, const uint32_t DstIdx,
+    const uint32_t SrcIdx, const uint32_t Cnt) const noexcept {
   auto *Inst = Ref.getPtr<Runtime::Instance::ArrayInstance>();
   if (Inst == nullptr) {
     return Unexpect(ErrCode::Value::AccessNullArray);
@@ -629,8 +698,8 @@ Executor::arrayInitElem(Runtime::StackManager &StackMgr, const RefVariant &Ref,
       Inst->getLength()) {
     return Unexpect(ErrCode::Value::ArrayOutOfBounds);
   }
-  const auto &VType = getArrayStorageTypeByIdx(StackMgr, TypeIdx);
-  auto *ElemInst = getElemInstByIdx(StackMgr, ElemIdx);
+  const auto &VType = getArrayStorageTypeByIdx(ModInst, TypeIdx);
+  auto *ElemInst = getElemInstByIdx(ModInst, ElemIdx);
   assuming(ElemInst);
   auto ElemSrc = ElemInst->getRefs();
   if (static_cast<uint64_t>(SrcIdx) + static_cast<uint64_t>(Cnt) >
@@ -647,10 +716,20 @@ Executor::arrayInitElem(Runtime::StackManager &StackMgr, const RefVariant &Ref,
 }
 
 Expect<void>
-Executor::arrayCopy(Runtime::StackManager &StackMgr, const RefVariant &DstRef,
-                    const uint32_t DstTypeIdx, const uint32_t DstIdx,
-                    const RefVariant &SrcRef, const uint32_t SrcTypeIdx,
-                    const uint32_t SrcIdx, const uint32_t Cnt) const noexcept {
+Executor::arrayInitElem(Runtime::StackManager &StackMgr, const RefVariant &Ref,
+                        const uint32_t TypeIdx, const uint32_t ElemIdx,
+                        const uint32_t DstIdx, const uint32_t SrcIdx,
+                        const uint32_t Cnt) const noexcept {
+  return arrayInitElem(StackMgr.getModule(), Ref, TypeIdx, ElemIdx, DstIdx,
+                       SrcIdx, Cnt);
+}
+
+Expect<void>
+Executor::arrayCopy(const Runtime::Instance::ModuleInstance *ModInst,
+                    const RefVariant &DstRef, const uint32_t DstTypeIdx,
+                    const uint32_t DstIdx, const RefVariant &SrcRef,
+                    const uint32_t SrcTypeIdx, const uint32_t SrcIdx,
+                    const uint32_t Cnt) const noexcept {
   auto *SrcInst = SrcRef.getPtr<Runtime::Instance::ArrayInstance>();
   auto *DstInst = DstRef.getPtr<Runtime::Instance::ArrayInstance>();
   if (SrcInst == nullptr) {
@@ -670,8 +749,8 @@ Executor::arrayCopy(Runtime::StackManager &StackMgr, const RefVariant &DstRef,
 
   auto SrcArr = SrcInst->getArray();
   auto DstArr = DstInst->getArray();
-  const auto &SrcVType = getArrayStorageTypeByIdx(StackMgr, SrcTypeIdx);
-  const auto &DstVType = getArrayStorageTypeByIdx(StackMgr, DstTypeIdx);
+  const auto &SrcVType = getArrayStorageTypeByIdx(ModInst, SrcTypeIdx);
+  const auto &DstVType = getArrayStorageTypeByIdx(ModInst, DstTypeIdx);
   if (DstIdx <= SrcIdx) {
     std::transform(SrcArr.begin() + SrcIdx, SrcArr.begin() + SrcIdx + Cnt,
                    DstArr.begin() + DstIdx, [&](const ValVariant &V) {
@@ -686,6 +765,15 @@ Executor::arrayCopy(Runtime::StackManager &StackMgr, const RefVariant &DstRef,
                    });
   }
   return {};
+}
+
+Expect<void>
+Executor::arrayCopy(Runtime::StackManager &StackMgr, const RefVariant &DstRef,
+                    const uint32_t DstTypeIdx, const uint32_t DstIdx,
+                    const RefVariant &SrcRef, const uint32_t SrcTypeIdx,
+                    const uint32_t SrcIdx, const uint32_t Cnt) const noexcept {
+  return arrayCopy(StackMgr.getModule(), DstRef, DstTypeIdx, DstIdx, SrcRef,
+                   SrcTypeIdx, SrcIdx, Cnt);
 }
 
 } // namespace Executor
