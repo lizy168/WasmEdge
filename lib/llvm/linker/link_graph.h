@@ -22,6 +22,7 @@ namespace Linker {
 enum class Target : uint8_t { X86_64, ARM, AArch64, RISCV64, S390X };
 enum class Endianness : uint8_t { Little, Big };
 enum class SectionKind : uint8_t { Text, ReadOnly, Data, BSS, Unwind };
+enum class ObjectFormat : uint8_t { ELF, MachO, COFF };
 
 using SectionId = uint32_t;
 using SymbolId = uint32_t;
@@ -54,6 +55,7 @@ struct Relocation {
   SymbolId Symbol;
   int64_t Addend;
   bool AddendIsImplicit = false;
+  ObjectFormat Format = ObjectFormat::ELF;
 };
 
 struct Rebase {
@@ -61,6 +63,8 @@ struct Rebase {
   uint64_t Offset;
   uint32_t Type;
   int64_t Addend;
+  uint8_t Width = 0;
+  ObjectFormat Format = ObjectFormat::ELF;
 };
 
 struct Diagnostic {
@@ -102,6 +106,7 @@ public:
   std::vector<Relocation> &relocations() noexcept { return Relocations; }
   const std::vector<Rebase> &rebases() const noexcept { return Rebases; }
   std::vector<Rebase> &rebases() noexcept { return Rebases; }
+  bool relocationsApplied() const noexcept { return RelocationsApplied; }
 
 private:
   Target TargetValue;
@@ -111,6 +116,9 @@ private:
   std::vector<Symbol> Symbols;
   std::vector<Relocation> Relocations;
   std::vector<Rebase> Rebases;
+  bool RelocationsApplied = false;
+
+  friend Expect<void> applyRelocations(LinkGraph &) noexcept;
 };
 
 } // namespace Linker

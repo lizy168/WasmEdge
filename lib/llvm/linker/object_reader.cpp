@@ -338,6 +338,16 @@ relocationAddend(const llvm::object::ObjectFile &Object,
   return {*Addend, false};
 }
 
+ObjectFormat objectFormat(const llvm::object::ObjectFile &Object) noexcept {
+  if (Object.isMachO()) {
+    return ObjectFormat::MachO;
+  }
+  if (Object.isCOFF()) {
+    return ObjectFormat::COFF;
+  }
+  return ObjectFormat::ELF;
+}
+
 } // namespace
 
 namespace Internal {
@@ -561,7 +571,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       auto Added = Graph.addRelocation(
           Relocation{Section->second, InputRelocation.getOffset(),
                      static_cast<uint32_t>(InputRelocation.getType()),
-                     Symbol->second, Addend, Implicit});
+                     Symbol->second, Addend, Implicit, objectFormat(Object)});
       if (!Added) {
         return fail<LinkGraph>(Added.error().Message);
       }
