@@ -44,6 +44,7 @@ struct Symbol {
   uint64_t Offset;
   uint64_t Size;
   bool Exported;
+  std::optional<std::string> ExportName = std::nullopt;
 };
 
 struct Relocation {

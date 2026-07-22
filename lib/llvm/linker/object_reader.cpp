@@ -19,7 +19,6 @@
 
 #include <algorithm>
 #include <map>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,11 +73,176 @@ bool isSupportedFormat(const llvm::object::ObjectFile &Object) noexcept {
 }
 
 uint64_t sectionAlignment(const llvm::object::SectionRef &Section) noexcept {
-#if LLVM_VERSION_MAJOR >= 11
+#if LLVM_VERSION_MAJOR >= 16
   return Internal::normalizeSectionAlignment(Section.getAlignment().value());
 #else
   return Internal::normalizeSectionAlignment(Section.getAlignment());
 #endif
+}
+
+bool symbolFlags(const llvm::object::SymbolRef &Symbol, uint32_t &Flags) {
+#if LLVM_VERSION_MAJOR >= 11
+  return take(Symbol.getFlags(), Flags, "cannot read symbol flags");
+#else
+  Flags = Symbol.getFlags();
+  return true;
+#endif
+}
+
+template <typename T>
+bool readELFInteger(Span<const Byte> Buffer, uint64_t Offset, bool LittleEndian,
+                    T &Value) noexcept {
+  if (Offset > Buffer.size() || sizeof(T) > Buffer.size() - Offset) {
+    return false;
+  }
+  Value = 0;
+  for (size_t I = 0; I < sizeof(T); ++I) {
+    const size_t Shift = LittleEndian ? I * 8 : (sizeof(T) - I - 1) * 8;
+    Value |= static_cast<T>(Buffer[Offset + I]) << Shift;
+  }
+  return true;
+}
+
+bool validELFRelocations(Span<const Byte> Buffer) noexcept {
+  if (Buffer.size() < 16 || Buffer[0] != 0x7F || Buffer[1] != 'E' ||
+      Buffer[2] != 'L' || Buffer[3] != 'F') {
+    return true;
+  }
+  const bool Is64 = Buffer[4] == llvm::ELF::ELFCLASS64;
+  const bool Is32 = Buffer[4] == llvm::ELF::ELFCLASS32;
+  const bool LittleEndian = Buffer[5] == llvm::ELF::ELFDATA2LSB;
+  if ((!Is32 && !Is64) ||
+      (!LittleEndian && Buffer[5] != llvm::ELF::ELFDATA2MSB)) {
+    return false;
+  }
+  uint64_t SectionOffset = 0;
+  uint16_t SectionEntrySize = 0;
+  uint16_t SectionCount16 = 0;
+  if (Is64) {
+    if (!readELFInteger(Buffer, 40, LittleEndian, SectionOffset) ||
+        !readELFInteger(Buffer, 58, LittleEndian, SectionEntrySize) ||
+        !readELFInteger(Buffer, 60, LittleEndian, SectionCount16)) {
+      return false;
+    }
+  } else {
+    uint32_t Offset32 = 0;
+    if (!readELFInteger(Buffer, 32, LittleEndian, Offset32) ||
+        !readELFInteger(Buffer, 46, LittleEndian, SectionEntrySize) ||
+        !readELFInteger(Buffer, 48, LittleEndian, SectionCount16)) {
+      return false;
+    }
+    SectionOffset = Offset32;
+  }
+  uint64_t SectionCount = SectionCount16;
+  const uint64_t RequiredSectionSize = Is64 ? 64 : 40;
+  if (SectionEntrySize < RequiredSectionSize || SectionOffset > Buffer.size() ||
+      SectionEntrySize > Buffer.size() - SectionOffset) {
+    return false;
+  }
+  if (SectionCount == 0) {
+    if (Is64) {
+      if (!readELFInteger(Buffer, SectionOffset + 32, LittleEndian,
+                          SectionCount)) {
+        return false;
+      }
+    } else {
+      uint32_t ExtendedCount = 0;
+      if (!readELFInteger(Buffer, SectionOffset + 20, LittleEndian,
+                          ExtendedCount)) {
+        return false;
+      }
+      SectionCount = ExtendedCount;
+    }
+  }
+  if (SectionCount == 0 ||
+      static_cast<uint64_t>(SectionCount) >
+          (Buffer.size() - SectionOffset) / SectionEntrySize) {
+    return false;
+  }
+  auto readSection = [&](uint64_t Index, uint32_t &Type, uint64_t &Offset,
+                         uint64_t &Size, uint32_t &Link,
+                         uint64_t &EntrySize) noexcept {
+    if (Index >= SectionCount) {
+      return false;
+    }
+    const uint64_t Base = SectionOffset + Index * SectionEntrySize;
+    if (!readELFInteger(Buffer, Base + 4, LittleEndian, Type) ||
+        !readELFInteger(Buffer, Base + (Is64 ? 40 : 24), LittleEndian, Link)) {
+      return false;
+    }
+    if (Is64) {
+      return readELFInteger(Buffer, Base + 24, LittleEndian, Offset) &&
+             readELFInteger(Buffer, Base + 32, LittleEndian, Size) &&
+             readELFInteger(Buffer, Base + 56, LittleEndian, EntrySize);
+    }
+    uint32_t Offset32 = 0;
+    uint32_t Size32 = 0;
+    uint32_t EntrySize32 = 0;
+    if (!readELFInteger(Buffer, Base + 16, LittleEndian, Offset32) ||
+        !readELFInteger(Buffer, Base + 20, LittleEndian, Size32) ||
+        !readELFInteger(Buffer, Base + 36, LittleEndian, EntrySize32)) {
+      return false;
+    }
+    Offset = Offset32;
+    Size = Size32;
+    EntrySize = EntrySize32;
+    return true;
+  };
+  for (uint64_t I = 0; I < SectionCount; ++I) {
+    uint32_t Type = 0;
+    uint32_t Link = 0;
+    uint64_t Offset = 0;
+    uint64_t Size = 0;
+    uint64_t EntrySize = 0;
+    if (!readSection(I, Type, Offset, Size, Link, EntrySize)) {
+      return false;
+    }
+    if (Type != llvm::ELF::SHT_REL && Type != llvm::ELF::SHT_RELA) {
+#if LLVM_VERSION_MAJOR >= 19
+      if (Type == llvm::ELF::SHT_CREL) {
+        return false;
+      }
+#endif
+      continue;
+    }
+    const uint64_t ExpectedEntrySize =
+        Is64 ? (Type == llvm::ELF::SHT_RELA ? 24 : 16)
+             : (Type == llvm::ELF::SHT_RELA ? 12 : 8);
+    uint32_t SymbolType = 0;
+    uint32_t SymbolLink = 0;
+    uint64_t SymbolOffset = 0;
+    uint64_t SymbolSize = 0;
+    uint64_t SymbolEntrySize = 0;
+    if (EntrySize != ExpectedEntrySize || Size % EntrySize != 0 ||
+        Offset > Buffer.size() || Size > Buffer.size() - Offset ||
+        !readSection(Link, SymbolType, SymbolOffset, SymbolSize, SymbolLink,
+                     SymbolEntrySize) ||
+        (SymbolType != llvm::ELF::SHT_SYMTAB &&
+         SymbolType != llvm::ELF::SHT_DYNSYM) ||
+        SymbolEntrySize != (Is64 ? 24U : 16U) ||
+        SymbolSize % SymbolEntrySize != 0 || SymbolOffset > Buffer.size() ||
+        SymbolSize > Buffer.size() - SymbolOffset) {
+      return false;
+    }
+    const uint64_t SymbolCount = SymbolSize / SymbolEntrySize;
+    for (uint64_t J = 0; J < Size / EntrySize; ++J) {
+      const uint64_t InfoOffset = Offset + J * EntrySize + (Is64 ? 8 : 4);
+      uint64_t Info = 0;
+      if (Is64) {
+        if (!readELFInteger(Buffer, InfoOffset, LittleEndian, Info) ||
+            (Info >> 32) >= SymbolCount) {
+          return false;
+        }
+      } else {
+        uint32_t Info32 = 0;
+        if (!readELFInteger(Buffer, InfoOffset, LittleEndian, Info32) ||
+            (Info32 >> 8) >= SymbolCount) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
 }
 
 bool isAllocatable(const llvm::object::ObjectFile &Object,
@@ -148,9 +312,10 @@ uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept {
   return std::max<uint64_t>(Alignment, 1);
 }
 
-std::optional<std::set<std::string>> parseCOFFExports(std::string_view Input) {
+std::optional<std::map<std::string, std::string>>
+parseCOFFExports(std::string_view Input) {
   llvm::StringRef Directives(Input.data(), Input.size());
-  std::set<std::string> Exports;
+  std::map<std::string, std::string> Exports;
   while (!Directives.trim().empty()) {
     Directives = Directives.ltrim();
     llvm::StringRef Token;
@@ -174,11 +339,12 @@ std::optional<std::set<std::string>> parseCOFFExports(std::string_view Input) {
     }
     Token = Token.drop_front(8);
     Token = Token.split(',').first;
-    Token = Token.split('=').first;
-    if (Token.empty()) {
+    const auto [ExportName, SymbolName] = Token.split('=');
+    if (ExportName.empty()) {
       return std::nullopt;
     }
-    Exports.emplace(Token.str());
+    Exports.emplace(ExportName.str(),
+                    SymbolName.empty() ? ExportName.str() : SymbolName.str());
   }
   return Exports;
 }
@@ -189,6 +355,9 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
                                      Target ExpectedTarget) noexcept {
   if (Buffer.empty()) {
     return fail<LinkGraph>("empty object buffer");
+  }
+  if (!validELFRelocations(Buffer)) {
+    return fail<LinkGraph>("malformed ELF relocation metadata");
   }
   const auto Data = llvm::StringRef(
       reinterpret_cast<const char *>(Buffer.data()), Buffer.size());
@@ -220,7 +389,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     return fail<LinkGraph>("cannot initialize link graph input");
   }
   std::map<uint64_t, SectionId> SectionIds;
-  std::set<std::string> COFFExports;
+  std::map<std::string, std::string> COFFExports;
   for (const auto &InputSection : Object.sections()) {
     llvm::StringRef Name;
     if (!take(InputSection.getName(), Name, "cannot read section name")) {
@@ -267,7 +436,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     uint32_t Flags = 0;
     llvm::object::SymbolRef::Type Type{};
     if (!take(InputSymbol.getName(), Name, "cannot read symbol name") ||
-        !take(InputSymbol.getFlags(), Flags, "cannot read symbol flags") ||
+        !symbolFlags(InputSymbol, Flags) ||
         !take(InputSymbol.getType(), Type, "cannot read symbol type")) {
       return Unexpect(ErrCode::Value::IllegalPath);
     }
@@ -305,18 +474,26 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       return fail<LinkGraph>("symbol address precedes its section");
     }
     bool Exported = (Flags & llvm::object::SymbolRef::SF_Exported) != 0;
+    std::optional<std::string> ExportName;
     if (Object.isMachO()) {
-      Exported = (Flags & llvm::object::SymbolRef::SF_Global) != 0;
+      Exported = (Flags & llvm::object::SymbolRef::SF_Global) != 0 &&
+                 (Flags & llvm::object::SymbolRef::SF_Hidden) == 0;
     } else if (Object.isCOFF()) {
-      Exported = COFFExports.count(Name.str()) != 0;
+      const auto Export =
+          std::find_if(COFFExports.begin(), COFFExports.end(),
+                       [&](const auto &Entry) { return Entry.second == Name; });
+      Exported = Export != COFFExports.end();
+      if (Exported && Export->first != Name) {
+        ExportName = Export->first;
+      }
     }
     std::string SymbolName = Name.str();
     if (SymbolName == "$section") {
       SymbolName += std::to_string((*InputSection)->getIndex());
     }
-    auto Added = Graph.addSymbol(
-        Symbol{std::move(SymbolName), Section->second, Address - Base,
-               SymbolSizes[InputSymbol.getRawDataRefImpl()], Exported});
+    auto Added = Graph.addSymbol(Symbol{
+        std::move(SymbolName), Section->second, Address - Base,
+        SymbolSizes[InputSymbol.getRawDataRefImpl()], Exported, ExportName});
     if (!Added) {
       return fail<LinkGraph>(Added.error().Message);
     }

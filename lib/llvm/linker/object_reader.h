@@ -8,8 +8,8 @@
 #include "common/types.h"
 #include "linker/link_graph.h"
 
+#include <map>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 
@@ -20,7 +20,7 @@ namespace Linker {
 namespace Internal {
 
 uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept;
-std::optional<std::set<std::string>>
+std::optional<std::map<std::string, std::string>>
 parseCOFFExports(std::string_view Directives);
 
 } // namespace Internal

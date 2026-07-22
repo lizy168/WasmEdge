@@ -14,6 +14,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/CodeGen.h>
 #if LLVM_VERSION_MAJOR >= 19
 #include <llvm/TargetParser/Host.h>
@@ -28,7 +29,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
-#include <set>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -37,13 +37,15 @@ namespace {
 
 using namespace WasmEdge::LLVM::Linker;
 
-std::vector<WasmEdge::Byte> makeObject(const llvm::Triple &Triple,
-                                       bool Undefined = false,
-                                       bool DLLExport = false) {
+std::vector<WasmEdge::Byte>
+makeObject(const llvm::Triple &Triple, bool Undefined = false,
+           bool DLLExport = false, std::string FunctionName = "f0",
+           std::string Directives = {}, bool Hidden = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
     llvm::InitializeAllAsmPrinters();
+    llvm::InitializeAllAsmParsers();
     return true;
   }();
   (void)Initialized;
@@ -84,15 +86,21 @@ std::vector<WasmEdge::Byte> makeObject(const llvm::Triple &Triple,
                                         llvm::GlobalValue::InternalLinkage,
                                         llvm::ConstantInt::get(I32, 0), "zero");
   Zero->setAlignment(llvm::Align(16));
-  auto *F0 =
-      llvm::Function::Create(llvm::FunctionType::get(I32, false),
-                             llvm::GlobalValue::ExternalLinkage, "f0", Module);
+  auto *F0 = llvm::Function::Create(llvm::FunctionType::get(I32, false),
+                                    llvm::GlobalValue::ExternalLinkage,
+                                    FunctionName, Module);
   F0->addFnAttr(llvm::Attribute::NoUnwind);
+  F0->setVisibility(Hidden ? llvm::GlobalValue::HiddenVisibility
+                           : llvm::GlobalValue::DefaultVisibility);
   if (DLLExport) {
     F0->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
   }
   llvm::IRBuilder<> Builder(llvm::BasicBlock::Create(Context, "entry", F0));
   Builder.CreateRet(Builder.CreateLoad(I32, Value));
+  if (!Directives.empty()) {
+    Module.setModuleInlineAsm(".section .drectve\n.ascii \" " + Directives +
+                              "\"");
+  }
 
   llvm::SmallVector<char, 0> Storage;
   llvm::raw_svector_ostream Stream(Storage);
@@ -105,6 +113,50 @@ std::vector<WasmEdge::Byte> makeObject(const llvm::Triple &Triple,
   EXPECT_FALSE(Machine->addPassesToEmitFile(Passes, Stream, nullptr, FileType));
   Passes.run(Module);
   return std::vector<WasmEdge::Byte>(Storage.begin(), Storage.end());
+}
+
+uint64_t read64le(const std::vector<WasmEdge::Byte> &Bytes, size_t Offset) {
+  uint64_t Value = 0;
+  for (size_t I = 0; I < 8; ++I) {
+    Value |= static_cast<uint64_t>(Bytes[Offset + I]) << (I * 8);
+  }
+  return Value;
+}
+
+void write64le(std::vector<WasmEdge::Byte> &Bytes, size_t Offset,
+               uint64_t Value) {
+  for (size_t I = 0; I < 8; ++I) {
+    Bytes[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+  }
+}
+
+size_t elf64RelocationSectionHeader(const std::vector<WasmEdge::Byte> &Bytes) {
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "test.o"));
+  EXPECT_TRUE(static_cast<bool>(Object));
+  if (!Object) {
+    llvm::consumeError(Object.takeError());
+    return 0;
+  }
+  uint64_t Index = 0;
+  for (const auto &Section : (*Object)->sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (Name &&
+#if LLVM_VERSION_MAJOR >= 19
+        (Name->starts_with(".rela") || Name->starts_with(".rel"))) {
+#else
+        (Name->startswith(".rela") || Name->startswith(".rel"))) {
+#endif
+      Index = Section.getIndex();
+      break;
+    }
+  }
+  EXPECT_NE(Index, 0U);
+  return static_cast<size_t>(read64le(Bytes, 40) + Index * 64);
 }
 
 std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
@@ -437,8 +489,10 @@ TEST(ObjectReaderTest, ParsesCOFFExportDirectives) {
       " /DEFAULTLIB:libcmt /EXPORT:f0 /EXPORT:data,DATA "
       "/EXPORT:ordinal,NONAME /EXPORT:alias=real");
   ASSERT_TRUE(Exports);
-  EXPECT_EQ(*Exports,
-            (std::set<std::string>{"alias", "data", "f0", "ordinal"}));
+  EXPECT_EQ(Exports->at("alias"), "real");
+  EXPECT_EQ(Exports->at("data"), "data");
+  EXPECT_EQ(Exports->at("f0"), "f0");
+  EXPECT_EQ(Exports->at("ordinal"), "ordinal");
 }
 
 TEST(ObjectReaderTest, RejectsMalformedCOFFExportDirectives) {
@@ -503,6 +557,21 @@ TEST(ObjectReaderTest, ReadsCOFFExportsFromDirectives) {
   EXPECT_TRUE(F0->Exported);
 }
 
+TEST(ObjectReaderTest, NormalizesRenamedCOFFExport) {
+  auto Result =
+      ObjectReader::read(makeObject(llvm::Triple("x86_64-pc-windows-msvc"),
+                                    false, false, "real", "/EXPORT:alias=real"),
+                         Target::X86_64);
+  ASSERT_TRUE(Result);
+  const auto Real =
+      std::find_if(Result->symbols().begin(), Result->symbols().end(),
+                   [](const Symbol &Value) { return Value.Name == "real"; });
+  ASSERT_NE(Real, Result->symbols().end());
+  EXPECT_TRUE(Real->Exported);
+  ASSERT_TRUE(Real->ExportName);
+  EXPECT_EQ(*Real->ExportName, "alias");
+}
+
 TEST(ObjectReaderTest, ExportsMachOExternalDefinedSymbols) {
   auto Result = ObjectReader::read(
       makeObject(llvm::Triple("x86_64-apple-macosx")), Target::X86_64);
@@ -512,6 +581,51 @@ TEST(ObjectReaderTest, ExportsMachOExternalDefinedSymbols) {
                    [](const Symbol &Value) { return Value.Name == "_f0"; });
   ASSERT_NE(F0, Result->symbols().end());
   EXPECT_TRUE(F0->Exported);
+}
+
+TEST(ObjectReaderTest, DoesNotExportHiddenMachOSymbols) {
+  auto Result =
+      ObjectReader::read(makeObject(llvm::Triple("x86_64-apple-macosx"), false,
+                                    false, "hidden", {}, true),
+                         Target::X86_64);
+  ASSERT_TRUE(Result);
+  const auto Hidden =
+      std::find_if(Result->symbols().begin(), Result->symbols().end(),
+                   [](const Symbol &Value) { return Value.Name == "_hidden"; });
+  ASSERT_NE(Hidden, Result->symbols().end());
+  EXPECT_FALSE(Hidden->Exported);
+}
+
+TEST(ObjectReaderTest, RejectsELFRelocationWithInvalidSectionLink) {
+  auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
+  const auto Header = elf64RelocationSectionHeader(Bytes);
+  Bytes[Header + 40] = 0xFF;
+  Bytes[Header + 41] = 0xFF;
+  Bytes[Header + 42] = 0xFF;
+  Bytes[Header + 43] = 0x7F;
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsELFRelocationWithZeroEntrySize) {
+  auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
+  const auto Header = elf64RelocationSectionHeader(Bytes);
+  write64le(Bytes, Header + 56, 0);
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsTruncatedELFRelocationTable) {
+  auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
+  const auto Header = elf64RelocationSectionHeader(Bytes);
+  write64le(Bytes, Header + 32, read64le(Bytes, Header + 32) - 1);
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsELFRelocationWithInvalidSymbolIndex) {
+  auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
+  const auto Header = elf64RelocationSectionHeader(Bytes);
+  const auto RelocationOffset = read64le(Bytes, Header + 24);
+  write64le(Bytes, RelocationOffset + 8, UINT64_C(0xFFFFFFFF00000000));
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
 }
 
 TEST(ObjectReaderTest, MarksELFRelAddendsImplicit) {
