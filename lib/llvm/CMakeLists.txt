@@ -27,6 +27,7 @@ set(WASMEDGE_LLVM_SOURCES
   data.cpp
   jit.cpp
   lazyjit.cpp
+  linker/link_graph.cpp
   llvm.cpp
 )
 

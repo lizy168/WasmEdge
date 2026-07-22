@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
 wasmedge_add_executable(wasmedgeLLVMCoreTests
+  LinkerTest.cpp
   LLVMcoreTest.cpp
 )
 
@@ -11,6 +12,11 @@ target_link_libraries(wasmedgeLLVMCoreTests
   PRIVATE
   wasmedgeTestSpec
   wasmedgeVM
+)
+
+target_include_directories(wasmedgeLLVMCoreTests
+  PRIVATE
+  ${PROJECT_SOURCE_DIR}/lib/llvm
 )
 
 wasmedge_add_executable(wasmedgeLazyJITTests
