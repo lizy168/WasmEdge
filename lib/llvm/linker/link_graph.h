@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/expected.h"
+#include "common/span.h"
 #include "common/types.h"
 
 namespace WasmEdge {
@@ -85,7 +86,9 @@ public:
   LinkExpect<void> addRelocation(Relocation Value);
   LinkExpect<void> addRebase(Rebase Value);
   LinkExpect<void> validate() const;
-  LinkExpect<Section *> section(SectionId Id);
+  LinkExpect<void> setSectionAddress(SectionId Id, uint64_t Address);
+  LinkExpect<void> setSectionFileOffset(SectionId Id, uint64_t FileOffset);
+  LinkExpect<Span<Byte>> sectionContent(SectionId Id);
 
   Target target() const noexcept { return TargetValue; }
   Endianness endianness() const noexcept { return EndianValue; }

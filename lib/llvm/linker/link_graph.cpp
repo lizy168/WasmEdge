@@ -142,6 +142,22 @@ LinkExpect<void> LinkGraph::validate() const {
   if (!InputName) {
     return fail<void>(Diagnostic{"link graph requires one input object"});
   }
+  for (SectionId I = 0; I < Sections.size(); ++I) {
+    const auto &Value = Sections[I];
+    if (Value.Alignment == 0 ||
+        (Value.Alignment & (Value.Alignment - 1)) != 0) {
+      Diagnostic Diag{"section alignment must be a non-zero power of two"};
+      Diag.Section = I;
+      Diag.SectionName = Value.Name;
+      return fail<void>(std::move(Diag));
+    }
+    if (Value.Content.size() > Value.VirtualSize) {
+      Diagnostic Diag{"section content exceeds section virtual size"};
+      Diag.Section = I;
+      Diag.SectionName = Value.Name;
+      return fail<void>(std::move(Diag));
+    }
+  }
   for (size_t I = 0; I < Symbols.size(); ++I) {
     const auto &Value = Symbols[I];
     if (Value.Section >= Sections.size()) {
@@ -207,13 +223,34 @@ LinkExpect<void> LinkGraph::validate() const {
   return {};
 }
 
-LinkExpect<Section *> LinkGraph::section(SectionId Id) {
+LinkExpect<void> LinkGraph::setSectionAddress(SectionId Id, uint64_t Address) {
   if (Id >= Sections.size()) {
     Diagnostic Diag{"invalid section ID"};
     Diag.Section = Id;
-    return fail<Section *>(std::move(Diag));
+    return fail<void>(std::move(Diag));
   }
-  return &Sections[Id];
+  Sections[Id].Address = Address;
+  return {};
+}
+
+LinkExpect<void> LinkGraph::setSectionFileOffset(SectionId Id,
+                                                 uint64_t FileOffset) {
+  if (Id >= Sections.size()) {
+    Diagnostic Diag{"invalid section ID"};
+    Diag.Section = Id;
+    return fail<void>(std::move(Diag));
+  }
+  Sections[Id].FileOffset = FileOffset;
+  return {};
+}
+
+LinkExpect<Span<Byte>> LinkGraph::sectionContent(SectionId Id) {
+  if (Id >= Sections.size()) {
+    Diagnostic Diag{"invalid section ID"};
+    Diag.Section = Id;
+    return fail<Span<Byte>>(std::move(Diag));
+  }
+  return Span<Byte>(Sections[Id].Content.data(), Sections[Id].Content.size());
 }
 
 } // namespace Linker

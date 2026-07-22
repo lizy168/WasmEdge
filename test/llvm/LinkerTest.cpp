@@ -212,18 +212,46 @@ TEST(LinkGraphTest, ProvidesCheckedMutableGraphAccess) {
   ASSERT_TRUE(Graph.addRelocation(Relocation{*Text, 0, 42, *TargetSymbol, 0}));
   ASSERT_TRUE(Graph.addRebase(Rebase{*Text, 1, 7, 0}));
 
-  auto MutableSection = Graph.section(*Text);
-  ASSERT_TRUE(MutableSection);
-  (*MutableSection)->Address = 64;
+  ASSERT_TRUE(Graph.setSectionAddress(*Text, 64));
+  ASSERT_TRUE(Graph.setSectionFileOffset(*Text, 32));
+  auto Content = Graph.sectionContent(*Text);
+  ASSERT_TRUE(Content);
+  (*Content)[0] = 0xCC;
   Graph.relocations()[0].Addend = 8;
   Graph.rebases()[0].Addend = 16;
   EXPECT_EQ(Graph.sections()[*Text].Address, 64U);
+  EXPECT_EQ(Graph.sections()[*Text].FileOffset, 32U);
+  EXPECT_EQ(Graph.sections()[*Text].Content[0], 0xCCU);
   EXPECT_EQ(Graph.relocations()[0].Addend, 8);
   EXPECT_EQ(Graph.rebases()[0].Addend, 16);
 
-  auto Invalid = Graph.section(InvalidSectionId);
-  ASSERT_FALSE(Invalid);
-  EXPECT_EQ(Invalid.error().Message, "invalid section ID");
+  EXPECT_FALSE(Graph.setSectionAddress(InvalidSectionId, 0));
+  EXPECT_FALSE(Graph.setSectionFileOffset(InvalidSectionId, 0));
+  EXPECT_FALSE(Graph.sectionContent(InvalidSectionId));
+}
+
+TEST(LinkGraphTest, ValidatesMutatedSectionInvariants) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text =
+      Graph.addSection(Section{".text", SectionKind::Text, 1, 2, 0, 0, {0}});
+  ASSERT_TRUE(Text);
+
+  auto Content = Graph.sectionContent(*Text);
+  ASSERT_TRUE(Content);
+  auto &Sections = const_cast<std::vector<Section> &>(Graph.sections());
+  Sections[*Text].Alignment = 0;
+  auto AlignmentResult = Graph.validate();
+  ASSERT_FALSE(AlignmentResult);
+  EXPECT_EQ(AlignmentResult.error().Message,
+            "section alignment must be a non-zero power of two");
+
+  Sections[*Text].Alignment = 1;
+  Sections[*Text].VirtualSize = 0;
+  auto SizeResult = Graph.validate();
+  ASSERT_FALSE(SizeResult);
+  EXPECT_EQ(SizeResult.error().Message,
+            "section content exceeds section virtual size");
 }
 
 TEST(LinkGraphTest, ValidatesMutatedPatchOffsets) {
