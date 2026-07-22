@@ -14,6 +14,6 @@ output_dir=$3
 mkdir -p "$output_dir"
 cd "$output_dir"
 
-"$wasmedgec" --dump-ir "$input" output.aot.wasm
+"$wasmedgec" --dump "$input" output.aot.wasm
 llvm-readobj --file-headers --sections --symbols --relocations wasm.o > object.txt
 llvm-objdump -dr wasm.o > disassembly.txt
