@@ -12,44 +12,34 @@
 #include <vector>
 
 #include "common/expected.h"
+#include "common/types.h"
 
 namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
 
-enum class Target { X86_64, ARM, AArch64, RISCV64, S390X };
-enum class Endianness { Little, Big };
-enum class SectionKind { Text, ReadOnly, Data, BSS, Unwind };
+enum class Target : uint8_t { X86_64, ARM, AArch64, RISCV64, S390X };
+enum class Endianness : uint8_t { Little, Big };
+enum class SectionKind : uint8_t { Text, ReadOnly, Data, BSS, Unwind };
 
-struct SectionId {
-  uint32_t Value;
-};
-
-inline bool operator==(SectionId LHS, SectionId RHS) noexcept {
-  return LHS.Value == RHS.Value;
-}
-
-struct SymbolId {
-  uint32_t Value;
-};
-
-inline bool operator==(SymbolId LHS, SymbolId RHS) noexcept {
-  return LHS.Value == RHS.Value;
-}
+using SectionId = uint32_t;
+using SymbolId = uint32_t;
+inline constexpr SectionId InvalidSectionId = UINT32_MAX;
+inline constexpr SymbolId InvalidSymbolId = UINT32_MAX;
 
 struct Section {
   std::string Name;
   SectionKind Kind;
   uint64_t Alignment;
-  uint64_t Address;
-  uint64_t FileOffset;
   uint64_t VirtualSize;
-  std::vector<uint8_t> Content;
+  uint64_t Address = 0;
+  uint64_t FileOffset = 0;
+  std::vector<Byte> Content{};
 };
 
 struct Symbol {
   std::string Name;
-  std::optional<SectionId> Section;
+  SectionId Section;
   uint64_t Offset;
   uint64_t Size;
   bool Exported;

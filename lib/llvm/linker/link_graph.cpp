@@ -47,16 +47,21 @@ LinkExpect<SectionId> LinkGraph::addSection(Section Value) {
 }
 
 LinkExpect<SymbolId> LinkGraph::addSymbol(Symbol Value) {
-  if (Value.Section && Value.Section->Value >= Sections.size()) {
+  if (Value.Section == InvalidSectionId) {
+    Diagnostic Diag{"undefined symbol"};
+    Diag.SymbolName = Value.Name;
+    Diag.Offset = Value.Offset;
+    return fail<SymbolId>(std::move(Diag));
+  }
+  if (Value.Section >= Sections.size()) {
     Diagnostic Diag{"invalid section ID"};
     Diag.Section = Value.Section;
     Diag.SymbolName = Value.Name;
     Diag.Offset = Value.Offset;
     return fail<SymbolId>(std::move(Diag));
   }
-  if (Value.Section &&
-      extendsBeyond(Value.Offset, Value.Size,
-                    Sections[Value.Section->Value].VirtualSize)) {
+  if (extendsBeyond(Value.Offset, Value.Size,
+                    Sections[Value.Section].VirtualSize)) {
     Diagnostic Diag{"symbol extends beyond section virtual size"};
     Diag.Section = Value.Section;
     Diag.SymbolName = Value.Name;
@@ -65,7 +70,7 @@ LinkExpect<SymbolId> LinkGraph::addSymbol(Symbol Value) {
   }
   const auto Duplicate =
       std::find_if(Symbols.begin(), Symbols.end(), [&](const auto &Defined) {
-        return Defined.Section && Value.Section && Defined.Name == Value.Name;
+        return Defined.Name == Value.Name;
       });
   if (Duplicate != Symbols.end()) {
     Diagnostic Diag{"duplicate symbol definition"};
@@ -83,14 +88,14 @@ LinkExpect<SymbolId> LinkGraph::addSymbol(Symbol Value) {
 }
 
 LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
-  if (Value.Section.Value >= Sections.size()) {
+  if (Value.Section >= Sections.size()) {
     Diagnostic Diag{"invalid section ID"};
     Diag.Section = Value.Section;
     Diag.RelocationType = Value.Type;
     Diag.Offset = Value.Offset;
     return fail<void>(std::move(Diag));
   }
-  if (Value.Symbol.Value >= Symbols.size()) {
+  if (Value.Symbol >= Symbols.size()) {
     Diagnostic Diag{"invalid symbol ID"};
     Diag.Section = Value.Section;
     Diag.Symbol = Value.Symbol;
@@ -103,7 +108,7 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
 }
 
 LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
-  if (Value.Section.Value >= Sections.size()) {
+  if (Value.Section >= Sections.size()) {
     Diagnostic Diag{"invalid section ID"};
     Diag.Section = Value.Section;
     Diag.RelocationType = Value.Type;
@@ -120,26 +125,19 @@ LinkExpect<void> LinkGraph::validate() const {
   }
   for (uint32_t I = 0; I < Symbols.size(); ++I) {
     const auto &Value = Symbols[I];
-    if (!Value.Section) {
-      Diagnostic Diag{"undefined symbol"};
-      Diag.Symbol = SymbolId{I};
-      Diag.SymbolName = Value.Name;
-      Diag.Offset = Value.Offset;
-      return fail<void>(std::move(Diag));
-    }
-    if (Value.Section->Value >= Sections.size()) {
+    if (Value.Section >= Sections.size()) {
       Diagnostic Diag{"invalid section ID"};
       Diag.Section = Value.Section;
-      Diag.Symbol = SymbolId{I};
+      Diag.Symbol = I;
       Diag.SymbolName = Value.Name;
       Diag.Offset = Value.Offset;
       return fail<void>(std::move(Diag));
     }
     if (extendsBeyond(Value.Offset, Value.Size,
-                      Sections[Value.Section->Value].VirtualSize)) {
+                      Sections[Value.Section].VirtualSize)) {
       Diagnostic Diag{"symbol extends beyond section virtual size"};
       Diag.Section = Value.Section;
-      Diag.Symbol = SymbolId{I};
+      Diag.Symbol = I;
       Diag.SymbolName = Value.Name;
       Diag.Offset = Value.Offset;
       return fail<void>(std::move(Diag));
