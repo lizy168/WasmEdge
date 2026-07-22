@@ -117,6 +117,10 @@ Expect<void> applyRelocations(LinkGraph &Graph) noexcept {
                   static_cast<uint32_t>(Graph.target()));
     return Unexpect(ErrCode::Value::AOTNotImpl);
   }
+  if (Graph.endianness() != Endianness::Little) {
+    spdlog::error("native linker: x86_64 requires little-endian input"sv);
+    return Unexpect(ErrCode::Value::IllegalPath);
+  }
   auto Result = Internal::applyX86_64(Graph);
   if (!Result) {
     return Unexpect(Result.error());

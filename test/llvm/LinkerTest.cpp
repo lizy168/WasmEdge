@@ -197,6 +197,57 @@ std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
                     Undefined);
 }
 
+std::vector<WasmEdge::Byte> makeX86_64AssemblyObject(std::string Assembly) {
+  static const bool Initialized = [] {
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmPrinters();
+    llvm::InitializeAllAsmParsers();
+    return true;
+  }();
+  (void)Initialized;
+  const llvm::Triple Triple("x86_64-unknown-linux-gnu");
+  std::string Error;
+  const llvm::Target *Target =
+      llvm::TargetRegistry::lookupTarget(Triple.str(), Error);
+  EXPECT_NE(Target, nullptr) << Error;
+  if (Target == nullptr) {
+    return {};
+  }
+  llvm::TargetOptions Options;
+  std::unique_ptr<llvm::TargetMachine> Machine(Target->createTargetMachine(
+#if LLVM_VERSION_MAJOR >= 21
+      Triple,
+#else
+      Triple.str(),
+#endif
+      "generic", "", Options, llvm::Reloc::PIC_));
+  EXPECT_NE(Machine, nullptr);
+  if (Machine == nullptr) {
+    return {};
+  }
+  llvm::LLVMContext Context;
+  llvm::Module Module("x86-relocation-test", Context);
+#if LLVM_VERSION_MAJOR >= 21
+  Module.setTargetTriple(Triple);
+#else
+  Module.setTargetTriple(Triple.str());
+#endif
+  Module.setDataLayout(Machine->createDataLayout());
+  Module.setModuleInlineAsm(std::move(Assembly));
+  llvm::SmallVector<char, 0> Storage;
+  llvm::raw_svector_ostream Stream(Storage);
+  llvm::legacy::PassManager Passes;
+#if LLVM_VERSION_MAJOR >= 18
+  const auto FileType = llvm::CodeGenFileType::ObjectFile;
+#else
+  const auto FileType = llvm::CGFT_ObjectFile;
+#endif
+  EXPECT_FALSE(Machine->addPassesToEmitFile(Passes, Stream, nullptr, FileType));
+  Passes.run(Module);
+  return std::vector<WasmEdge::Byte>(Storage.begin(), Storage.end());
+}
+
 Target nativeTarget() {
 #if defined(__x86_64__) || defined(_M_X64)
   return Target::X86_64;
@@ -687,21 +738,26 @@ TEST(LayoutTest, RetainsAllSectionsIncludingEmptySections) {
   EXPECT_EQ(Graph.sections()[2].Address, 16U);
 }
 
-TEST(RelocationFieldTest, ReadsAndWritesIntegerWidthsInEitherEndianness) {
+TEST(RelocationFieldTest, ReadsAndWritesUnsignedBoundariesWithExactBytes) {
   struct Case {
     uint8_t Width;
-    uint64_t Value;
+    uint64_t Maximum;
   };
   const std::array<Case, 4> Cases{
       {{1, UINT8_MAX}, {2, UINT16_MAX}, {4, UINT32_MAX}, {8, UINT64_MAX}}};
   for (const auto Endian : {Endianness::Little, Endianness::Big}) {
     for (const auto &Test : Cases) {
-      std::array<WasmEdge::Byte, 10> Bytes{};
-      ASSERT_TRUE(
-          Internal::writeUnsigned(Bytes, 1, Test.Width, Endian, Test.Value));
-      auto Value = Internal::readUnsigned(Bytes, 1, Test.Width, Endian);
-      ASSERT_TRUE(Value);
-      EXPECT_EQ(*Value, Test.Value);
+      for (const uint64_t Value : {UINT64_C(0), Test.Maximum}) {
+        std::array<WasmEdge::Byte, 10> Bytes{};
+        ASSERT_TRUE(
+            Internal::writeUnsigned(Bytes, 1, Test.Width, Endian, Value));
+        for (uint8_t I = 0; I < Test.Width; ++I) {
+          EXPECT_EQ(Bytes[1 + I], Value == 0 ? 0 : 0xFF);
+        }
+        auto Read = Internal::readUnsigned(Bytes, 1, Test.Width, Endian);
+        ASSERT_TRUE(Read);
+        EXPECT_EQ(*Read, Value);
+      }
     }
   }
   std::array<WasmEdge::Byte, 4> Bytes{};
@@ -713,7 +769,7 @@ TEST(RelocationFieldTest, ReadsAndWritesIntegerWidthsInEitherEndianness) {
   EXPECT_EQ(Bytes, (std::array<WasmEdge::Byte, 4>{0x12, 0x34, 0x56, 0x78}));
 }
 
-TEST(RelocationFieldTest, ReadsAndWritesSignedMinMaxOnMisalignedFields) {
+TEST(RelocationFieldTest, ReadsAndWritesSignedBoundariesInEitherEndianness) {
   struct Case {
     uint8_t Width;
     int64_t Minimum;
@@ -724,27 +780,60 @@ TEST(RelocationFieldTest, ReadsAndWritesSignedMinMaxOnMisalignedFields) {
                                    {4, INT32_MIN, INT32_MAX},
                                    {8, INT64_MIN, INT64_MAX}}};
   for (const auto &Test : Cases) {
-    for (const auto Value : {Test.Minimum, Test.Maximum}) {
-      std::array<WasmEdge::Byte, 10> Bytes{};
-      ASSERT_TRUE(Internal::writeSigned(Bytes, 1, Test.Width,
-                                        Endianness::Little, Value));
-      auto Read =
-          Internal::readSigned(Bytes, 1, Test.Width, Endianness::Little);
-      ASSERT_TRUE(Read);
-      EXPECT_EQ(*Read, Value);
+    for (const auto Endian : {Endianness::Little, Endianness::Big}) {
+      for (const auto Value : {Test.Minimum, Test.Maximum}) {
+        std::array<WasmEdge::Byte, 10> Bytes{};
+        ASSERT_TRUE(Internal::writeSigned(Bytes, 1, Test.Width, Endian, Value));
+        for (uint8_t I = 0; I < Test.Width; ++I) {
+          const bool SignByte =
+              Endian == Endianness::Little ? I == Test.Width - 1 : I == 0;
+          const uint8_t Expected = Value == Test.Minimum
+                                       ? SignByte ? 0x80 : 0x00
+                                   : SignByte ? 0x7F
+                                              : 0xFF;
+          EXPECT_EQ(Bytes[1 + I], Expected);
+        }
+        auto Read = Internal::readSigned(Bytes, 1, Test.Width, Endian);
+        ASSERT_TRUE(Read);
+        EXPECT_EQ(*Read, Value);
+      }
     }
   }
 }
 
-TEST(RelocationFieldTest, RejectsInvalidWidthsBoundsAndOverflow) {
+TEST(RelocationFieldTest, AllowsMisalignmentAndRejectsBoundsAndOverflow) {
   std::array<WasmEdge::Byte, 8> Bytes{};
+  ASSERT_TRUE(Internal::writeUnsigned(Bytes, 1, 4, Endianness::Little,
+                                      UINT32_C(0x12345678)));
+  EXPECT_EQ(*Internal::readUnsigned(Bytes, 1, 4, Endianness::Little),
+            UINT32_C(0x12345678));
   EXPECT_FALSE(Internal::readUnsigned(Bytes, 0, 3, Endianness::Little));
   EXPECT_FALSE(
       Internal::readUnsigned(Bytes, UINT64_MAX, 1, Endianness::Little));
-  EXPECT_FALSE(Internal::writeUnsigned(Bytes, 7, 2, Endianness::Little, 0));
+  for (const uint8_t Width : {1, 2, 4, 8}) {
+    const uint64_t Offset = Bytes.size() - Width + 1;
+    EXPECT_FALSE(
+        Internal::readUnsigned(Bytes, Offset, Width, Endianness::Little));
+    EXPECT_FALSE(Internal::readSigned(Bytes, Offset, Width, Endianness::Big));
+    EXPECT_FALSE(
+        Internal::writeUnsigned(Bytes, Offset, Width, Endianness::Little, 0));
+    EXPECT_FALSE(
+        Internal::writeSigned(Bytes, Offset, Width, Endianness::Big, 0));
+  }
   EXPECT_FALSE(Internal::writeUnsigned(Bytes, 0, 1, Endianness::Little, 256));
   EXPECT_FALSE(Internal::writeSigned(Bytes, 0, 1, Endianness::Little, 128));
   EXPECT_FALSE(Internal::writeSigned(Bytes, 0, 1, Endianness::Little, -129));
+  for (const uint8_t Width : {1, 2, 4}) {
+    const uint8_t Bits = Width * 8;
+    EXPECT_FALSE(Internal::writeUnsigned(Bytes, 0, Width, Endianness::Little,
+                                         UINT64_C(1) << Bits));
+    const int64_t Maximum = (INT64_C(1) << (Bits - 1)) - 1;
+    const int64_t Minimum = -(INT64_C(1) << (Bits - 1));
+    EXPECT_FALSE(
+        Internal::writeSigned(Bytes, 0, Width, Endianness::Big, Maximum + 1));
+    EXPECT_FALSE(
+        Internal::writeSigned(Bytes, 0, Width, Endianness::Big, Minimum - 1));
+  }
 }
 
 LinkGraph makeRelocationGraph(uint32_t Type, int64_t Addend,
@@ -773,6 +862,59 @@ LinkGraph makeRelocationGraph(uint32_t Type, int64_t Addend,
   return Graph;
 }
 
+void expectGraphStateEquals(const LinkGraph &Actual,
+                            const LinkGraph &Expected) {
+  EXPECT_EQ(Actual.target(), Expected.target());
+  EXPECT_EQ(Actual.endianness(), Expected.endianness());
+  EXPECT_EQ(Actual.relocationsApplied(), Expected.relocationsApplied());
+  ASSERT_EQ(Actual.sections().size(), Expected.sections().size());
+  for (size_t I = 0; I < Actual.sections().size(); ++I) {
+    const auto &Left = Actual.sections()[I];
+    const auto &Right = Expected.sections()[I];
+    EXPECT_EQ(Left.Name, Right.Name);
+    EXPECT_EQ(Left.Kind, Right.Kind);
+    EXPECT_EQ(Left.Alignment, Right.Alignment);
+    EXPECT_EQ(Left.VirtualSize, Right.VirtualSize);
+    EXPECT_EQ(Left.Address, Right.Address);
+    EXPECT_EQ(Left.FileOffset, Right.FileOffset);
+    EXPECT_EQ(Left.Content, Right.Content);
+  }
+  ASSERT_EQ(Actual.symbols().size(), Expected.symbols().size());
+  for (size_t I = 0; I < Actual.symbols().size(); ++I) {
+    const auto &Left = Actual.symbols()[I];
+    const auto &Right = Expected.symbols()[I];
+    EXPECT_EQ(Left.Name, Right.Name);
+    EXPECT_EQ(Left.Section, Right.Section);
+    EXPECT_EQ(Left.Offset, Right.Offset);
+    EXPECT_EQ(Left.Size, Right.Size);
+    EXPECT_EQ(Left.Exported, Right.Exported);
+    EXPECT_EQ(Left.ExportName, Right.ExportName);
+  }
+  ASSERT_EQ(Actual.relocations().size(), Expected.relocations().size());
+  for (size_t I = 0; I < Actual.relocations().size(); ++I) {
+    const auto &Left = Actual.relocations()[I];
+    const auto &Right = Expected.relocations()[I];
+    EXPECT_EQ(Left.Section, Right.Section);
+    EXPECT_EQ(Left.Offset, Right.Offset);
+    EXPECT_EQ(Left.Type, Right.Type);
+    EXPECT_EQ(Left.Symbol, Right.Symbol);
+    EXPECT_EQ(Left.Addend, Right.Addend);
+    EXPECT_EQ(Left.AddendIsImplicit, Right.AddendIsImplicit);
+    EXPECT_EQ(Left.Format, Right.Format);
+  }
+  ASSERT_EQ(Actual.rebases().size(), Expected.rebases().size());
+  for (size_t I = 0; I < Actual.rebases().size(); ++I) {
+    const auto &Left = Actual.rebases()[I];
+    const auto &Right = Expected.rebases()[I];
+    EXPECT_EQ(Left.Section, Right.Section);
+    EXPECT_EQ(Left.Offset, Right.Offset);
+    EXPECT_EQ(Left.Type, Right.Type);
+    EXPECT_EQ(Left.Addend, Right.Addend);
+    EXPECT_EQ(Left.Width, Right.Width);
+    EXPECT_EQ(Left.Format, Right.Format);
+  }
+}
+
 TEST(RelocationTest, AppliesX86_64AbsoluteAndRecordsOneRebase) {
   auto Graph = makeRelocationGraph(1, 5);
   ASSERT_TRUE(applyRelocations(Graph));
@@ -786,8 +928,71 @@ TEST(RelocationTest, AppliesX86_64AbsoluteAndRecordsOneRebase) {
   EXPECT_EQ(Graph.rebases()[0].Width, 8U);
   EXPECT_EQ(Graph.rebases()[0].Type, 1U);
   EXPECT_EQ(Graph.rebases()[0].Format, ObjectFormat::ELF);
+  const auto Snapshot = Graph;
   EXPECT_FALSE(applyRelocations(Graph));
-  EXPECT_EQ(Graph.rebases().size(), 1U);
+  expectGraphStateEquals(Graph, Snapshot);
+}
+
+TEST(RelocationTest, RejectsBigEndianX86_64WithoutMutation) {
+  LinkGraph Graph(Target::X86_64, Endianness::Big);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto DataSection = Graph.addSection(Section{
+      ".data", SectionKind::Data, 1, 8, 0x1000, 0, {1, 2, 3, 4, 5, 6, 7, 8}});
+  ASSERT_TRUE(DataSection);
+  auto TargetSymbol =
+      Graph.addSymbol(Symbol{"target", *DataSection, 0, 8, false});
+  ASSERT_TRUE(TargetSymbol);
+  ASSERT_TRUE(Graph.addRelocation(Relocation{*DataSection, 0, 1, *TargetSymbol,
+                                             0, false, ObjectFormat::ELF}));
+  const auto Content = Graph.sections()[0].Content;
+  EXPECT_FALSE(applyRelocations(Graph));
+  EXPECT_EQ(Graph.sections()[0].Content, Content);
+  EXPECT_TRUE(Graph.rebases().empty());
+  EXPECT_FALSE(Graph.relocationsApplied());
+}
+
+TEST(RelocationTest, ChecksX86_64AbsoluteOverflowAndUnderflow) {
+  for (const auto &[Address, Addend] :
+       std::array<std::pair<uint64_t, int64_t>, 2>{
+           {{0, -1}, {UINT64_MAX, 1}}}) {
+    auto Graph = makeRelocationGraph(1, Addend, false, Address);
+    const auto Content = Graph.sections()[0].Content;
+    EXPECT_FALSE(applyRelocations(Graph));
+    EXPECT_EQ(Graph.sections()[0].Content, Content);
+    EXPECT_TRUE(Graph.rebases().empty());
+  }
+}
+
+TEST(RelocationTest, ChecksPC32AndPLT32SignedBoundaries) {
+  struct Case {
+    int64_t Displacement;
+    bool Accepted;
+  };
+  const std::array<Case, 6> Cases{{{INT32_MIN, true},
+                                   {INT32_MAX, true},
+                                   {static_cast<int64_t>(INT32_MIN) - 1, false},
+                                   {static_cast<int64_t>(INT32_MAX) + 1, false},
+                                   {-256, true},
+                                   {256, true}}};
+  constexpr uint64_t PatchAddress = UINT64_C(0x100000000);
+  constexpr uint64_t Place = PatchAddress + 1;
+  for (const uint32_t Type : {2U, 4U}) {
+    for (const auto &Test : Cases) {
+      const uint64_t Target =
+          Test.Displacement < 0
+              ? Place - static_cast<uint64_t>(-Test.Displacement)
+              : Place + static_cast<uint64_t>(Test.Displacement);
+      auto Graph = makeRelocationGraph(Type, 0, false, Target, PatchAddress);
+      auto Result = applyRelocations(Graph);
+      EXPECT_EQ(static_cast<bool>(Result), Test.Accepted);
+      if (Test.Accepted) {
+        auto Value = Internal::readSigned(Graph.sections()[0].Content, 1, 4,
+                                          Endianness::Little);
+        ASSERT_TRUE(Value);
+        EXPECT_EQ(*Value, Test.Displacement);
+      }
+    }
+  }
 }
 
 TEST(RelocationTest, AppliesExplicitAndImplicitPC32AndPLT32) {
@@ -832,20 +1037,19 @@ TEST(RelocationTest, DecodesImplicitAddendForX86_64Absolute) {
 }
 
 TEST(RelocationTest, RejectsOverflowAndDoesNotPartiallyModifyGraph) {
-  auto Graph = makeRelocationGraph(2, -4);
-  auto FarSection = Graph.addSection(
-      Section{".far", SectionKind::Data, 1, 1, UINT64_C(0x8000100D), 0, {0}});
+  auto Graph = makeRelocationGraph(1, 5);
+  auto FarSection = Graph.addSection(Section{
+      ".far", SectionKind::Data, 1, 1, UINT64_C(0x8000000000000001), 0, {0}});
   ASSERT_TRUE(FarSection);
   auto SecondSymbol =
       Graph.addSymbol(Symbol{"second", *FarSection, 0, 1, false});
   ASSERT_TRUE(SecondSymbol);
   ASSERT_TRUE(Graph.addRelocation(
-      Relocation{0, 8, 2, *SecondSymbol, -4, false, ObjectFormat::ELF}));
-  const auto Original = Graph.sections()[0].Content;
+      Relocation{0, 8, 1, *SecondSymbol, INT64_MAX, false, ObjectFormat::ELF}));
+  const auto Snapshot = Graph;
   auto Result = applyRelocations(Graph);
   EXPECT_FALSE(Result);
-  EXPECT_EQ(Graph.sections()[0].Content, Original);
-  EXPECT_TRUE(Graph.rebases().empty());
+  expectGraphStateEquals(Graph, Snapshot);
 }
 
 TEST(RelocationTest, RejectsInvalidGraphUnsupportedTargetTypeAndFormat) {
@@ -904,6 +1108,62 @@ TEST(RelocationTest, ReadsLayoutsAndRelocatesX86_64ObjectEndToEnd) {
                 static_cast<int64_t>(Text->Address + Relocation.Offset) - 4);
 }
 
+TEST(RelocationTest, AppliesGeneratedELF64PC32AndPLT32RelocationsExactly) {
+  auto Graph = ObjectReader::read(
+      makeX86_64AssemblyObject(
+          ".data\n.globl target_data\ntarget_data:\n.quad 0\n"
+          ".globl absolute\nabsolute:\n.quad target_data + 5\n"
+          ".text\n.globl caller\ncaller:\n"
+          "movl target_data(%rip), %eax\ncall target_func\nret\n"
+          ".section .text.target,\"ax\",@progbits\n"
+          ".globl target_func\ntarget_func:\nret\n"),
+      Target::X86_64);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->relocations().size(), 3U);
+  std::array<bool, 3> Seen{};
+  for (const auto &Relocation : Graph->relocations()) {
+    ASSERT_TRUE(Relocation.Type == 1 || Relocation.Type == 2 ||
+                Relocation.Type == 4);
+    Seen[Relocation.Type == 1 ? 0 : Relocation.Type == 2 ? 1 : 2] = true;
+    EXPECT_EQ(Relocation.Format, ObjectFormat::ELF);
+    EXPECT_FALSE(Relocation.AddendIsImplicit);
+    EXPECT_EQ(Relocation.Addend, Relocation.Type == 1 ? 5 : -4);
+  }
+  EXPECT_EQ(Seen, (std::array<bool, 3>{true, true, true}));
+  ASSERT_TRUE(layout(*Graph, 0x1000));
+  struct ExpectedPatch {
+    SectionId Section;
+    uint64_t Offset;
+    uint8_t Width;
+    uint64_t Bits;
+  };
+  std::vector<ExpectedPatch> Expected;
+  for (const auto &Relocation : Graph->relocations()) {
+    const auto &Symbol = Graph->symbols()[Relocation.Symbol];
+    const uint64_t S =
+        Graph->sections()[Symbol.Section].Address + Symbol.Offset;
+    const uint64_t P =
+        Graph->sections()[Relocation.Section].Address + Relocation.Offset;
+    Expected.push_back(ExpectedPatch{
+        Relocation.Section, Relocation.Offset,
+        static_cast<uint8_t>(Relocation.Type == 1 ? 8 : 4),
+        Relocation.Type == 1 ? S + static_cast<uint64_t>(Relocation.Addend)
+                             : static_cast<uint32_t>(static_cast<int64_t>(S) +
+                                                     Relocation.Addend -
+                                                     static_cast<int64_t>(P))});
+  }
+  ASSERT_TRUE(applyRelocations(*Graph));
+  for (const auto &Patch : Expected) {
+    auto Value =
+        Internal::readUnsigned(Graph->sections()[Patch.Section].Content,
+                               Patch.Offset, Patch.Width, Endianness::Little);
+    ASSERT_TRUE(Value);
+    EXPECT_EQ(*Value, Patch.Bits);
+  }
+  ASSERT_EQ(Graph->rebases().size(), 1U);
+  EXPECT_EQ(Graph->rebases()[0].Width, 8U);
+}
+
 TEST(RelocationTest, ReadsLayoutsAndRelocatesCurrentMachOAndCOFFForms) {
   struct Case {
     llvm::Triple Triple;
@@ -920,7 +1180,23 @@ TEST(RelocationTest, ReadsLayoutsAndRelocatesCurrentMachOAndCOFFForms) {
     EXPECT_EQ(Graph->relocations()[0].Format, Test.Format);
     EXPECT_EQ(Graph->relocations()[0].Type, Test.Type);
     ASSERT_TRUE(layout(*Graph, 0x1000));
-    EXPECT_TRUE(applyRelocations(*Graph));
+    const auto &Relocation = Graph->relocations()[0];
+    const auto &Symbol = Graph->symbols()[Relocation.Symbol];
+    const int64_t S = static_cast<int64_t>(
+        Graph->sections()[Symbol.Section].Address + Symbol.Offset);
+    const int64_t P = static_cast<int64_t>(
+        Graph->sections()[Relocation.Section].Address + Relocation.Offset);
+    auto Before =
+        Internal::readSigned(Graph->sections()[Relocation.Section].Content,
+                             Relocation.Offset, 4, Endianness::Little);
+    ASSERT_TRUE(Before);
+    ASSERT_TRUE(applyRelocations(*Graph));
+    auto After =
+        Internal::readSigned(Graph->sections()[Relocation.Section].Content,
+                             Relocation.Offset, 4, Endianness::Little);
+    ASSERT_TRUE(After);
+    EXPECT_EQ(*After,
+              S + *Before - P + (Test.Format == ObjectFormat::COFF ? -4 : 0));
   }
 }
 
