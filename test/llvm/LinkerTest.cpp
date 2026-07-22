@@ -547,10 +547,16 @@ TEST(LayoutTest, BssConsumesVirtualButNotFileSpace) {
   ASSERT_TRUE(layout(Graph));
   EXPECT_EQ(Graph.sections()[*First].Address, 0U);
   EXPECT_EQ(Graph.sections()[*Second].Address, 4U);
+  EXPECT_EQ(Graph.sections()[*Second].FileOffset, 4U);
   EXPECT_EQ(Graph.sections()[*Bss].Address, 8U);
-  EXPECT_EQ(Graph.sections()[*Bss].FileOffset, 5U);
+  EXPECT_EQ(Graph.sections()[*Bss].FileOffset, 0U);
   EXPECT_EQ(Graph.sections()[*Bss].Address + Graph.sections()[*Bss].VirtualSize,
             17U);
+
+  ASSERT_TRUE(Graph.setSectionFileOffset(*Bss, 123));
+  ASSERT_TRUE(layout(Graph));
+  EXPECT_EQ(Graph.sections()[*Second].FileOffset, 4U);
+  EXPECT_EQ(Graph.sections()[*Bss].FileOffset, 0U);
 }
 
 TEST(LayoutTest, IsIndependentOfInsertionOrderForUniqueNames) {

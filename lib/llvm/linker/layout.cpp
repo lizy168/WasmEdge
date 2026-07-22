@@ -93,7 +93,8 @@ LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
       return overflow(SectionValue, Id,
                       "section file offset alignment overflows");
     }
-    Placements[Id] = {Address, FileOffset};
+    Placements[Id] = {Address,
+                      SectionValue.Kind == SectionKind::BSS ? 0 : FileOffset};
     if (!checkedAdd(Address, SectionValue.VirtualSize, Address)) {
       return overflow(SectionValue, Id, "section virtual size overflows");
     }
