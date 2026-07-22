@@ -446,16 +446,12 @@ TEST(ObjectReaderTest, RejectsMalformedCOFFExportDirectives) {
   EXPECT_FALSE(Internal::parseCOFFExports("\"/EXPORT:f0"));
 }
 
-TEST(ObjectReaderTest, NormalizesNativeObject) {
-  const auto Bytes = makeNativeObject();
-  auto Result = ObjectReader::read(Bytes, nativeTarget());
+TEST(ObjectReaderTest, NormalizesX86_64ELFRelaObject) {
+  const auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
+  auto Result = ObjectReader::read(Bytes, Target::X86_64);
   ASSERT_TRUE(Result);
-  EXPECT_EQ(Result->target(), nativeTarget());
-#if defined(__s390x__)
-  EXPECT_EQ(Result->endianness(), Endianness::Big);
-#else
+  EXPECT_EQ(Result->target(), Target::X86_64);
   EXPECT_EQ(Result->endianness(), Endianness::Little);
-#endif
   EXPECT_FALSE(Result->sections().empty());
   const auto Text =
       std::find_if(Result->sections().begin(), Result->sections().end(),
@@ -487,13 +483,11 @@ TEST(ObjectReaderTest, NormalizesNativeObject) {
   EXPECT_LT(Relocation.Offset, Text->Content.size());
   EXPECT_NE(Relocation.Type, 0U);
   EXPECT_LT(Relocation.Symbol, Result->symbols().size());
-#if defined(__x86_64__) && !defined(__APPLE__) && !defined(_WIN32)
   EXPECT_EQ(Relocation.Offset, 3U);
   EXPECT_EQ(Relocation.Type, 42U);
   EXPECT_EQ(Result->symbols()[Relocation.Symbol].Name, "value");
   EXPECT_EQ(Relocation.Addend, -4);
   EXPECT_FALSE(Relocation.AddendIsImplicit);
-#endif
   EXPECT_NE(Relocation.Symbol, F0Id);
 }
 
