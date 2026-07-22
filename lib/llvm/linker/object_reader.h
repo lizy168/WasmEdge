@@ -8,9 +8,22 @@
 #include "common/types.h"
 #include "linker/link_graph.h"
 
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+
 namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
+
+namespace Internal {
+
+uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept;
+std::optional<std::set<std::string>>
+parseCOFFExports(std::string_view Directives);
+
+} // namespace Internal
 
 class ObjectReader {
 public:

@@ -75,9 +75,9 @@ bool isSupportedFormat(const llvm::object::ObjectFile &Object) noexcept {
 
 uint64_t sectionAlignment(const llvm::object::SectionRef &Section) noexcept {
 #if LLVM_VERSION_MAJOR >= 11
-  return Section.getAlignment().value();
+  return Internal::normalizeSectionAlignment(Section.getAlignment().value());
 #else
-  return std::max<uint64_t>(Section.getAlignment(), 1);
+  return Internal::normalizeSectionAlignment(Section.getAlignment());
 #endif
 }
 
@@ -140,15 +140,24 @@ relocationAddend(const llvm::object::ObjectFile &Object,
   return {*Addend, false};
 }
 
-bool parseCOFFExports(llvm::StringRef Directives,
-                      std::set<std::string> &Exports) {
+} // namespace
+
+namespace Internal {
+
+uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept {
+  return std::max<uint64_t>(Alignment, 1);
+}
+
+std::optional<std::set<std::string>> parseCOFFExports(std::string_view Input) {
+  llvm::StringRef Directives(Input.data(), Input.size());
+  std::set<std::string> Exports;
   while (!Directives.trim().empty()) {
     Directives = Directives.ltrim();
     llvm::StringRef Token;
     if (Directives.front() == '"') {
       const auto End = Directives.drop_front().find('"');
       if (End == llvm::StringRef::npos) {
-        return false;
+        return std::nullopt;
       }
       Token = Directives.substr(1, End);
       Directives = Directives.drop_front(End + 2);
@@ -167,14 +176,14 @@ bool parseCOFFExports(llvm::StringRef Directives,
     Token = Token.split(',').first;
     Token = Token.split('=').first;
     if (Token.empty()) {
-      return false;
+      return std::nullopt;
     }
     Exports.emplace(Token.str());
   }
-  return true;
+  return Exports;
 }
 
-} // namespace
+} // namespace Internal
 
 Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
                                      Target ExpectedTarget) noexcept {
@@ -219,10 +228,14 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     }
     if (Object.isCOFF() && Name == ".drectve") {
       llvm::StringRef Contents;
-      if (!take(InputSection.getContents(), Contents, "cannot read .drectve") ||
-          !parseCOFFExports(Contents, COFFExports)) {
+      if (!take(InputSection.getContents(), Contents, "cannot read .drectve")) {
+        return Unexpect(ErrCode::Value::IllegalPath);
+      }
+      auto Exports = Internal::parseCOFFExports(Contents.str());
+      if (!Exports) {
         return fail<LinkGraph>("malformed COFF .drectve export directive");
       }
+      COFFExports.insert(Exports->begin(), Exports->end());
     }
     if (!isAllocatable(Object, InputSection)) {
       continue;

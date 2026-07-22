@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -36,14 +37,16 @@ namespace {
 
 using namespace WasmEdge::LLVM::Linker;
 
-std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
+std::vector<WasmEdge::Byte> makeObject(const llvm::Triple &Triple,
+                                       bool Undefined = false,
+                                       bool DLLExport = false) {
   static const bool Initialized = [] {
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmPrinters();
     return true;
   }();
   (void)Initialized;
-  const llvm::Triple Triple(llvm::sys::getDefaultTargetTriple());
   std::string Error;
   const llvm::Target *NativeTarget =
       llvm::TargetRegistry::lookupTarget(Triple.str(), Error);
@@ -84,6 +87,10 @@ std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
   auto *F0 =
       llvm::Function::Create(llvm::FunctionType::get(I32, false),
                              llvm::GlobalValue::ExternalLinkage, "f0", Module);
+  F0->addFnAttr(llvm::Attribute::NoUnwind);
+  if (DLLExport) {
+    F0->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+  }
   llvm::IRBuilder<> Builder(llvm::BasicBlock::Create(Context, "entry", F0));
   Builder.CreateRet(Builder.CreateLoad(I32, Value));
 
@@ -98,6 +105,11 @@ std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
   EXPECT_FALSE(Machine->addPassesToEmitFile(Passes, Stream, nullptr, FileType));
   Passes.run(Module);
   return std::vector<WasmEdge::Byte>(Storage.begin(), Storage.end());
+}
+
+std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
+  return makeObject(llvm::Triple(llvm::sys::getDefaultTargetTriple()),
+                    Undefined);
 }
 
 Target nativeTarget() {
@@ -415,6 +427,25 @@ TEST(ObjectReaderTest, RejectsMalformedBytes) {
   EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
 }
 
+TEST(ObjectReaderTest, NormalizesZeroSectionAlignment) {
+  EXPECT_EQ(Internal::normalizeSectionAlignment(0), 1U);
+  EXPECT_EQ(Internal::normalizeSectionAlignment(16), 16U);
+}
+
+TEST(ObjectReaderTest, ParsesCOFFExportDirectives) {
+  auto Exports = Internal::parseCOFFExports(
+      " /DEFAULTLIB:libcmt /EXPORT:f0 /EXPORT:data,DATA "
+      "/EXPORT:ordinal,NONAME /EXPORT:alias=real");
+  ASSERT_TRUE(Exports);
+  EXPECT_EQ(*Exports,
+            (std::set<std::string>{"alias", "data", "f0", "ordinal"}));
+}
+
+TEST(ObjectReaderTest, RejectsMalformedCOFFExportDirectives) {
+  EXPECT_FALSE(Internal::parseCOFFExports("/EXPORT:"));
+  EXPECT_FALSE(Internal::parseCOFFExports("\"/EXPORT:f0"));
+}
+
 TEST(ObjectReaderTest, NormalizesNativeObject) {
   const auto Bytes = makeNativeObject();
   auto Result = ObjectReader::read(Bytes, nativeTarget());
@@ -444,13 +475,78 @@ TEST(ObjectReaderTest, NormalizesNativeObject) {
       std::find_if(Result->symbols().begin(), Result->symbols().end(),
                    [](const Symbol &Value) { return Value.Name == "f0"; });
   ASSERT_NE(F0, Result->symbols().end());
+  const auto TextId = static_cast<SectionId>(Text - Result->sections().begin());
+  const auto F0Id = static_cast<SymbolId>(F0 - Result->symbols().begin());
+  EXPECT_EQ(F0->Section, TextId);
+  EXPECT_EQ(F0->Offset, 0U);
   EXPECT_TRUE(F0->Exported);
   EXPECT_GT(F0->Size, 0U);
   ASSERT_FALSE(Result->relocations().empty());
+  const auto &Relocation = Result->relocations()[0];
+  EXPECT_EQ(Relocation.Section, TextId);
+  EXPECT_LT(Relocation.Offset, Text->Content.size());
+  EXPECT_NE(Relocation.Type, 0U);
+  EXPECT_LT(Relocation.Symbol, Result->symbols().size());
 #if defined(__x86_64__) && !defined(__APPLE__) && !defined(_WIN32)
-  EXPECT_EQ(Result->relocations()[0].Addend, -4);
-  EXPECT_FALSE(Result->relocations()[0].AddendIsImplicit);
+  EXPECT_EQ(Relocation.Offset, 3U);
+  EXPECT_EQ(Relocation.Type, 42U);
+  EXPECT_EQ(Result->symbols()[Relocation.Symbol].Name, "value");
+  EXPECT_EQ(Relocation.Addend, -4);
+  EXPECT_FALSE(Relocation.AddendIsImplicit);
 #endif
+  EXPECT_NE(Relocation.Symbol, F0Id);
+}
+
+TEST(ObjectReaderTest, ReadsCOFFExportsFromDirectives) {
+  auto Result = ObjectReader::read(
+      makeObject(llvm::Triple("x86_64-pc-windows-msvc"), false, true),
+      Target::X86_64);
+  ASSERT_TRUE(Result);
+  const auto F0 =
+      std::find_if(Result->symbols().begin(), Result->symbols().end(),
+                   [](const Symbol &Value) { return Value.Name == "f0"; });
+  ASSERT_NE(F0, Result->symbols().end());
+  EXPECT_TRUE(F0->Exported);
+}
+
+TEST(ObjectReaderTest, ExportsMachOExternalDefinedSymbols) {
+  auto Result = ObjectReader::read(
+      makeObject(llvm::Triple("x86_64-apple-macosx")), Target::X86_64);
+  ASSERT_TRUE(Result);
+  const auto F0 =
+      std::find_if(Result->symbols().begin(), Result->symbols().end(),
+                   [](const Symbol &Value) { return Value.Name == "_f0"; });
+  ASSERT_NE(F0, Result->symbols().end());
+  EXPECT_TRUE(F0->Exported);
+}
+
+TEST(ObjectReaderTest, MarksELFRelAddendsImplicit) {
+  auto Result = ObjectReader::read(
+      makeObject(llvm::Triple("armv7-unknown-linux-gnueabihf")), Target::ARM);
+  ASSERT_TRUE(Result);
+  ASSERT_FALSE(Result->relocations().empty());
+  EXPECT_TRUE(Result->relocations()[0].AddendIsImplicit);
+  EXPECT_EQ(Result->relocations()[0].Addend, 0);
+}
+
+TEST(ObjectReaderTest, RejectsNonRelocatableELFObject) {
+  auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
+  ASSERT_GT(Bytes.size(), 18U);
+  Bytes[16] = 3;
+  Bytes[17] = 0;
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
+  Bytes[16] = 2;
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsUnsupportedObjectFormat) {
+  EXPECT_FALSE(ObjectReader::read(
+      makeObject(llvm::Triple("wasm32-unknown-unknown")), Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsUnsupportedArchitecture) {
+  EXPECT_FALSE(ObjectReader::read(
+      makeObject(llvm::Triple("i386-unknown-linux-gnu")), Target::X86_64));
 }
 
 TEST(ObjectReaderTest, RejectsUndefinedExternal) {
