@@ -488,51 +488,87 @@ private:
   /// Helper function for getting defined type by index.
   const AST::SubType *getDefTypeByIdx(Runtime::StackManager &StackMgr,
                                       const uint32_t Idx) const;
+  const AST::SubType *
+  getDefTypeByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                  const uint32_t Idx) const;
 
   /// Helper function for getting composite type by index. Assuming validated.
   const WasmEdge::AST::CompositeType &
   getCompositeTypeByIdx(Runtime::StackManager &StackMgr,
+                        const uint32_t Idx) const noexcept;
+  const WasmEdge::AST::CompositeType &
+  getCompositeTypeByIdx(const Runtime::Instance::ModuleInstance *ModInst,
                         const uint32_t Idx) const noexcept;
 
   /// Helper function for getting struct storage type by index.
   const ValType &getStructStorageTypeByIdx(Runtime::StackManager &StackMgr,
                                            const uint32_t Idx,
                                            const uint32_t Off) const noexcept;
+  const ValType &
+  getStructStorageTypeByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                            const uint32_t Idx,
+                            const uint32_t Off) const noexcept;
 
   /// Helper function for getting array storage type by index.
   const ValType &getArrayStorageTypeByIdx(Runtime::StackManager &StackMgr,
                                           const uint32_t Idx) const noexcept;
+  const ValType &
+  getArrayStorageTypeByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                           const uint32_t Idx) const noexcept;
 
   /// Helper function for getting function instance by index.
   Runtime::Instance::FunctionInstance *
   getFuncInstByIdx(Runtime::StackManager &StackMgr, const uint32_t Idx) const;
+  Runtime::Instance::FunctionInstance *
+  getFuncInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                   const uint32_t Idx) const;
 
   /// Helper function for getting table instance by index.
   Runtime::Instance::TableInstance *
   getTabInstByIdx(Runtime::StackManager &StackMgr, const uint32_t Idx) const;
+  Runtime::Instance::TableInstance *
+  getTabInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                  const uint32_t Idx) const;
 
   /// Helper function for getting memory instance by index.
   Runtime::Instance::MemoryInstance *
   getMemInstByIdx(Runtime::StackManager &StackMgr, const uint32_t Idx) const;
+  Runtime::Instance::MemoryInstance *
+  getMemInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                  const uint32_t Idx) const;
 
   /// Helper function for getting tag instance by index.
   Runtime::Instance::TagInstance *
   getTagInstByIdx(Runtime::StackManager &StackMgr, const uint32_t Idx) const;
+  Runtime::Instance::TagInstance *
+  getTagInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                  const uint32_t Idx) const;
 
   /// Helper function for getting global instance by index.
   Runtime::Instance::GlobalInstance *
   getGlobInstByIdx(Runtime::StackManager &StackMgr, const uint32_t Idx) const;
+  Runtime::Instance::GlobalInstance *
+  getGlobInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                   const uint32_t Idx) const;
 
   /// Helper function for getting element instance by index.
   Runtime::Instance::ElementInstance *
   getElemInstByIdx(Runtime::StackManager &StackMgr, const uint32_t Idx) const;
+  Runtime::Instance::ElementInstance *
+  getElemInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                   const uint32_t Idx) const;
 
   /// Helper function for getting data instance by index.
   Runtime::Instance::DataInstance *
   getDataInstByIdx(Runtime::StackManager &StackMgr, const uint32_t Idx) const;
+  Runtime::Instance::DataInstance *
+  getDataInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                   const uint32_t Idx) const;
 
   /// Helper function for converting into bottom abstract heap type.
   TypeCode toBottomType(Runtime::StackManager &StackMgr,
+                        const ValType &Type) const;
+  TypeCode toBottomType(const Runtime::Instance::ModuleInstance *ModInst,
                         const ValType &Type) const;
 
   /// Helper function for cleaning unused bits of numeric values in ValVariant.

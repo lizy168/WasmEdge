@@ -384,9 +384,9 @@ Executor::checkOffsetOverflow(const Runtime::Instance::MemoryInstance &MemInst,
   return {};
 }
 
-const AST::SubType *Executor::getDefTypeByIdx(Runtime::StackManager &StackMgr,
-                                              const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
+const AST::SubType *
+Executor::getDefTypeByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                          const uint32_t Idx) const {
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -394,37 +394,59 @@ const AST::SubType *Executor::getDefTypeByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetType(Idx);
 }
 
-const WasmEdge::AST::CompositeType &
-Executor::getCompositeTypeByIdx(Runtime::StackManager &StackMgr,
-                                const uint32_t Idx) const noexcept {
-  auto *DefType = getDefTypeByIdx(StackMgr, Idx);
+const AST::SubType *Executor::getDefTypeByIdx(Runtime::StackManager &StackMgr,
+                                              const uint32_t Idx) const {
+  return getDefTypeByIdx(StackMgr.getModule(), Idx);
+}
+
+const WasmEdge::AST::CompositeType &Executor::getCompositeTypeByIdx(
+    const Runtime::Instance::ModuleInstance *ModInst,
+    const uint32_t Idx) const noexcept {
+  auto *DefType = getDefTypeByIdx(ModInst, Idx);
   assuming(DefType);
   const auto &CompType = DefType->getCompositeType();
   assuming(!CompType.isFunc());
   return CompType;
 }
 
-const ValType &
-Executor::getStructStorageTypeByIdx(Runtime::StackManager &StackMgr,
-                                    const uint32_t Idx,
-                                    const uint32_t Off) const noexcept {
-  const auto &CompType = getCompositeTypeByIdx(StackMgr, Idx);
+const WasmEdge::AST::CompositeType &
+Executor::getCompositeTypeByIdx(Runtime::StackManager &StackMgr,
+                                const uint32_t Idx) const noexcept {
+  return getCompositeTypeByIdx(StackMgr.getModule(), Idx);
+}
+
+const ValType &Executor::getStructStorageTypeByIdx(
+    const Runtime::Instance::ModuleInstance *ModInst, const uint32_t Idx,
+    const uint32_t Off) const noexcept {
+  const auto &CompType = getCompositeTypeByIdx(ModInst, Idx);
   assuming(static_cast<uint32_t>(CompType.getFieldTypes().size()) > Off);
   return CompType.getFieldTypes()[Off].getStorageType();
 }
 
 const ValType &
-Executor::getArrayStorageTypeByIdx(Runtime::StackManager &StackMgr,
-                                   const uint32_t Idx) const noexcept {
-  const auto &CompType = getCompositeTypeByIdx(StackMgr, Idx);
+Executor::getStructStorageTypeByIdx(Runtime::StackManager &StackMgr,
+                                    const uint32_t Idx,
+                                    const uint32_t Off) const noexcept {
+  return getStructStorageTypeByIdx(StackMgr.getModule(), Idx, Off);
+}
+
+const ValType &Executor::getArrayStorageTypeByIdx(
+    const Runtime::Instance::ModuleInstance *ModInst,
+    const uint32_t Idx) const noexcept {
+  const auto &CompType = getCompositeTypeByIdx(ModInst, Idx);
   assuming(static_cast<uint32_t>(CompType.getFieldTypes().size()) == 1);
   return CompType.getFieldTypes()[0].getStorageType();
 }
 
+const ValType &
+Executor::getArrayStorageTypeByIdx(Runtime::StackManager &StackMgr,
+                                   const uint32_t Idx) const noexcept {
+  return getArrayStorageTypeByIdx(StackMgr.getModule(), Idx);
+}
+
 Runtime::Instance::FunctionInstance *
-Executor::getFuncInstByIdx(Runtime::StackManager &StackMgr,
+Executor::getFuncInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
                            const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -432,10 +454,15 @@ Executor::getFuncInstByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetFunction(Idx);
 }
 
+Runtime::Instance::FunctionInstance *
+Executor::getFuncInstByIdx(Runtime::StackManager &StackMgr,
+                           const uint32_t Idx) const {
+  return getFuncInstByIdx(StackMgr.getModule(), Idx);
+}
+
 Runtime::Instance::TableInstance *
-Executor::getTabInstByIdx(Runtime::StackManager &StackMgr,
+Executor::getTabInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
                           const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -443,10 +470,15 @@ Executor::getTabInstByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetTable(Idx);
 }
 
-Runtime::Instance::MemoryInstance *
-Executor::getMemInstByIdx(Runtime::StackManager &StackMgr,
+Runtime::Instance::TableInstance *
+Executor::getTabInstByIdx(Runtime::StackManager &StackMgr,
                           const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
+  return getTabInstByIdx(StackMgr.getModule(), Idx);
+}
+
+Runtime::Instance::MemoryInstance *
+Executor::getMemInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                          const uint32_t Idx) const {
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -454,10 +486,15 @@ Executor::getMemInstByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetMemory(Idx);
 }
 
-Runtime::Instance::TagInstance *
-Executor::getTagInstByIdx(Runtime::StackManager &StackMgr,
+Runtime::Instance::MemoryInstance *
+Executor::getMemInstByIdx(Runtime::StackManager &StackMgr,
                           const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
+  return getMemInstByIdx(StackMgr.getModule(), Idx);
+}
+
+Runtime::Instance::TagInstance *
+Executor::getTagInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                          const uint32_t Idx) const {
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -465,10 +502,15 @@ Executor::getTagInstByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetTag(Idx);
 }
 
+Runtime::Instance::TagInstance *
+Executor::getTagInstByIdx(Runtime::StackManager &StackMgr,
+                          const uint32_t Idx) const {
+  return getTagInstByIdx(StackMgr.getModule(), Idx);
+}
+
 Runtime::Instance::GlobalInstance *
-Executor::getGlobInstByIdx(Runtime::StackManager &StackMgr,
+Executor::getGlobInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
                            const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -476,10 +518,15 @@ Executor::getGlobInstByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetGlobal(Idx);
 }
 
-Runtime::Instance::ElementInstance *
-Executor::getElemInstByIdx(Runtime::StackManager &StackMgr,
+Runtime::Instance::GlobalInstance *
+Executor::getGlobInstByIdx(Runtime::StackManager &StackMgr,
                            const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
+  return getGlobInstByIdx(StackMgr.getModule(), Idx);
+}
+
+Runtime::Instance::ElementInstance *
+Executor::getElemInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                           const uint32_t Idx) const {
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -487,10 +534,15 @@ Executor::getElemInstByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetElem(Idx);
 }
 
-Runtime::Instance::DataInstance *
-Executor::getDataInstByIdx(Runtime::StackManager &StackMgr,
+Runtime::Instance::ElementInstance *
+Executor::getElemInstByIdx(Runtime::StackManager &StackMgr,
                            const uint32_t Idx) const {
-  const auto *ModInst = StackMgr.getModule();
+  return getElemInstByIdx(StackMgr.getModule(), Idx);
+}
+
+Runtime::Instance::DataInstance *
+Executor::getDataInstByIdx(const Runtime::Instance::ModuleInstance *ModInst,
+                           const uint32_t Idx) const {
   // When the top frame is a dummy frame, the instance cannot be found.
   if (unlikely(ModInst == nullptr)) {
     return nullptr;
@@ -498,8 +550,15 @@ Executor::getDataInstByIdx(Runtime::StackManager &StackMgr,
   return ModInst->unsafeGetData(Idx);
 }
 
-TypeCode Executor::toBottomType(Runtime::StackManager &StackMgr,
-                                const ValType &Type) const {
+Runtime::Instance::DataInstance *
+Executor::getDataInstByIdx(Runtime::StackManager &StackMgr,
+                           const uint32_t Idx) const {
+  return getDataInstByIdx(StackMgr.getModule(), Idx);
+}
+
+TypeCode
+Executor::toBottomType(const Runtime::Instance::ModuleInstance *ModInst,
+                       const ValType &Type) const {
   if (Type.isRefType()) {
     if (Type.isAbsHeapType()) {
       switch (Type.getHeapTypeCode()) {
@@ -523,9 +582,8 @@ TypeCode Executor::toBottomType(Runtime::StackManager &StackMgr,
         assumingUnreachable();
       }
     } else {
-      const auto &CompType = StackMgr.getModule()
-                                 ->unsafeGetType(Type.getTypeIndex())
-                                 ->getCompositeType();
+      const auto &CompType =
+          ModInst->unsafeGetType(Type.getTypeIndex())->getCompositeType();
       if (CompType.isFunc()) {
         return TypeCode::NullFuncRef;
       } else {
@@ -535,6 +593,11 @@ TypeCode Executor::toBottomType(Runtime::StackManager &StackMgr,
   } else {
     return Type.getCode();
   }
+}
+
+TypeCode Executor::toBottomType(Runtime::StackManager &StackMgr,
+                                const ValType &Type) const {
+  return toBottomType(StackMgr.getModule(), Type);
 }
 
 void Executor::cleanNumericVal(ValVariant &Val,
