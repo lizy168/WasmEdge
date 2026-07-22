@@ -167,10 +167,10 @@ TEST(LinkGraphTest, SymbolIdsRemainStableAcrossVectorGrowth) {
 }
 
 TEST(LinkGraphTest, SectionOffsetsDefaultToZero) {
-  Section Value{".data", SectionKind::Data, 4, 4};
+  Section Value{".data", SectionKind::Data, 4};
   EXPECT_EQ(Value.Address, 0U);
   EXPECT_EQ(Value.FileOffset, 0U);
-  EXPECT_EQ(Value.VirtualSize, 4U);
+  EXPECT_EQ(Value.VirtualSize, 0U);
 }
 
 } // namespace

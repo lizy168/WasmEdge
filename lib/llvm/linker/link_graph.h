@@ -31,7 +31,7 @@ struct Section {
   std::string Name;
   SectionKind Kind;
   uint64_t Alignment;
-  uint64_t VirtualSize;
+  uint64_t VirtualSize = 0;
   uint64_t Address = 0;
   uint64_t FileOffset = 0;
   std::vector<Byte> Content{};
