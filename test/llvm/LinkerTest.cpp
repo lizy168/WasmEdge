@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -594,10 +595,32 @@ writeLegacyUniversal(const std::filesystem::path &Directory,
   }
   EXPECT_TRUE(Metadata.writeU64(Symbols["version"]));
   EXPECT_TRUE(Metadata.writeU64(Symbols["intrinsics"]));
-  EXPECT_TRUE(Metadata.writeU64(1));
-  EXPECT_TRUE(Metadata.writeU64(Symbols["t0"]));
-  EXPECT_TRUE(Metadata.writeU64(1));
-  EXPECT_TRUE(Metadata.writeU64(Symbols["f0"]));
+  auto IndexedSymbols = [&](char Prefix) {
+    std::vector<uint64_t> Result;
+    for (const auto &[Name, Address] : Symbols) {
+      if (Name.size() < 2 || Name.front() != Prefix) {
+        continue;
+      }
+      uint64_t Index = 0;
+      const auto Parsed =
+          std::from_chars(Name.data() + 1, Name.data() + Name.size(), Index);
+      if (Parsed.ec == std::errc{} && Parsed.ptr == Name.data() + Name.size()) {
+        Result.resize(std::max(Result.size(), static_cast<size_t>(Index + 1)));
+        Result[Index] = Address;
+      }
+    }
+    return Result;
+  };
+  const auto Types = IndexedSymbols('t');
+  const auto Codes = IndexedSymbols('f');
+  EXPECT_TRUE(Metadata.writeU64(Types.size()));
+  for (const auto Address : Types) {
+    EXPECT_TRUE(Metadata.writeU64(Address));
+  }
+  EXPECT_TRUE(Metadata.writeU64(Codes.size()));
+  for (const auto Address : Codes) {
+    EXPECT_TRUE(Metadata.writeU64(Address));
+  }
 
   std::vector<llvm::object::SectionRef> Sections;
   for (const auto &Section : Image->getBinary()->sections()) {
@@ -649,6 +672,9 @@ writeLegacyUniversal(const std::filesystem::path &Directory,
 #endif
 
 struct AOTMetadata {
+  using SectionTuple =
+      std::tuple<uint8_t, uint64_t, uint64_t, std::vector<WasmEdge::Byte>>;
+
   uint32_t Version;
   uint8_t OS;
   uint8_t Arch;
@@ -656,9 +682,7 @@ struct AOTMetadata {
   uint64_t IntrinsicsAddress;
   std::vector<uintptr_t> Types;
   std::vector<uintptr_t> Codes;
-  std::vector<
-      std::tuple<uint8_t, uint64_t, uint64_t, std::vector<WasmEdge::Byte>>>
-      Sections;
+  std::vector<SectionTuple> Sections;
 };
 
 AOTMetadata parseAOTMetadata(const std::filesystem::path &Path) {
@@ -675,6 +699,56 @@ AOTMetadata parseAOTMetadata(const std::filesystem::path &Path) {
           AOT.getArchType(),          AOT.getVersionAddress(),
           AOT.getIntrinsicsAddress(), AOT.getTypesAddress(),
           AOT.getCodesAddress(),      AOT.getSections()};
+}
+
+std::vector<AOTMetadata::SectionTuple>
+coalesceSemanticSections(const LinkGraph &Graph) {
+  using Tuple = AOTMetadata::SectionTuple;
+  std::vector<const Section *> Ordered;
+  for (const auto &Section : Graph.sections()) {
+    if (Section.VirtualSize != 0) {
+      Ordered.push_back(&Section);
+    }
+  }
+  std::sort(Ordered.begin(), Ordered.end(),
+            [](const auto *Left, const auto *Right) {
+              return std::tuple(Left->Kind, Left->Address, Left->Name) <
+                     std::tuple(Right->Kind, Right->Address, Right->Name);
+            });
+  auto Kind = [](SectionKind Value) {
+    switch (Value) {
+    case SectionKind::Text:
+      return uint8_t{1};
+    case SectionKind::ReadOnly:
+    case SectionKind::Data:
+      return uint8_t{2};
+    case SectionKind::BSS:
+      return uint8_t{3};
+    case SectionKind::Unwind:
+      return uint8_t{4};
+    }
+    return uint8_t{0};
+  };
+  std::vector<Tuple> Result;
+  SectionKind Previous = SectionKind::Text;
+  for (const auto *Section : Ordered) {
+    if (Result.empty() || Previous != Section->Kind) {
+      Result.emplace_back(Kind(Section->Kind), Section->Address,
+                          Section->VirtualSize, Section->Content);
+      Previous = Section->Kind;
+      continue;
+    }
+    auto &Output = Result.back();
+    const auto Base = std::get<1>(Output);
+    if (Section->Kind != SectionKind::BSS) {
+      std::get<3>(Output).resize(Section->Address - Base);
+      std::get<3>(Output).insert(std::get<3>(Output).end(),
+                                 Section->Content.begin(),
+                                 Section->Content.end());
+    }
+    std::get<2>(Output) = Section->Address + Section->VirtualSize - Base;
+  }
+  return Result;
 }
 
 class LinkerOutputTest : public testing::Test {
@@ -835,12 +909,41 @@ TEST_F(LinkerOutputTest, UniversalWasmWriterSerializesLoaderSchema) {
 
 #if WASMEDGE_OS_LINUX && defined(__x86_64__)
 TEST_F(LinkerOutputTest, UniversalWasmMatchesLegacyLLDMetadata) {
-  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
-      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
-      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
-      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  constexpr std::array<WasmEdge::Byte, 40> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05,
+      0x01, 0x60, 0x00, 0x01, 0x7F, 0x03, 0x03, 0x02, 0x00, 0x00,
+      0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00, 0x0A, 0x0B, 0x02,
+      0x04, 0x00, 0x10, 0x01, 0x0B, 0x04, 0x00, 0x41, 0x07, 0x0B};
   const auto Seed = Directory / "seed.wasm";
   const auto Object = compileTinyObject(TinyWasm, Seed);
+  auto Graph = ObjectReader::read(Object, nativeTarget());
+  ASSERT_TRUE(Graph);
+  ASSERT_FALSE(Graph->relocations().empty());
+  const auto Relocation = std::find_if(
+      Graph->relocations().begin(), Graph->relocations().end(),
+      [&](const auto &Value) {
+        return Graph->sections()[Value.Section].Kind == SectionKind::Unwind &&
+               Graph->symbols()[Value.Symbol].Name == ".text" &&
+               Value.PCRelative;
+      });
+  ASSERT_NE(Relocation, Graph->relocations().end());
+  EXPECT_EQ(Relocation->Format, ObjectFormat::ELF);
+  EXPECT_EQ(Relocation->Type, llvm::ELF::R_X86_64_PC32);
+  EXPECT_EQ(Relocation->PatchSize, 4U);
+  const auto OriginalPatch = std::vector<WasmEdge::Byte>(
+      Graph->sections()[Relocation->Section].Content.begin() +
+          Relocation->Offset,
+      Graph->sections()[Relocation->Section].Content.begin() +
+          Relocation->Offset + Relocation->PatchSize);
+  constexpr uint64_t HostPageSize = 4096;
+  ASSERT_TRUE(layout(*Graph, 0, HostPageSize));
+  ASSERT_TRUE(applyRelocations(*Graph));
+  const auto FinalPatch = std::vector<WasmEdge::Byte>(
+      Graph->sections()[Relocation->Section].Content.begin() +
+          Relocation->Offset,
+      Graph->sections()[Relocation->Section].Content.begin() +
+          Relocation->Offset + Relocation->PatchSize);
+  EXPECT_NE(OriginalPatch, FinalPatch);
   const auto Legacy = writeLegacyUniversal(Directory, Object, TinyWasm);
   const auto Current = Directory / "current.wasm";
   ASSERT_TRUE(
@@ -848,6 +951,46 @@ TEST_F(LinkerOutputTest, UniversalWasmMatchesLegacyLLDMetadata) {
 
   const auto LegacyMetadata = parseAOTMetadata(Legacy);
   const auto CurrentMetadata = parseAOTMetadata(Current);
+  EXPECT_EQ(CurrentMetadata.Sections, coalesceSemanticSections(*Graph));
+  const auto FindKind = [](const auto &Metadata, uint8_t Kind) {
+    return std::find_if(
+        Metadata.Sections.begin(), Metadata.Sections.end(),
+        [&](const auto &Value) { return std::get<0>(Value) == Kind; });
+  };
+  const auto CurrentTextTuple = FindKind(CurrentMetadata, 1);
+  const auto CurrentUnwindTuple = FindKind(CurrentMetadata, 4);
+  const auto LegacyTextTuple = FindKind(LegacyMetadata, 1);
+  const auto LegacyUnwindTuple = FindKind(LegacyMetadata, 4);
+  ASSERT_NE(CurrentTextTuple, CurrentMetadata.Sections.end());
+  ASSERT_NE(CurrentUnwindTuple, CurrentMetadata.Sections.end());
+  ASSERT_NE(LegacyTextTuple, LegacyMetadata.Sections.end());
+  ASSERT_NE(LegacyUnwindTuple, LegacyMetadata.Sections.end());
+  const auto &PatchSection = Graph->sections()[Relocation->Section];
+  const auto RelativePatch = static_cast<size_t>(
+      PatchSection.Address - std::get<1>(*CurrentUnwindTuple) +
+      Relocation->Offset);
+  ASSERT_LE(RelativePatch + Relocation->PatchSize,
+            std::get<3>(*CurrentUnwindTuple).size());
+  ASSERT_LE(RelativePatch + Relocation->PatchSize,
+            std::get<3>(*LegacyUnwindTuple).size());
+  auto CurrentDisplacement =
+      Internal::readSigned(std::get<3>(*CurrentUnwindTuple), RelativePatch,
+                           Relocation->PatchSize, Endianness::Little);
+  auto LegacyDisplacement =
+      Internal::readSigned(std::get<3>(*LegacyUnwindTuple), RelativePatch,
+                           Relocation->PatchSize, Endianness::Little);
+  ASSERT_TRUE(CurrentDisplacement);
+  ASSERT_TRUE(LegacyDisplacement);
+  const auto ResolveTargetOffset = [&](const auto &Unwind, const auto &Text,
+                                       int64_t Displacement) {
+    const auto Place = std::get<1>(Unwind) + RelativePatch;
+    return static_cast<int64_t>(Place) + Displacement - Relocation->Addend -
+           static_cast<int64_t>(std::get<1>(Text));
+  };
+  EXPECT_EQ(ResolveTargetOffset(*CurrentUnwindTuple, *CurrentTextTuple,
+                                *CurrentDisplacement),
+            ResolveTargetOffset(*LegacyUnwindTuple, *LegacyTextTuple,
+                                *LegacyDisplacement));
   EXPECT_EQ(CurrentMetadata.Version, LegacyMetadata.Version);
   EXPECT_EQ(CurrentMetadata.OS, LegacyMetadata.OS);
   EXPECT_EQ(CurrentMetadata.Arch, LegacyMetadata.Arch);
@@ -931,6 +1074,27 @@ TEST_F(LinkerOutputTest, UniversalWasmMatchesLegacyLLDMetadata) {
     EXPECT_TRUE(CurrentKinds.insert(std::get<0>(Value)).second);
   }
   EXPECT_EQ(CurrentKinds, (std::set<uint8_t>{1, 2, 3, 4}));
+
+  auto LegacyImage = llvm::object::ObjectFile::createObjectFile(
+      (Directory / "legacy.so").string());
+  ASSERT_TRUE(static_cast<bool>(LegacyImage));
+  std::set<std::string> LegacyNativeMetadata;
+  for (const auto &Section : LegacyImage->getBinary()->sections()) {
+    auto Name = Section.getName();
+    ASSERT_TRUE(static_cast<bool>(Name));
+    if (*Name == ".dynsym" || *Name == ".dynstr" || *Name == ".hash" ||
+        *Name == ".gnu.hash" || *Name == ".dynamic") {
+      LegacyNativeMetadata.emplace(Name->str());
+    }
+  }
+  EXPECT_TRUE(LegacyNativeMetadata.count(".dynsym"));
+  EXPECT_TRUE(LegacyNativeMetadata.count(".dynstr"));
+  EXPECT_TRUE(LegacyNativeMetadata.count(".dynamic"));
+  EXPECT_TRUE(LegacyNativeMetadata.count(".hash") ||
+              LegacyNativeMetadata.count(".gnu.hash"));
+  for (const auto &Section : Graph->sections()) {
+    EXPECT_FALSE(LegacyNativeMetadata.count(Section.Name));
+  }
 }
 #endif
 
