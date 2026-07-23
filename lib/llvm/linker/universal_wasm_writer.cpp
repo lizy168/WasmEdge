@@ -12,6 +12,7 @@
 #include <limits>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 using namespace std::literals;
@@ -85,6 +86,58 @@ std::optional<AOTSectionKind> sectionKind(SectionKind Kind) noexcept {
     return AOTSectionKind::Unwind;
   }
   return std::nullopt;
+}
+
+struct OutputSection {
+  SectionKind Kind;
+  uint64_t Address;
+  uint64_t Size;
+  std::vector<Byte> Content;
+};
+
+Expect<std::vector<OutputSection>> outputSections(const LinkGraph &Graph) {
+  std::vector<const Section *> Ordered;
+  for (const auto &Value : Graph.sections()) {
+    if (Value.VirtualSize != 0) {
+      Ordered.push_back(&Value);
+    }
+  }
+  std::sort(Ordered.begin(), Ordered.end(),
+            [](const auto *Left, const auto *Right) {
+              return std::tuple(Left->Kind, Left->Address, Left->Name) <
+                     std::tuple(Right->Kind, Right->Address, Right->Name);
+            });
+  std::vector<OutputSection> Result;
+  for (const auto *Value : Ordered) {
+    if (Value->Content.size() > Value->VirtualSize ||
+        Value->Address >
+            std::numeric_limits<uint64_t>::max() - Value->VirtualSize) {
+      return Unexpect(ErrCode::Value::IllegalPath);
+    }
+    const uint64_t End = Value->Address + Value->VirtualSize;
+    if (Result.empty() || Result.back().Kind != Value->Kind) {
+      Result.push_back(OutputSection{Value->Kind, Value->Address,
+                                     Value->VirtualSize, Value->Content});
+      continue;
+    }
+    auto &Output = Result.back();
+    if (Value->Address < Output.Address ||
+        Value->Address < Output.Address + Output.Size) {
+      return Unexpect(ErrCode::Value::IllegalPath);
+    }
+    const uint64_t Size = End - Output.Address;
+    if (Size > std::numeric_limits<size_t>::max()) {
+      return Unexpect(ErrCode::Value::IllegalPath);
+    }
+    if (Output.Kind != SectionKind::BSS) {
+      Output.Content.resize(
+          static_cast<size_t>(Value->Address - Output.Address));
+      Output.Content.insert(Output.Content.end(), Value->Content.begin(),
+                            Value->Content.end());
+    }
+    Output.Size = Size;
+  }
+  return Result;
 }
 
 std::optional<uint64_t> symbolAddress(const LinkGraph &Graph,
@@ -178,24 +231,19 @@ UniversalWasmWriter::write(const LinkGraph &Graph, Span<const Byte> Wasm,
   EXPECTED_TRY(Section.writeByte(*OS));
   EXPECTED_TRY(Section.writeByte(*Arch));
   EXPECTED_TRY(writeAddresses(Section, Graph));
-  const auto SectionCount =
-      std::count_if(Graph.sections().begin(), Graph.sections().end(),
-                    [](const auto &Value) { return Value.VirtualSize != 0; });
-  if (SectionCount > std::numeric_limits<uint32_t>::max()) {
+  EXPECTED_TRY(auto Sections, outputSections(Graph));
+  if (Sections.size() > std::numeric_limits<uint32_t>::max()) {
     return writeError();
   }
-  EXPECTED_TRY(Section.writeU32(static_cast<uint32_t>(SectionCount)));
-  for (const auto &Value : Graph.sections()) {
-    if (Value.VirtualSize == 0) {
-      continue;
-    }
+  EXPECTED_TRY(Section.writeU32(static_cast<uint32_t>(Sections.size())));
+  for (const auto &Value : Sections) {
     const auto Kind = sectionKind(Value.Kind);
-    if (!Kind || Value.Content.size() > Value.VirtualSize) {
+    if (!Kind) {
       return writeError();
     }
     EXPECTED_TRY(Section.writeByte(static_cast<uint8_t>(*Kind)));
     EXPECTED_TRY(Section.writeU64(Value.Address));
-    EXPECTED_TRY(Section.writeU64(Value.VirtualSize));
+    EXPECTED_TRY(Section.writeU64(Value.Size));
     EXPECTED_TRY(Section.writeName(
         std::string_view(reinterpret_cast<const char *>(Value.Content.data()),
                          Value.Content.size())));
