@@ -526,77 +526,6 @@ Target nativeTarget() {
 #endif
 }
 
-std::vector<WasmEdge::Byte> makeUniversalObject() {
-  static const bool Initialized = [] {
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
-    return true;
-  }();
-  (void)Initialized;
-  const llvm::Triple Triple(llvm::sys::getDefaultTargetTriple());
-  std::string Error;
-  const auto *Target = llvm::TargetRegistry::lookupTarget(Triple.str(), Error);
-  EXPECT_NE(Target, nullptr) << Error;
-  if (Target == nullptr) {
-    return {};
-  }
-  llvm::TargetOptions Options;
-  std::unique_ptr<llvm::TargetMachine> Machine(Target->createTargetMachine(
-#if LLVM_VERSION_MAJOR >= 21
-      Triple,
-#else
-      Triple.str(),
-#endif
-      "generic", "", Options, llvm::Reloc::PIC_));
-  EXPECT_NE(Machine, nullptr);
-  if (Machine == nullptr) {
-    return {};
-  }
-  llvm::LLVMContext Context;
-  llvm::Module Module("universal-writer-test", Context);
-#if LLVM_VERSION_MAJOR >= 21
-  Module.setTargetTriple(Triple);
-#else
-  Module.setTargetTriple(Triple.str());
-#endif
-  Module.setDataLayout(Machine->createDataLayout());
-  auto *I32 = llvm::Type::getInt32Ty(Context);
-  auto *I64 = llvm::Type::getInt64Ty(Context);
-  auto *Intrinsics = new llvm::GlobalVariable(
-      Module, I64, false, llvm::GlobalValue::ExternalLinkage,
-      llvm::ConstantInt::get(I64, 0), "intrinsics");
-  Intrinsics->setSection(".data.intrinsics");
-  auto *Version = new llvm::GlobalVariable(
-      Module, I32, false, llvm::GlobalValue::ExternalLinkage,
-      llvm::ConstantInt::get(I32, 3), "version");
-  Version->setSection(".data.version");
-  auto *Zero = new llvm::GlobalVariable(Module, I64, false,
-                                        llvm::GlobalValue::ExternalLinkage,
-                                        llvm::ConstantInt::get(I64, 0), "zero");
-  Zero->setSection(".bss.zero");
-  for (const std::string Name : {"f0", "t0"}) {
-    auto *Function = llvm::Function::Create(llvm::FunctionType::get(I32, false),
-                                            llvm::GlobalValue::ExternalLinkage,
-                                            Name, Module);
-    Function->setSection(".text." + Name);
-    Function->addFnAttr(llvm::Attribute::NoUnwind);
-    llvm::IRBuilder<> Builder(
-        llvm::BasicBlock::Create(Context, "entry", Function));
-    Builder.CreateRet(llvm::ConstantInt::get(I32, Name == "f0" ? 7 : 0));
-  }
-  llvm::SmallVector<char, 0> Storage;
-  llvm::raw_svector_ostream Stream(Storage);
-  llvm::legacy::PassManager Passes;
-#if LLVM_VERSION_MAJOR >= 18
-  const auto FileType = llvm::CodeGenFileType::ObjectFile;
-#else
-  const auto FileType = llvm::CGFT_ObjectFile;
-#endif
-  EXPECT_FALSE(Machine->addPassesToEmitFile(Passes, Stream, nullptr, FileType));
-  Passes.run(Module);
-  return std::vector<WasmEdge::Byte>(Storage.begin(), Storage.end());
-}
-
 #if WASMEDGE_OS_LINUX
 bool writeBytes(const std::filesystem::path &Path,
                 WasmEdge::Span<const WasmEdge::Byte> Bytes) {
@@ -779,6 +708,55 @@ protected:
     }
   }
 
+  std::vector<WasmEdge::Byte>
+  compileTinyObject(WasmEdge::Span<const WasmEdge::Byte> Wasm,
+                    const std::filesystem::path &Output) const {
+    WasmEdge::Configure Conf;
+    Conf.getCompilerConfigure().setOutputFormat(
+        WasmEdge::CompilerConfigure::OutputFormat::Wasm);
+    Conf.getCompilerConfigure().setDumpIR(true);
+    WasmEdge::Loader::Loader Loader(Conf);
+    WasmEdge::Validator::Validator Validator(Conf);
+    WasmEdge::LLVM::Compiler Compiler(Conf);
+    WasmEdge::LLVM::CodeGen CodeGen(Conf);
+    auto Module = Loader.parseModule(Wasm);
+    EXPECT_TRUE(Module);
+    if (!Module) {
+      return {};
+    }
+    EXPECT_TRUE(Validator.validate(**Module));
+    auto Data = Compiler.compile(**Module);
+    EXPECT_TRUE(Data);
+    if (!Data) {
+      return {};
+    }
+    const auto Original = std::filesystem::current_path();
+    std::filesystem::current_path(Directory);
+    const auto Result = CodeGen.codegen(Wasm, std::move(*Data), Output);
+    std::filesystem::current_path(Original);
+    EXPECT_TRUE(Result);
+    auto Object = readFile(Directory / "wasm.o");
+    std::filesystem::remove(Directory / "wasm.o");
+    std::filesystem::remove(Directory / "wasm.ll");
+    std::filesystem::remove(Directory / "wasm-opt.ll");
+    return Object;
+  }
+
+  uint32_t execute(const std::filesystem::path &Path) const {
+    WasmEdge::Configure Conf;
+    Conf.getRuntimeConfigure().setRunMode(WasmEdge::RunMode::AOT);
+    WasmEdge::VM::VM VM(Conf);
+    EXPECT_TRUE(VM.loadWasm(Path));
+    EXPECT_TRUE(VM.validate());
+    EXPECT_TRUE(VM.instantiate());
+    auto Result = VM.execute("f");
+    EXPECT_TRUE(Result);
+    if (!Result || Result->size() != 1) {
+      return 0;
+    }
+    return (*Result)[0].first.get<uint32_t>();
+  }
+
   std::filesystem::path Directory;
 };
 
@@ -861,7 +839,8 @@ TEST_F(LinkerOutputTest, UniversalWasmMatchesLegacyLLDMetadata) {
       0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
       0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
       0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
-  const auto Object = makeUniversalObject();
+  const auto Seed = Directory / "seed.wasm";
+  const auto Object = compileTinyObject(TinyWasm, Seed);
   const auto Legacy = writeLegacyUniversal(Directory, Object, TinyWasm);
   const auto Current = Directory / "current.wasm";
   ASSERT_TRUE(
@@ -872,37 +851,55 @@ TEST_F(LinkerOutputTest, UniversalWasmMatchesLegacyLLDMetadata) {
   EXPECT_EQ(CurrentMetadata.Version, LegacyMetadata.Version);
   EXPECT_EQ(CurrentMetadata.OS, LegacyMetadata.OS);
   EXPECT_EQ(CurrentMetadata.Arch, LegacyMetadata.Arch);
-  auto Containing = [](const auto &Metadata, uint8_t Kind, uint64_t Address) {
+  EXPECT_EQ(execute(Legacy), 7U);
+  EXPECT_EQ(execute(Current), 7U);
+  auto Containing = [](const auto &Metadata, uint64_t Address) {
     return std::find_if(Metadata.Sections.begin(), Metadata.Sections.end(),
                         [&](const auto &Section) {
-                          return std::get<0>(Section) == Kind &&
-                                 Address >= std::get<1>(Section) &&
+                          return Address >= std::get<1>(Section) &&
                                  Address - std::get<1>(Section) <
                                      std::get<2>(Section);
                         });
   };
-  const auto LegacyText =
-      Containing(LegacyMetadata, 1, LegacyMetadata.Codes[0]);
-  const auto CurrentText =
-      Containing(CurrentMetadata, 1, CurrentMetadata.Codes[0]);
-  const auto LegacyData =
-      Containing(LegacyMetadata, 2, LegacyMetadata.IntrinsicsAddress);
-  const auto CurrentData =
-      Containing(CurrentMetadata, 2, CurrentMetadata.IntrinsicsAddress);
-  ASSERT_NE(LegacyText, LegacyMetadata.Sections.end());
-  ASSERT_NE(CurrentText, CurrentMetadata.Sections.end());
-  ASSERT_NE(LegacyData, LegacyMetadata.Sections.end());
-  ASSERT_NE(CurrentData, CurrentMetadata.Sections.end());
-  EXPECT_EQ(LegacyMetadata.Codes[0] - std::get<1>(*LegacyText),
-            CurrentMetadata.Codes[0] - std::get<1>(*CurrentText));
-  EXPECT_EQ(LegacyMetadata.Types[0] - std::get<1>(*LegacyText),
-            CurrentMetadata.Types[0] - std::get<1>(*CurrentText));
-  EXPECT_EQ(std::get<2>(*CurrentText), std::get<2>(*LegacyText));
-  EXPECT_EQ(LegacyMetadata.IntrinsicsAddress - std::get<1>(*LegacyData),
-            CurrentMetadata.IntrinsicsAddress - std::get<1>(*CurrentData));
-  EXPECT_EQ(LegacyMetadata.VersionAddress - std::get<1>(*LegacyData),
-            CurrentMetadata.VersionAddress - std::get<1>(*CurrentData));
-  EXPECT_EQ(std::get<2>(*CurrentData), std::get<2>(*LegacyData));
+  auto ExpectRole = [&](uint64_t LegacyAddress, uint64_t CurrentAddress) {
+    const auto LegacySection = Containing(LegacyMetadata, LegacyAddress);
+    const auto CurrentSection = Containing(CurrentMetadata, CurrentAddress);
+    ASSERT_NE(LegacySection, LegacyMetadata.Sections.end());
+    ASSERT_NE(CurrentSection, CurrentMetadata.Sections.end());
+    EXPECT_EQ(std::get<0>(*CurrentSection), std::get<0>(*LegacySection));
+    EXPECT_EQ(LegacyAddress - std::get<1>(*LegacySection),
+              CurrentAddress - std::get<1>(*CurrentSection));
+  };
+  ExpectRole(LegacyMetadata.VersionAddress, CurrentMetadata.VersionAddress);
+  ExpectRole(LegacyMetadata.IntrinsicsAddress,
+             CurrentMetadata.IntrinsicsAddress);
+  ASSERT_EQ(LegacyMetadata.Types.size(), CurrentMetadata.Types.size());
+  for (size_t I = 0; I < LegacyMetadata.Types.size(); ++I) {
+    ExpectRole(LegacyMetadata.Types[I], CurrentMetadata.Types[I]);
+  }
+  ASSERT_EQ(LegacyMetadata.Codes.size(), CurrentMetadata.Codes.size());
+  for (size_t I = 0; I < LegacyMetadata.Codes.size(); ++I) {
+    ExpectRole(LegacyMetadata.Codes[I], CurrentMetadata.Codes[I]);
+  }
+  const auto LegacyVersion =
+      Containing(LegacyMetadata, LegacyMetadata.VersionAddress);
+  const auto CurrentVersion =
+      Containing(CurrentMetadata, CurrentMetadata.VersionAddress);
+  ASSERT_NE(LegacyVersion, LegacyMetadata.Sections.end());
+  ASSERT_NE(CurrentVersion, CurrentMetadata.Sections.end());
+  constexpr size_t VersionSize = sizeof(uint32_t);
+  const auto LegacyVersionOffset = static_cast<size_t>(
+      LegacyMetadata.VersionAddress - std::get<1>(*LegacyVersion));
+  const auto CurrentVersionOffset = static_cast<size_t>(
+      CurrentMetadata.VersionAddress - std::get<1>(*CurrentVersion));
+  ASSERT_LE(LegacyVersionOffset + VersionSize,
+            std::get<3>(*LegacyVersion).size());
+  ASSERT_LE(CurrentVersionOffset + VersionSize,
+            std::get<3>(*CurrentVersion).size());
+  EXPECT_TRUE(std::equal(
+      std::get<3>(*LegacyVersion).begin() + LegacyVersionOffset,
+      std::get<3>(*LegacyVersion).begin() + LegacyVersionOffset + VersionSize,
+      std::get<3>(*CurrentVersion).begin() + CurrentVersionOffset));
   EXPECT_TRUE(
       std::any_of(CurrentMetadata.Sections.begin(),
                   CurrentMetadata.Sections.end(), [](const auto &Value) {
@@ -915,6 +912,25 @@ TEST_F(LinkerOutputTest, UniversalWasmMatchesLegacyLLDMetadata) {
                                    std::get<2>(Value) == 8 &&
                                    std::get<3>(Value).empty();
                           }));
+  const auto CurrentUnwind = std::count_if(
+      CurrentMetadata.Sections.begin(), CurrentMetadata.Sections.end(),
+      [](const auto &Value) { return std::get<0>(Value) == 4; });
+  const auto LegacyUnwind = std::count_if(
+      LegacyMetadata.Sections.begin(), LegacyMetadata.Sections.end(),
+      [](const auto &Value) { return std::get<0>(Value) == 4; });
+  EXPECT_EQ(CurrentUnwind, LegacyUnwind);
+  EXPECT_GT(CurrentUnwind, 0);
+  EXPECT_TRUE(std::all_of(
+      CurrentMetadata.Sections.begin(), CurrentMetadata.Sections.end(),
+      [](const auto &Value) {
+        return std::get<0>(Value) != 4 || !std::get<3>(Value).empty();
+      }));
+  EXPECT_LT(CurrentMetadata.Sections.size(), LegacyMetadata.Sections.size());
+  std::set<uint8_t> CurrentKinds;
+  for (const auto &Value : CurrentMetadata.Sections) {
+    EXPECT_TRUE(CurrentKinds.insert(std::get<0>(Value)).second);
+  }
+  EXPECT_EQ(CurrentKinds, (std::set<uint8_t>{1, 2, 3, 4}));
 }
 #endif
 
@@ -1008,6 +1024,29 @@ TEST_F(LinkerOutputTest, NativeLinkerCreatesNoNativeTemporary) {
   expectNoTemporaryFiles();
 }
 
+TEST_F(LinkerOutputTest, NativeLinkerReplacesExistingOutputAtomically) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Output = Directory / "replace.wasm";
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  const std::array<WasmEdge::Byte, 4> Sentinel{1, 2, 3, 4};
+  {
+    std::ofstream File(Output, std::ios_base::binary);
+    File.write(reinterpret_cast<const char *>(Sentinel.data()),
+               Sentinel.size());
+    ASSERT_TRUE(File);
+  }
+
+  ASSERT_TRUE(
+      NativeLinker::link(Object, TinyWasm, Output, OutputKind::UniversalWasm));
+  EXPECT_NE(readFile(Output),
+            (std::vector<WasmEdge::Byte>(Sentinel.begin(), Sentinel.end())));
+  EXPECT_EQ(execute(Output), 7U);
+  expectNoTemporaryFiles();
+}
+
 TEST_F(LinkerOutputTest, NativeLinkerRejectsBadObjectsAtomically) {
   const auto Output = Directory / "existing.wasm";
   const std::array<WasmEdge::Byte, 3> Existing{1, 2, 3};
@@ -1050,6 +1089,30 @@ TEST_F(LinkerOutputTest,
   EXPECT_TRUE(Second.get());
   EXPECT_EQ(parseAOTMetadata(Directory / "first.wasm").Sections,
             parseAOTMetadata(Directory / "second.wasm").Sections);
+  expectNoTemporaryFiles();
+}
+
+TEST_F(LinkerOutputTest, NativeLinkerPublishesConcurrentlyToSameDestination) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Output = Directory / "shared.wasm";
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  std::promise<void> Start;
+  const auto Ready = Start.get_future().share();
+  auto Link = [&] {
+    Ready.wait();
+    return NativeLinker::link(Object, TinyWasm, Output,
+                              OutputKind::UniversalWasm);
+  };
+  auto First = std::async(std::launch::async, Link);
+  auto Second = std::async(std::launch::async, Link);
+  Start.set_value();
+
+  EXPECT_TRUE(First.get());
+  EXPECT_TRUE(Second.get());
+  EXPECT_EQ(execute(Output), 7U);
   expectNoTemporaryFiles();
 }
 
