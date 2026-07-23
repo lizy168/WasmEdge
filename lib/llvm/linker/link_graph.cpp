@@ -24,6 +24,20 @@ bool extendsBeyond(uint64_t Offset, uint64_t Size, uint64_t Limit) noexcept {
   return Offset > Limit || Size > Limit - Offset;
 }
 
+bool isRISCVSymbolDifference(const Relocation &Value) noexcept {
+  return Value.Format == ObjectFormat::ELF && Value.PatchSize == 4 &&
+         (Value.Type == llvm::ELF::R_RISCV_ADD32 ||
+          Value.Type == llvm::ELF::R_RISCV_SUB32);
+}
+
+bool composeRISCVSymbolDifference(const Relocation &Left,
+                                  const Relocation &Right) noexcept {
+  return isRISCVSymbolDifference(Left) && isRISCVSymbolDifference(Right) &&
+         Left.Section == Right.Section && Left.Offset == Right.Offset &&
+         Left.Format == Right.Format && Left.PatchSize == Right.PatchSize &&
+         Left.Type != Right.Type;
+}
+
 template <typename T, typename Size>
 bool overlaps(const T &Left, const T &Right, Size GetSize) noexcept {
   if (Left.Section != Right.Section) {
@@ -122,6 +136,8 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
     case llvm::ELF::R_RISCV_PCREL_LO12_I:
     case llvm::ELF::R_RISCV_PCREL_LO12_S:
     case llvm::ELF::R_RISCV_32_PCREL:
+    case llvm::ELF::R_RISCV_ADD32:
+    case llvm::ELF::R_RISCV_SUB32:
       return WordPatch;
     case llvm::ELF::R_RISCV_RELAX:
       return NoPatch;
@@ -146,6 +162,41 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
     return MetadataSize;
   }
   return std::nullopt;
+}
+
+bool relocationIsPCRelative(ObjectFormat Format, Target TargetValue,
+                            uint32_t Type) noexcept {
+  if (Format != ObjectFormat::ELF) {
+    return false;
+  }
+  switch (TargetValue) {
+  case Target::X86_64:
+    return Type == llvm::ELF::R_X86_64_PC32 ||
+           Type == llvm::ELF::R_X86_64_PLT32 ||
+           Type == llvm::ELF::R_X86_64_GOTPCRELX ||
+           Type == llvm::ELF::R_X86_64_REX_GOTPCRELX;
+  case Target::ARM:
+    return Type == llvm::ELF::R_ARM_REL32 ||
+           Type == llvm::ELF::R_ARM_THM_CALL || Type == llvm::ELF::R_ARM_CALL ||
+           Type == llvm::ELF::R_ARM_JUMP24 || Type == llvm::ELF::R_ARM_PREL31;
+  case Target::AArch64:
+    return Type == llvm::ELF::R_AARCH64_PREL64 ||
+           Type == llvm::ELF::R_AARCH64_PREL32 ||
+           Type == llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21 ||
+           Type == llvm::ELF::R_AARCH64_JUMP26 ||
+           Type == llvm::ELF::R_AARCH64_CALL26;
+  case Target::RISCV64:
+    return Type == llvm::ELF::R_RISCV_CALL ||
+           Type == llvm::ELF::R_RISCV_CALL_PLT ||
+           Type == llvm::ELF::R_RISCV_PCREL_HI20 ||
+           Type == llvm::ELF::R_RISCV_PCREL_LO12_I ||
+           Type == llvm::ELF::R_RISCV_PCREL_LO12_S ||
+           Type == llvm::ELF::R_RISCV_32_PCREL;
+  case Target::S390X:
+    return Type == llvm::ELF::R_390_PC32 || Type == llvm::ELF::R_390_PC32DBL ||
+           Type == llvm::ELF::R_390_PLT32DBL;
+  }
+  return false;
 }
 
 LinkExpect<void> LinkGraph::beginInput(std::string_view Name) {
@@ -275,9 +326,14 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
   }
   if (Value.PatchSize != NoPatch &&
       std::any_of(Relocations.begin(), Relocations.end(), [&](const auto &Old) {
-        return overlaps(Value, Old, [](const auto &RelocationValue) {
-          return RelocationValue.PatchSize;
-        });
+        if (Old.PatchSize == NoPatch) {
+          return false;
+        }
+        return overlaps(Value, Old,
+                        [](const auto &RelocationValue) {
+                          return RelocationValue.PatchSize;
+                        }) &&
+               !composeRISCVSymbolDifference(Value, Old);
       })) {
     Diagnostic Diag{"overlapping relocation patches"};
     Diag.Section = Value.Section;
@@ -408,10 +464,21 @@ LinkExpect<void> LinkGraph::validate() const {
       if (Relocations[I].PatchSize != NoPatch &&
           Relocations[J].PatchSize != NoPatch &&
           overlaps(Relocations[I], Relocations[J],
-                   [](const auto &Value) { return Value.PatchSize; })) {
+                   [](const auto &Value) { return Value.PatchSize; }) &&
+          !composeRISCVSymbolDifference(Relocations[I], Relocations[J])) {
         return fail<void>(Diagnostic{"overlapping relocation patches"});
       }
     }
+  }
+  for (const auto &Value : Relocations) {
+    if (!isRISCVSymbolDifference(Value))
+      continue;
+    const auto Pair = std::count_if(
+        Relocations.begin(), Relocations.end(), [&](const auto &Other) {
+          return composeRISCVSymbolDifference(Value, Other);
+        });
+    if (Pair != 1)
+      return fail<void>(Diagnostic{"unpaired RISC-V symbol difference"});
   }
   for (const auto &Value : Rebases) {
     if (Value.Section >= Sections.size()) {

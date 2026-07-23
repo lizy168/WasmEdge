@@ -495,13 +495,16 @@ relocationMetadata(const llvm::object::ObjectFile &Object,
                Type == llvm::ELF::R_X86_64_GOTPCRELX ||
                Type == llvm::ELF::R_X86_64_REX_GOTPCRELX) {
       Metadata.PatchSize = WordPatch;
-      Metadata.PCRelative = true;
     }
   } else if (TargetValue == Target::X86_64 && Object.isCOFF() &&
              Type >= llvm::COFF::IMAGE_REL_AMD64_REL32 &&
              Type <= llvm::COFF::IMAGE_REL_AMD64_REL32_5) {
     Metadata.PatchSize = WordPatch;
     Metadata.PCRelative = true;
+  }
+  if (Object.isELF()) {
+    Metadata.PCRelative =
+        relocationIsPCRelative(ObjectFormat::ELF, TargetValue, Type);
   }
   return Metadata;
 }

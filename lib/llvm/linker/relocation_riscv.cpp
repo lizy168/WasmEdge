@@ -47,14 +47,85 @@ Expect<RelocationResult> applyRISCV(const LinkGraph &Graph) {
   }
   Result.Rebases = Graph.rebases();
   std::map<std::pair<SectionId, uint64_t>, int128_t> HighValues;
+  std::map<std::pair<SectionId, uint64_t>,
+           std::pair<const Relocation *, const Relocation *>>
+      SymbolDifferences;
   for (const auto &Rel : Graph.relocations()) {
+    if (Rel.Type == llvm::ELF::R_RISCV_ADD32 ||
+        Rel.Type == llvm::ELF::R_RISCV_SUB32) {
+      auto &Pair = SymbolDifferences[{Rel.Section, Rel.Offset}];
+      (Rel.Type == llvm::ELF::R_RISCV_ADD32 ? Pair.first : Pair.second) = &Rel;
+    }
+    if (Rel.Format != ObjectFormat::ELF ||
+        Rel.Type != llvm::ELF::R_RISCV_PCREL_HI20) {
+      continue;
+    }
+    if ((Rel.Offset & InstructionAlignmentMask) != 0) {
+      return fail(Rel, "invalid relocation field");
+    }
+    const auto &Bytes = Graph.sections()[Rel.Section].Content;
+    const auto Word =
+        readUnsigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little);
+    if (!Word || (*Word & OpcodeMask) != AuipcOpcode) {
+      return fail(Rel, "invalid PCREL_HI20 instruction");
+    }
+    const auto &Symbol = Graph.symbols()[Rel.Symbol];
+    const int128_t S = int128_t(Graph.sections()[Symbol.Section].Address) +
+                       Symbol.Offset + Rel.Addend;
+    const int128_t P =
+        int128_t(Graph.sections()[Rel.Section].Address) + Rel.Offset;
+    const int128_t Delta = S - P;
+    if (!signedBits(Delta, WordBits) ||
+        !HighValues.emplace(std::make_pair(Rel.Section, Rel.Offset), Delta)
+             .second) {
+      return fail(Rel, "invalid PCREL_HI20 relocation");
+    }
+  }
+  for (const auto &Rel : Graph.relocations()) {
+    auto &Bytes = Result.Content[Rel.Section];
     if (Rel.Format != ObjectFormat::ELF) {
       return fail(Rel, "invalid relocation field");
     }
     if (Rel.Type == llvm::ELF::R_RISCV_RELAX) {
       continue;
     }
-    auto &Bytes = Result.Content[Rel.Section];
+    if (Rel.Type == llvm::ELF::R_RISCV_SUB32) {
+      continue;
+    }
+    if (Rel.Type == llvm::ELF::R_RISCV_ADD32) {
+      const auto Pair = SymbolDifferences.find({Rel.Section, Rel.Offset});
+      if (Pair == SymbolDifferences.end() || Pair->second.first == nullptr ||
+          Pair->second.second == nullptr) {
+        return fail(Rel, "unpaired symbol difference relocation");
+      }
+      const auto address = [&](const Relocation &Value,
+                               uint64_t &Output) noexcept {
+        const auto &Target = Graph.symbols()[Value.Symbol];
+        const uint64_t Base = Graph.sections()[Target.Section].Address;
+        if (Target.Offset > UINT64_MAX - Base)
+          return false;
+        Output = Base + Target.Offset;
+        return true;
+      };
+      uint64_t AddAddress = 0;
+      uint64_t SubAddress = 0;
+      const auto Original =
+          readUnsigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little);
+      if (!Original || !address(*Pair->second.first, AddAddress) ||
+          !address(*Pair->second.second, SubAddress)) {
+        return fail(Rel, "invalid symbol difference relocation");
+      }
+      uint32_t Value = static_cast<uint32_t>(*Original);
+      Value += static_cast<uint32_t>(AddAddress) +
+               static_cast<uint32_t>(Pair->second.first->Addend);
+      Value -= static_cast<uint32_t>(SubAddress) +
+               static_cast<uint32_t>(Pair->second.second->Addend);
+      if (!writeUnsigned(Bytes, Rel.Offset, InstructionWidth,
+                         Endianness::Little, Value)) {
+        return fail(Rel, "cannot encode symbol difference");
+      }
+      continue;
+    }
     const auto &Symbol = Graph.symbols()[Rel.Symbol];
     const int128_t S = int128_t(Graph.sections()[Symbol.Section].Address) +
                        Symbol.Offset + Rel.Addend;
@@ -127,17 +198,14 @@ Expect<RelocationResult> applyRISCV(const LinkGraph &Graph) {
       continue;
     }
     if (Rel.Type == llvm::ELF::R_RISCV_PCREL_HI20) {
-      if ((Instruction & OpcodeMask) != AuipcOpcode) {
-        return fail(Rel, "invalid PCREL_HI20 instruction");
+      const auto HighValue = HighValues.find({Rel.Section, Rel.Offset});
+      if (HighValue == HighValues.end()) {
+        return fail(Rel, "missing precomputed PCREL_HI20 relocation");
       }
-      const int128_t Delta = S - P;
+      const int128_t Delta = HighValue->second;
       const int128_t High = (Delta + ImmediateRoundingBias) >> ImmediateShift;
-      if (!signedBits(Delta, WordBits)) {
-        return fail(Rel, "PCREL_HI20 displacement overflows");
-      }
       Instruction = (Instruction & UpperImmediatePreservedMask) |
                     (static_cast<uint32_t>(High) << ImmediateShift);
-      HighValues.emplace(std::make_pair(Rel.Section, Rel.Offset), Delta);
     } else if (Rel.Type == llvm::ELF::R_RISCV_PCREL_LO12_I ||
                Rel.Type == llvm::ELF::R_RISCV_PCREL_LO12_S) {
       constexpr unsigned IImmediateShift = 20;

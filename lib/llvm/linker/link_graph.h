@@ -90,6 +90,8 @@ template <typename T> using LinkExpect = Expected<T, Diagnostic>;
 std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
                                            Target TargetValue, uint32_t Type,
                                            uint8_t MetadataSize) noexcept;
+bool relocationIsPCRelative(ObjectFormat Format, Target TargetValue,
+                            uint32_t Type) noexcept;
 
 class LinkGraph {
 public:

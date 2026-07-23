@@ -162,7 +162,7 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       Low12Encoding Encoding{};
       switch (Rel.Type) {
       case llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC:
-        Encoding = {Low12Scale::Byte, UINT32_C(0x7F000000),
+        Encoding = {Low12Scale::Byte, UINT32_C(0x7FC00000),
                     UINT32_C(0x11000000)};
         break;
       case llvm::ELF::R_AARCH64_LDST8_ABS_LO12_NC:
