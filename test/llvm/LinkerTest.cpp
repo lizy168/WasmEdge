@@ -19,6 +19,7 @@
 #if LLVM_VERSION_MAJOR >= 19
 #include <llvm/MC/MCELFExtras.h>
 #endif
+#include <llvm/Object/MachO.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/CodeGen.h>
 #if LLVM_VERSION_MAJOR >= 19
@@ -412,6 +413,47 @@ TEST(LinkGraphTest, StoresRelocationsAndRebases) {
   EXPECT_EQ(Graph.rebases()[0].Addend, 8);
 }
 
+TEST(LinkGraphTest, RejectsOverlappingRelocationsRegardlessOfOrder) {
+  for (const bool Reverse : {false, true}) {
+    LinkGraph Graph(Target::X86_64, Endianness::Little);
+    ASSERT_TRUE(Graph.beginInput("input.o"));
+    auto Text = Graph.addSection(Section{
+        ".text", SectionKind::Text, 1, 8, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}});
+    ASSERT_TRUE(Text);
+    auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+    ASSERT_TRUE(TargetSymbol);
+    Relocation First{*Text, 1, 2, *TargetSymbol, 0};
+    First.PatchSize = 4;
+    Relocation Second{*Text, 3, 2, *TargetSymbol, 0};
+    Second.PatchSize = 4;
+    ASSERT_TRUE(Graph.addRelocation(Reverse ? Second : First));
+    auto Result = Graph.addRelocation(Reverse ? First : Second);
+    ASSERT_FALSE(Result);
+    EXPECT_EQ(Result.error().Message, "overlapping relocation patches");
+  }
+}
+
+TEST(LinkGraphTest, RejectsOverlappingRebasesRegardlessOfOrder) {
+  for (const bool Reverse : {false, true}) {
+    LinkGraph Graph(Target::X86_64, Endianness::Little);
+    ASSERT_TRUE(Graph.beginInput("input.o"));
+    auto Data = Graph.addSection(Section{".data",
+                                         SectionKind::Data,
+                                         1,
+                                         12,
+                                         0,
+                                         0,
+                                         {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}});
+    ASSERT_TRUE(Data);
+    const Rebase First{*Data, 1, 1, 0, 8};
+    const Rebase Second{*Data, 7, 1, 0, 4};
+    ASSERT_TRUE(Graph.addRebase(Reverse ? Second : First));
+    auto Result = Graph.addRebase(Reverse ? First : Second);
+    ASSERT_FALSE(Result);
+    EXPECT_EQ(Result.error().Message, "overlapping rebase patches");
+  }
+}
+
 TEST(LinkGraphTest, RejectsInvalidPatchSections) {
   LinkGraph Graph(Target::X86_64, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("input.o"));
@@ -468,8 +510,8 @@ TEST(LinkGraphTest, ProvidesCheckedMutableGraphAccess) {
   auto Content = Graph.sectionContent(*Text);
   ASSERT_TRUE(Content);
   (*Content)[0] = 0xCC;
-  Graph.relocations()[0].Addend = 8;
-  Graph.rebases()[0].Addend = 16;
+  const_cast<std::vector<Relocation> &>(Graph.relocations())[0].Addend = 8;
+  const_cast<std::vector<Rebase> &>(Graph.rebases())[0].Addend = 16;
   EXPECT_EQ(Graph.sections()[*Text].Address, 64U);
   EXPECT_EQ(Graph.sections()[*Text].FileOffset, 32U);
   EXPECT_EQ(Graph.sections()[*Text].Content[0], 0xCCU);
@@ -516,7 +558,8 @@ TEST(LinkGraphTest, ValidatesMutatedPatchOffsets) {
   ASSERT_TRUE(TargetSymbol);
   ASSERT_TRUE(RelocationGraph.addRelocation(
       Relocation{*Text, 0, 42, *TargetSymbol, 0}));
-  RelocationGraph.relocations()[0].Offset = 1;
+  const_cast<std::vector<Relocation> &>(RelocationGraph.relocations())[0]
+      .Offset = 1;
   auto RelocationResult = RelocationGraph.validate();
   ASSERT_FALSE(RelocationResult);
   EXPECT_EQ(RelocationResult.error().Message,
@@ -528,7 +571,7 @@ TEST(LinkGraphTest, ValidatesMutatedPatchOffsets) {
       Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}});
   ASSERT_TRUE(Text);
   ASSERT_TRUE(RebaseGraph.addRebase(Rebase{*Text, 0, 7, 0}));
-  RebaseGraph.rebases()[0].Offset = 1;
+  const_cast<std::vector<Rebase> &>(RebaseGraph.rebases())[0].Offset = 1;
   auto RebaseResult = RebaseGraph.validate();
   ASSERT_FALSE(RebaseResult);
   EXPECT_EQ(RebaseResult.error().Message,
@@ -843,22 +886,20 @@ LinkGraph makeRelocationGraph(uint32_t Type, int64_t Addend,
                               ObjectFormat Format = ObjectFormat::ELF) {
   LinkGraph Graph(Target::X86_64, Endianness::Little);
   EXPECT_TRUE(Graph.beginInput("input.o"));
-  auto Patch = Graph.addSection(
-      Section{".text",
-              SectionKind::Text,
-              1,
-              16,
-              PatchAddress,
-              0,
-              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}});
+  auto Patch = Graph.addSection(Section{
+      ".text", SectionKind::Text, 1, 24, PatchAddress, 0, {0, 0, 0, 0, 0, 0,
+                                                           0, 0, 0, 0, 0, 0,
+                                                           0, 0, 0, 0, 0, 0,
+                                                           0, 0, 0, 0, 0, 0}});
   auto TargetSection = Graph.addSection(
       Section{".data", SectionKind::Data, 1, 1, TargetAddress, 0, {0}});
   EXPECT_TRUE(Patch && TargetSection);
   auto TargetSymbol =
       Graph.addSymbol(Symbol{"target", *TargetSection, 0, 1, false});
   EXPECT_TRUE(TargetSymbol);
-  EXPECT_TRUE(Graph.addRelocation(
-      Relocation{*Patch, 1, Type, *TargetSymbol, Addend, Implicit, Format}));
+  Relocation Value{*Patch, 1, Type, *TargetSymbol, Addend, Implicit, Format};
+  Value.PatchSize = Type == 1 ? 8 : 4;
+  EXPECT_TRUE(Graph.addRelocation(Value));
   return Graph;
 }
 
@@ -901,6 +942,10 @@ void expectGraphStateEquals(const LinkGraph &Actual,
     EXPECT_EQ(Left.Addend, Right.Addend);
     EXPECT_EQ(Left.AddendIsImplicit, Right.AddendIsImplicit);
     EXPECT_EQ(Left.Format, Right.Format);
+    EXPECT_EQ(Left.PatchSize, Right.PatchSize);
+    EXPECT_EQ(Left.PCRelative, Right.PCRelative);
+    EXPECT_EQ(Left.External, Right.External);
+    EXPECT_EQ(Left.Scattered, Right.Scattered);
   }
   ASSERT_EQ(Actual.rebases().size(), Expected.rebases().size());
   for (size_t I = 0; I < Actual.rebases().size(); ++I) {
@@ -1044,21 +1089,31 @@ TEST(RelocationTest, RejectsOverflowAndDoesNotPartiallyModifyGraph) {
   auto SecondSymbol =
       Graph.addSymbol(Symbol{"second", *FarSection, 0, 1, false});
   ASSERT_TRUE(SecondSymbol);
-  ASSERT_TRUE(Graph.addRelocation(
-      Relocation{0, 8, 1, *SecondSymbol, INT64_MAX, false, ObjectFormat::ELF}));
+  ASSERT_TRUE(Graph.addRelocation(Relocation{0, 12, 1, *SecondSymbol, INT64_MAX,
+                                             false, ObjectFormat::ELF, 8}));
   const auto Snapshot = Graph;
   auto Result = applyRelocations(Graph);
   EXPECT_FALSE(Result);
   expectGraphStateEquals(Graph, Snapshot);
 }
 
+TEST(RelocationTest, RejectsGeneratedRebaseOverlappingExistingRebase) {
+  auto Graph = makeRelocationGraph(1, 5);
+  ASSERT_TRUE(Graph.addRebase(Rebase{0, 4, 1, 0, 8}));
+  const auto Snapshot = Graph;
+  EXPECT_FALSE(applyRelocations(Graph));
+  expectGraphStateEquals(Graph, Snapshot);
+}
+
 TEST(RelocationTest, RejectsInvalidGraphUnsupportedTargetTypeAndFormat) {
   auto InvalidSection = makeRelocationGraph(2, -4);
-  InvalidSection.relocations()[0].Section = InvalidSectionId;
+  const_cast<std::vector<Relocation> &>(InvalidSection.relocations())[0]
+      .Section = InvalidSectionId;
   EXPECT_FALSE(applyRelocations(InvalidSection));
 
   auto InvalidSymbol = makeRelocationGraph(2, -4);
-  InvalidSymbol.relocations()[0].Symbol = InvalidSymbolId;
+  const_cast<std::vector<Relocation> &>(InvalidSymbol.relocations())[0].Symbol =
+      InvalidSymbolId;
   EXPECT_FALSE(applyRelocations(InvalidSymbol));
 
   LinkGraph UnsupportedTarget(Target::AArch64, Endianness::Little);
@@ -1076,13 +1131,109 @@ TEST(RelocationTest, RelaxesX86_64RexGotpcrelxForDefinedSymbol) {
   auto Graph = makeRelocationGraph(42, -4);
   auto Content = Graph.sectionContent(0);
   ASSERT_TRUE(Content);
-  (*Content)[0] = 0x8B;
+  auto &RelocationValue =
+      const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
+  RelocationValue.PatchSize = 4;
+  (*Content)[0] = 0x48;
+  (*Content)[1] = 0x8B;
+  (*Content)[2] = 0x05;
+  RelocationValue.Offset = 3;
   ASSERT_TRUE(applyRelocations(Graph));
-  EXPECT_EQ(Graph.sections()[0].Content[0], 0x8DU);
-  auto Value = Internal::readSigned(Graph.sections()[0].Content, 1, 4,
+  EXPECT_EQ(Graph.sections()[0].Content[1], 0x8DU);
+  auto Value = Internal::readSigned(Graph.sections()[0].Content, 3, 4,
                                     Endianness::Little);
   ASSERT_TRUE(Value);
-  EXPECT_EQ(*Value, 0xFB);
+  EXPECT_EQ(*Value, 0xF9);
+}
+
+TEST(RelocationTest, ValidatesGotpcrelxInstructionAndAddend) {
+  struct Case {
+    uint32_t Type;
+    int64_t Addend;
+    std::array<WasmEdge::Byte, 3> Prefix;
+    uint64_t Offset;
+    bool Accepted;
+  };
+  const std::array<Case, 7> Cases{{
+      {41, -4, {0, 0x8B, 0x05}, 3, true},
+      {42, -4, {0x48, 0x8B, 0x05}, 3, true},
+      {42, 0, {0x48, 0x8B, 0x05}, 3, false},
+      {42, -4, {0x48, 0x89, 0x05}, 3, false},
+      {42, -4, {0x48, 0x8B, 0x04}, 3, false},
+      {42, -4, {0x90, 0x8B, 0x05}, 3, false},
+      {41, -4, {0x8B, 0x05, 0x90}, 2, true},
+  }};
+  for (const auto &Test : Cases) {
+    auto Graph = makeRelocationGraph(Test.Type, Test.Addend);
+    auto Content = Graph.sectionContent(0);
+    ASSERT_TRUE(Content);
+    std::copy(Test.Prefix.begin(), Test.Prefix.end(), Content->begin());
+    auto &RelocationValue =
+        const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
+    RelocationValue.Offset = Test.Offset;
+    RelocationValue.PatchSize = 4;
+    EXPECT_EQ(static_cast<bool>(applyRelocations(Graph)), Test.Accepted);
+  }
+}
+
+TEST(RelocationTest, RelaxesExactGotpcrelxIndirectCallAndJump) {
+  struct Case {
+    WasmEdge::Byte ModRM;
+    std::array<WasmEdge::Byte, 6> ExpectedPrefixAndPatch;
+  };
+  const std::array<Case, 2> Cases{{
+      {0x15, {0x67, 0xE8, 0xFA, 0x00, 0x00, 0x00}},
+      {0x25, {0xE9, 0xFB, 0x00, 0x00, 0x00, 0x90}},
+  }};
+  for (const auto &Test : Cases) {
+    auto Graph = makeRelocationGraph(41, -4);
+    auto Content = Graph.sectionContent(0);
+    ASSERT_TRUE(Content);
+    (*Content)[0] = 0xFF;
+    (*Content)[1] = Test.ModRM;
+    auto &RelocationValue =
+        const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
+    RelocationValue.Offset = 2;
+    RelocationValue.PatchSize = 4;
+    ASSERT_TRUE(applyRelocations(Graph));
+    EXPECT_TRUE(std::equal(Test.ExpectedPrefixAndPatch.begin(),
+                           Test.ExpectedPrefixAndPatch.end(),
+                           Graph.sections()[0].Content.begin()));
+  }
+}
+
+TEST(RelocationTest, RejectsGotpcrelxIndirectBranchAboveUint32) {
+  auto Graph = makeRelocationGraph(41, -4, false, UINT64_C(0x100000100),
+                                   UINT64_C(0x100000000));
+  auto Content = Graph.sectionContent(0);
+  ASSERT_TRUE(Content);
+  (*Content)[0] = 0xFF;
+  (*Content)[1] = 0x15;
+  auto &RelocationValue =
+      const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
+  RelocationValue.Offset = 2;
+  RelocationValue.PatchSize = 4;
+  EXPECT_FALSE(applyRelocations(Graph));
+}
+
+TEST(RelocationTest, RejectsMutationAndLayoutAfterRelocation) {
+  auto Graph = makeRelocationGraph(2, -4);
+  ASSERT_TRUE(applyRelocations(Graph));
+  const auto ExpectRelocated = [](const auto &Result) {
+    ASSERT_FALSE(Result);
+    EXPECT_EQ(Result.error().Message, "link graph relocations already applied");
+  };
+  ExpectRelocated(Graph.beginInput("again.o"));
+  ExpectRelocated(Graph.addSection(Section{"new", SectionKind::Data, 1, 0}));
+  ExpectRelocated(Graph.addSymbol(Symbol{"new", 0, 0, 0, false}));
+  ExpectRelocated(Graph.addRelocation(Relocation{0, 8, 2, 0, -4}));
+  ExpectRelocated(Graph.addRebase(Rebase{0, 8, 1, 0, 8}));
+  ExpectRelocated(Graph.setSectionAddress(0, 3));
+  ExpectRelocated(Graph.setSectionFileOffset(0, 3));
+  ExpectRelocated(Graph.sectionContent(0));
+  auto LayoutResult = layout(Graph);
+  ASSERT_FALSE(LayoutResult);
+  EXPECT_EQ(LayoutResult.error().Message, "cannot layout relocated link graph");
 }
 
 TEST(RelocationTest, ReadsLayoutsAndRelocatesX86_64ObjectEndToEnd) {
@@ -1126,6 +1277,8 @@ TEST(RelocationTest, AppliesGeneratedELF64PC32AndPLT32RelocationsExactly) {
                 Relocation.Type == 4);
     Seen[Relocation.Type == 1 ? 0 : Relocation.Type == 2 ? 1 : 2] = true;
     EXPECT_EQ(Relocation.Format, ObjectFormat::ELF);
+    EXPECT_EQ(Relocation.PatchSize, Relocation.Type == 1 ? 8U : 4U);
+    EXPECT_EQ(Relocation.PCRelative, Relocation.Type != 1);
     EXPECT_FALSE(Relocation.AddendIsImplicit);
     EXPECT_EQ(Relocation.Addend, Relocation.Type == 1 ? 5 : -4);
   }
@@ -1179,6 +1332,8 @@ TEST(RelocationTest, ReadsLayoutsAndRelocatesCurrentMachOAndCOFFForms) {
     ASSERT_EQ(Graph->relocations().size(), 1U);
     EXPECT_EQ(Graph->relocations()[0].Format, Test.Format);
     EXPECT_EQ(Graph->relocations()[0].Type, Test.Type);
+    EXPECT_EQ(Graph->relocations()[0].PatchSize, 4U);
+    EXPECT_TRUE(Graph->relocations()[0].PCRelative);
     ASSERT_TRUE(layout(*Graph, 0x1000));
     const auto &Relocation = Graph->relocations()[0];
     const auto &Symbol = Graph->symbols()[Relocation.Symbol];
@@ -1266,6 +1421,8 @@ TEST(ObjectReaderTest, NormalizesX86_64ELFRelaObject) {
   EXPECT_EQ(Relocation.Offset, 3U);
   EXPECT_EQ(Relocation.Type, 42U);
   EXPECT_EQ(Relocation.Format, ObjectFormat::ELF);
+  EXPECT_EQ(Relocation.PatchSize, 4U);
+  EXPECT_TRUE(Relocation.PCRelative);
   EXPECT_EQ(Result->symbols()[Relocation.Symbol].Name, "value");
   EXPECT_EQ(Relocation.Addend, -4);
   EXPECT_FALSE(Relocation.AddendIsImplicit);
@@ -1308,6 +1465,50 @@ TEST(ObjectReaderTest, ExportsMachOExternalDefinedSymbols) {
                    [](const Symbol &Value) { return Value.Name == "_f0"; });
   ASSERT_NE(F0, Result->symbols().end());
   EXPECT_TRUE(F0->Exported);
+  ASSERT_EQ(Result->relocations().size(), 1U);
+  EXPECT_TRUE(Result->relocations()[0].PCRelative);
+  EXPECT_EQ(Result->relocations()[0].PatchSize, 4U);
+  EXPECT_TRUE(Result->relocations()[0].External);
+  EXPECT_FALSE(Result->relocations()[0].Scattered);
+}
+
+TEST(ObjectReaderTest, RejectsMalformedX86_64MachOSignedMetadata) {
+  auto Bytes = makeObject(llvm::Triple("x86_64-apple-macosx"));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "test.o"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+  ASSERT_NE(MachO, nullptr);
+  size_t RelocationOffset = 0;
+  for (const auto &Section : MachO->sections()) {
+    if (Section.relocation_begin() != Section.relocation_end()) {
+      const auto Ref = Section.relocation_begin()->getRawDataRefImpl();
+      llvm::object::DataRefImpl SectionRef;
+      SectionRef.d.a = Ref.d.a;
+      RelocationOffset = MachO->getSection64(SectionRef).reloff + Ref.d.b * 8;
+      break;
+    }
+  }
+  ASSERT_NE(RelocationOffset, 0U);
+  for (const uint32_t Mask : {UINT32_C(1) << 24, UINT32_C(1) << 25}) {
+    auto Malformed = Bytes;
+    uint32_t Word = 0;
+    std::memcpy(&Word, Malformed.data() + RelocationOffset + 4, sizeof(Word));
+    Word ^= Mask;
+    std::memcpy(Malformed.data() + RelocationOffset + 4, &Word, sizeof(Word));
+    EXPECT_FALSE(ObjectReader::read(Malformed, Target::X86_64));
+  }
+  auto Scattered = Bytes;
+  uint32_t AddressWord = 0;
+  std::memcpy(&AddressWord, Scattered.data() + RelocationOffset,
+              sizeof(AddressWord));
+  AddressWord |= UINT32_C(1) << 31;
+  std::memcpy(Scattered.data() + RelocationOffset, &AddressWord,
+              sizeof(AddressWord));
+  EXPECT_FALSE(ObjectReader::read(Scattered, Target::X86_64));
 }
 
 TEST(ObjectReaderTest, DoesNotExportHiddenMachOSymbols) {

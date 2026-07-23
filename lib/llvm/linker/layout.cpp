@@ -66,6 +66,9 @@ LinkExpect<void> overflow(const Section &SectionValue, SectionId Id,
 } // namespace
 
 LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
+  if (Graph.relocationsApplied()) {
+    return fail<void>(Diagnostic{"cannot layout relocated link graph"});
+  }
   if (auto Result = Graph.validate(); !Result) {
     return Result;
   }

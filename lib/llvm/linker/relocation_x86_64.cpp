@@ -5,6 +5,7 @@
 
 #include "common/spdlog.h"
 
+#include <algorithm>
 #include <limits>
 #include <string_view>
 
@@ -162,6 +163,20 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
                          Graph.endianness(), Value)) {
         return fail(RelocationValue, "absolute relocation overflows");
       }
+      const auto Overlap = std::find_if(
+          Result.Rebases.begin(), Result.Rebases.end(), [&](const auto &Old) {
+            if (Old.Section != RelocationValue.Section) {
+              return false;
+            }
+            const uint64_t OldWidth = std::max<uint8_t>(Old.Width, 1);
+            if (RelocationValue.Offset <= Old.Offset) {
+              return Width > Old.Offset - RelocationValue.Offset;
+            }
+            return OldWidth > RelocationValue.Offset - Old.Offset;
+          });
+      if (Overlap != Result.Rebases.end()) {
+        return fail(RelocationValue, "overlapping generated rebase");
+      }
       Result.Rebases.push_back(Rebase{RelocationValue.Section,
                                       RelocationValue.Offset,
                                       RelocationValue.Type, Addend, Width});
@@ -169,18 +184,36 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
       continue;
     }
     if (Relax) {
-      size_t Opcode = Bytes.size();
-      if (RelocationValue.Offset >= 2 &&
-          Bytes[RelocationValue.Offset - 2] == 0x8B) {
-        Opcode = static_cast<size_t>(RelocationValue.Offset - 2);
-      } else if (RelocationValue.Offset >= 1 &&
-                 Bytes[RelocationValue.Offset - 1] == 0x8B) {
-        Opcode = static_cast<size_t>(RelocationValue.Offset - 1);
-      }
-      if (Opcode == Bytes.size()) {
+      if (RelocationValue.AddendIsImplicit || Addend != -4 ||
+          RelocationValue.Offset < 2) {
         return fail(RelocationValue, "unsupported GOTPCRELX instruction");
       }
-      Bytes[Opcode] = 0x8D;
+      const size_t Opcode = static_cast<size_t>(RelocationValue.Offset - 2);
+      const uint8_t Op = Bytes[Opcode];
+      const uint8_t ModRM = Bytes[Opcode + 1];
+      const bool HasRex = RelocationValue.Offset >= 3 &&
+                          (Bytes[RelocationValue.Offset - 3] & 0xF0) == 0x40;
+      if (RelocationValue.Type == R_X86_64_REX_GOTPCRELX && !HasRex) {
+        return fail(RelocationValue, "unsupported GOTPCRELX instruction");
+      }
+      if (Op == 0x8B && (ModRM & 0xC7) == 0x05) {
+        Bytes[Opcode] = 0x8D;
+      } else if (Op == 0xFF && ModRM == 0x15 && S <= UINT32_MAX) {
+        Bytes[Opcode] = 0x67;
+        Bytes[Opcode + 1] = 0xE8;
+      } else if (Op == 0xFF && ModRM == 0x25 && S <= UINT32_MAX) {
+        int64_t Value = 0;
+        if (!delta32(S, Addend + 1, P, Value) ||
+            !writeSigned(Bytes, RelocationValue.Offset - 1, Width,
+                         Graph.endianness(), Value)) {
+          return fail(RelocationValue, "PC-relative relocation overflows");
+        }
+        Bytes[Opcode] = 0xE9;
+        Bytes[RelocationValue.Offset + 3] = 0x90;
+        continue;
+      } else {
+        return fail(RelocationValue, "unsupported GOTPCRELX instruction");
+      }
     }
     int64_t Value = 0;
     if (!delta32(S, Addend, P, Value) ||

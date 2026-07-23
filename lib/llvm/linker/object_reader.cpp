@@ -348,6 +348,58 @@ ObjectFormat objectFormat(const llvm::object::ObjectFile &Object) noexcept {
   return ObjectFormat::ELF;
 }
 
+struct RelocationMetadata {
+  uint8_t PatchSize = 1;
+  bool PCRelative = false;
+  bool External = false;
+  bool Scattered = false;
+};
+
+std::optional<RelocationMetadata>
+relocationMetadata(const llvm::object::ObjectFile &Object,
+                   const llvm::object::RelocationRef &Relocation,
+                   Target TargetValue) noexcept {
+  RelocationMetadata Metadata;
+  const uint32_t Type = static_cast<uint32_t>(Relocation.getType());
+  if (const auto *MachO =
+          llvm::dyn_cast<llvm::object::MachOObjectFile>(&Object)) {
+    const auto Raw = MachO->getRelocation(Relocation.getRawDataRefImpl());
+    Metadata.Scattered = MachO->isRelocationScattered(Raw);
+    Metadata.PCRelative = MachO->getAnyRelocationPCRel(Raw) != 0;
+    const unsigned Length = MachO->getAnyRelocationLength(Raw);
+    if (Length > 3) {
+      return std::nullopt;
+    }
+    Metadata.PatchSize = static_cast<uint8_t>(1U << Length);
+    Metadata.External =
+        !Metadata.Scattered && MachO->getPlainRelocationExternal(Raw);
+    if (TargetValue == Target::X86_64 && Metadata.Scattered) {
+      return std::nullopt;
+    }
+    if (TargetValue == Target::X86_64 && Type == 1 &&
+        (!Metadata.PCRelative || Metadata.PatchSize != 4)) {
+      return std::nullopt;
+    }
+    return Metadata;
+  }
+  if (TargetValue == Target::X86_64 && Object.isELF()) {
+    if (Type == llvm::ELF::R_X86_64_64) {
+      Metadata.PatchSize = 8;
+    } else if (Type == llvm::ELF::R_X86_64_PC32 ||
+               Type == llvm::ELF::R_X86_64_PLT32 ||
+               Type == llvm::ELF::R_X86_64_GOTPCRELX ||
+               Type == llvm::ELF::R_X86_64_REX_GOTPCRELX) {
+      Metadata.PatchSize = 4;
+      Metadata.PCRelative = true;
+    }
+  } else if (TargetValue == Target::X86_64 && Object.isCOFF() && Type >= 4 &&
+             Type <= 9) {
+    Metadata.PatchSize = 4;
+    Metadata.PCRelative = true;
+  }
+  return Metadata;
+}
+
 } // namespace
 
 namespace Internal {
@@ -568,10 +620,16 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
         return fail<LinkGraph>("relocation targets an unsupported symbol");
       }
       const auto [Addend, Implicit] = relocationAddend(Object, InputRelocation);
-      auto Added = Graph.addRelocation(
-          Relocation{Section->second, InputRelocation.getOffset(),
-                     static_cast<uint32_t>(InputRelocation.getType()),
-                     Symbol->second, Addend, Implicit, objectFormat(Object)});
+      const auto Metadata =
+          relocationMetadata(Object, InputRelocation, *ActualTarget);
+      if (!Metadata) {
+        return fail<LinkGraph>("malformed relocation metadata");
+      }
+      auto Added = Graph.addRelocation(Relocation{
+          Section->second, InputRelocation.getOffset(),
+          static_cast<uint32_t>(InputRelocation.getType()), Symbol->second,
+          Addend, Implicit, objectFormat(Object), Metadata->PatchSize,
+          Metadata->PCRelative, Metadata->External, Metadata->Scattered});
       if (!Added) {
         return fail<LinkGraph>(Added.error().Message);
       }

@@ -56,6 +56,10 @@ struct Relocation {
   int64_t Addend;
   bool AddendIsImplicit = false;
   ObjectFormat Format = ObjectFormat::ELF;
+  uint8_t PatchSize = 1;
+  bool PCRelative = false;
+  bool External = false;
+  bool Scattered = false;
 };
 
 struct Rebase {
@@ -103,9 +107,7 @@ public:
   const std::vector<Relocation> &relocations() const noexcept {
     return Relocations;
   }
-  std::vector<Relocation> &relocations() noexcept { return Relocations; }
   const std::vector<Rebase> &rebases() const noexcept { return Rebases; }
-  std::vector<Rebase> &rebases() noexcept { return Rebases; }
   bool relocationsApplied() const noexcept { return RelocationsApplied; }
 
 private:
