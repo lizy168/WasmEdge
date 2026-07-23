@@ -31,6 +31,10 @@ set(WASMEDGE_LLVM_SOURCES
   linker/link_graph.cpp
   linker/object_reader.cpp
   linker/relocation.cpp
+  linker/relocation_aarch64.cpp
+  linker/relocation_arm.cpp
+  linker/relocation_riscv.cpp
+  linker/relocation_s390x.cpp
   linker/relocation_x86_64.cpp
   llvm.cpp
 )

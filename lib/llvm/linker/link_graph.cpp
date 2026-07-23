@@ -64,6 +64,72 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
     }
     return std::nullopt;
   }
+  if (Format != ObjectFormat::ELF) {
+    return std::nullopt;
+  }
+  if (TargetValue == Target::ARM) {
+    switch (Type) {
+    case 0:
+      return 0;
+    case 2:
+    case 3:
+    case 28:
+    case 29:
+    case 42:
+      return 4;
+    default:
+      return std::nullopt;
+    }
+  }
+  if (TargetValue == Target::AArch64) {
+    switch (Type) {
+    case 0x101:
+      return 8;
+    case 0x105:
+    case 0x113:
+    case 0x115:
+    case 0x116:
+    case 0x11A:
+    case 0x11B:
+    case 0x11C:
+    case 0x11D:
+    case 0x11E:
+    case 0x12B:
+      return 4;
+    default:
+      return std::nullopt;
+    }
+  }
+  if (TargetValue == Target::RISCV64) {
+    switch (Type) {
+    case 2:
+      return 8;
+    case 18:
+    case 19:
+      return 8;
+    case 23:
+    case 24:
+    case 25:
+    case 57:
+      return 4;
+    case 51:
+      return 0;
+    default:
+      return std::nullopt;
+    }
+  }
+  if (TargetValue == Target::S390X) {
+    switch (Type) {
+    case 22:
+      return 8;
+    case 5:
+    case 19:
+    case 20:
+      return 4;
+    default:
+      return std::nullopt;
+    }
+  }
   if (MetadataSize == 1 || MetadataSize == 2 || MetadataSize == 4 ||
       MetadataSize == 8) {
     return MetadataSize;
@@ -196,7 +262,8 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
     Diag.Offset = Value.Offset;
     return fail<void>(std::move(Diag));
   }
-  if (std::any_of(Relocations.begin(), Relocations.end(), [&](const auto &Old) {
+  if (Value.PatchSize != 0 &&
+      std::any_of(Relocations.begin(), Relocations.end(), [&](const auto &Old) {
         return overlaps(Value, Old, [](const auto &RelocationValue) {
           return RelocationValue.PatchSize;
         });
@@ -327,7 +394,8 @@ LinkExpect<void> LinkGraph::validate() const {
   }
   for (size_t I = 0; I < Relocations.size(); ++I) {
     for (size_t J = I + 1; J < Relocations.size(); ++J) {
-      if (overlaps(Relocations[I], Relocations[J],
+      if (Relocations[I].PatchSize != 0 && Relocations[J].PatchSize != 0 &&
+          overlaps(Relocations[I], Relocations[J],
                    [](const auto &Value) { return Value.PatchSize; })) {
         return fail<void>(Diagnostic{"overlapping relocation patches"});
       }

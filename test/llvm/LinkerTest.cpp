@@ -49,7 +49,8 @@ using namespace WasmEdge::LLVM::Linker;
 std::vector<WasmEdge::Byte>
 makeObject(const llvm::Triple &Triple, bool Undefined = false,
            bool DLLExport = false, std::string FunctionName = "f0",
-           std::string Directives = {}, bool Hidden = false) {
+           std::string Directives = {}, bool Hidden = false,
+           bool HiddenData = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -91,6 +92,9 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
   auto *Value = new llvm::GlobalVariable(
       Module, I32, false, llvm::GlobalValue::ExternalLinkage,
       Undefined ? nullptr : llvm::ConstantInt::get(I32, 7), "value");
+  if (HiddenData) {
+    Value->setVisibility(llvm::GlobalValue::HiddenVisibility);
+  }
   auto *Zero = new llvm::GlobalVariable(Module, I32, false,
                                         llvm::GlobalValue::InternalLinkage,
                                         llvm::ConstantInt::get(I32, 0), "zero");
@@ -1222,10 +1226,6 @@ TEST(RelocationTest, RejectsInvalidGraphUnsupportedTargetTypeAndFormat) {
       InvalidSymbolId;
   EXPECT_FALSE(applyRelocations(InvalidSymbol));
 
-  LinkGraph UnsupportedTarget(Target::AArch64, Endianness::Little);
-  ASSERT_TRUE(UnsupportedTarget.beginInput("input.o"));
-  EXPECT_FALSE(applyRelocations(UnsupportedTarget));
-
   auto UnsupportedType = makeRelocationGraph(2, 0);
   auto &UnsupportedTypeValue =
       const_cast<std::vector<Relocation> &>(UnsupportedType.relocations())[0];
@@ -1392,6 +1392,380 @@ TEST(RelocationTest, ReadsLayoutsAndRelocatesX86_64ObjectEndToEnd) {
             static_cast<int64_t>(Graph->sections()[Symbol.Section].Address +
                                  Symbol.Offset) -
                 static_cast<int64_t>(Text->Address + Relocation.Offset) - 4);
+}
+
+LinkGraph makeELFRelocationGraph(
+    Target Architecture, Endianness Endian, uint32_t Type, uint8_t Width,
+    uint64_t TargetAddress, uint64_t PatchAddress = 0x1000, uint64_t Offset = 0,
+    int64_t Addend = 0, bool Implicit = false,
+    std::vector<WasmEdge::Byte> Bytes = std::vector<WasmEdge::Byte>(16)) {
+  LinkGraph Graph(Architecture, Endian);
+  EXPECT_TRUE(Graph.beginInput("input.o"));
+  auto Patch =
+      Graph.addSection(Section{".text", SectionKind::Text, 4, Bytes.size(),
+                               PatchAddress, 0, std::move(Bytes)});
+  auto TargetSection = Graph.addSection(
+      Section{".data", SectionKind::Data, 1, 1, TargetAddress, 0, {0}});
+  EXPECT_TRUE(Patch && TargetSection);
+  auto TargetSymbol =
+      Graph.addSymbol(Symbol{"target", *TargetSection, 0, 1, false});
+  EXPECT_TRUE(TargetSymbol);
+  EXPECT_TRUE(Graph.addRelocation(Relocation{*Patch, Offset, Type,
+                                             *TargetSymbol, Addend, Implicit,
+                                             ObjectFormat::ELF, Width}));
+  return Graph;
+}
+
+TEST(ARMRelocationTest, AppliesDataRelocationsAndPreservesPrel31TopBit) {
+  auto Absolute = makeELFRelocationGraph(Target::ARM, Endianness::Little, 2, 4,
+                                         0x2000, 0x1000, 0, 0, true);
+  ASSERT_TRUE(Internal::writeSigned(*Absolute.sectionContent(0), 0, 4,
+                                    Endianness::Little, -4));
+  ASSERT_TRUE(applyRelocations(Absolute));
+  EXPECT_EQ(*Internal::readUnsigned(Absolute.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            0x1FFCU);
+  ASSERT_EQ(Absolute.rebases().size(), 1U);
+  EXPECT_EQ(Absolute.rebases()[0].Width, 4U);
+
+  auto Relative = makeELFRelocationGraph(Target::ARM, Endianness::Little, 3, 4,
+                                         0x0F00, 0x1000, 0, 4);
+  ASSERT_TRUE(applyRelocations(Relative));
+  EXPECT_EQ(*Internal::readSigned(Relative.sections()[0].Content, 0, 4,
+                                  Endianness::Little),
+            -0xFC);
+
+  std::vector<WasmEdge::Byte> PrelBytes(16);
+  ASSERT_TRUE(Internal::writeUnsigned(PrelBytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0x80000004)));
+  auto Prel =
+      makeELFRelocationGraph(Target::ARM, Endianness::Little, 42, 4, 0x1100,
+                             0x1000, 0, 0, true, std::move(PrelBytes));
+  ASSERT_TRUE(applyRelocations(Prel));
+  EXPECT_EQ(*Internal::readUnsigned(Prel.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            UINT32_C(0x80000104));
+}
+
+TEST(ARMRelocationTest, EncodesArmCallAndChecksRangeAlignmentAndEndianness) {
+  for (const auto &[Delta, Accepted] :
+       std::array<std::pair<int64_t, bool>, 6>{{{4, true},
+                                                {-4, true},
+                                                {33554428, true},
+                                                {-33554432, true},
+                                                {2, false},
+                                                {33554432, false}}}) {
+    const uint64_t Patch = UINT64_C(0x4000000);
+    const uint64_t Target = Delta < 0 ? Patch - static_cast<uint64_t>(-Delta)
+                                      : Patch + static_cast<uint64_t>(Delta);
+    std::vector<WasmEdge::Byte> Bytes(16);
+    ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                        UINT32_C(0xEB000000)));
+    auto Graph =
+        makeELFRelocationGraph(Target::ARM, Endianness::Little, 28, 4, Target,
+                               Patch, 0, 0, false, std::move(Bytes));
+    const auto Snapshot = Graph;
+    auto Result = applyRelocations(Graph);
+    EXPECT_EQ(static_cast<bool>(Result), Accepted);
+    if (!Accepted) {
+      expectGraphStateEquals(Graph, Snapshot);
+    }
+  }
+
+  auto Big = makeELFRelocationGraph(Target::ARM, Endianness::Big, 3, 4, 0x1100);
+  const auto Snapshot = Big;
+  EXPECT_FALSE(applyRelocations(Big));
+  expectGraphStateEquals(Big, Snapshot);
+}
+
+TEST(ARMRelocationTest, DecodesImplicitBranchAddendFromImm24) {
+  std::vector<WasmEdge::Byte> Bytes(16);
+  ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0xEBFFFFFE)));
+  auto Graph =
+      makeELFRelocationGraph(Target::ARM, Endianness::Little, 28, 4, 0x1004,
+                             0x1000, 0, 0, true, std::move(Bytes));
+  ASSERT_TRUE(applyRelocations(Graph));
+  EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            UINT32_C(0xEBFFFFFF));
+}
+
+TEST(ARMRelocationTest,
+     AcceptsNoneOnlyAtZeroWidthAndRejectsUnsupportedAtomically) {
+  auto None =
+      makeELFRelocationGraph(Target::ARM, Endianness::Little, 0, 0, 0x1000);
+  ASSERT_TRUE(applyRelocations(None));
+
+  auto Unsupported =
+      makeELFRelocationGraph(Target::ARM, Endianness::Little, 2, 4, 0x1100);
+  const_cast<std::vector<Relocation> &>(Unsupported.relocations())[0].Type = 99;
+  const auto Snapshot = Unsupported;
+  EXPECT_FALSE(applyRelocations(Unsupported));
+  expectGraphStateEquals(Unsupported, Snapshot);
+}
+
+TEST(AArch64RelocationTest, AppliesAbsolutePrelAndCallRelocations) {
+  auto Absolute = makeELFRelocationGraph(Target::AArch64, Endianness::Little,
+                                         0x101, 8, 0x2000, 0x1000, 0, -8);
+  ASSERT_TRUE(applyRelocations(Absolute));
+  EXPECT_EQ(*Internal::readUnsigned(Absolute.sections()[0].Content, 0, 8,
+                                    Endianness::Little),
+            0x1FF8U);
+  ASSERT_EQ(Absolute.rebases().size(), 1U);
+
+  auto Prel = makeELFRelocationGraph(Target::AArch64, Endianness::Little, 0x105,
+                                     4, 0x0F00, 0x1000, 0, 4);
+  ASSERT_TRUE(applyRelocations(Prel));
+  EXPECT_EQ(*Internal::readSigned(Prel.sections()[0].Content, 0, 4,
+                                  Endianness::Little),
+            -0xFC);
+
+  for (const auto &[Delta, Accepted] :
+       std::array<std::pair<int64_t, bool>, 6>{{{4, true},
+                                                {-4, true},
+                                                {134217724, true},
+                                                {-134217728, true},
+                                                {2, false},
+                                                {134217728, false}}}) {
+    const uint64_t Patch = UINT64_C(0x20000000);
+    const uint64_t Target = Delta < 0 ? Patch - static_cast<uint64_t>(-Delta)
+                                      : Patch + static_cast<uint64_t>(Delta);
+    std::vector<WasmEdge::Byte> Bytes(16);
+    ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                        UINT32_C(0x94000000)));
+    auto Graph =
+        makeELFRelocationGraph(Target::AArch64, Endianness::Little, 0x11B, 4,
+                               Target, Patch, 0, 0, false, std::move(Bytes));
+    EXPECT_EQ(static_cast<bool>(applyRelocations(Graph)), Accepted);
+  }
+}
+
+TEST(AArch64RelocationTest, EncodesPageAndScaledLow12Relocations) {
+  std::vector<WasmEdge::Byte> AdrBytes(16);
+  ASSERT_TRUE(Internal::writeUnsigned(AdrBytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0x90000000)));
+  auto Adr = makeELFRelocationGraph(Target::AArch64, Endianness::Little, 0x113,
+                                    4, 0x201000, 0x1FFFFC, 0, 0, false,
+                                    std::move(AdrBytes));
+  ASSERT_TRUE(applyRelocations(Adr));
+  EXPECT_EQ(*Internal::readUnsigned(Adr.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            UINT32_C(0xD0000000));
+
+  struct Case {
+    uint32_t Type;
+    uint32_t Instruction;
+    uint64_t Address;
+    uint32_t Expected;
+    bool Accepted;
+  };
+  const std::array<Case, 7> Cases{{
+      {0x115, 0x91000000, 0x1ABC, 0x912AF000, true},
+      {0x116, 0x39000000, 0x1ABC, 0x392AF000, true},
+      {0x11C, 0x79000000, 0x1ABC, 0x79157800, true},
+      {0x11D, 0xB9000000, 0x1ABC, 0xB90ABC00, true},
+      {0x11E, 0xF9000000, 0x1AB8, 0xF9055C00, true},
+      {0x12B, 0x3D800000, 0x1AB0, 0x3D82AC00, true},
+      {0x11E, 0xF9000000, 0x1ABC, 0, false},
+  }};
+  for (const auto &Test : Cases) {
+    std::vector<WasmEdge::Byte> Bytes(16);
+    ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                        Test.Instruction));
+    auto Graph = makeELFRelocationGraph(Target::AArch64, Endianness::Little,
+                                        Test.Type, 4, Test.Address, 0x1000, 0,
+                                        0, false, std::move(Bytes));
+    auto Result = applyRelocations(Graph);
+    EXPECT_EQ(static_cast<bool>(Result), Test.Accepted);
+    if (Test.Accepted) {
+      EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 4,
+                                        Endianness::Little),
+                Test.Expected);
+    }
+  }
+}
+
+TEST(RISCVRelocationTest, AppliesAbsoluteCallAndUnwindRelocations) {
+  auto Absolute = makeELFRelocationGraph(Target::RISCV64, Endianness::Little, 2,
+                                         8, 0x2000, 0x1000, 0, -8);
+  ASSERT_TRUE(applyRelocations(Absolute));
+  EXPECT_EQ(*Internal::readUnsigned(Absolute.sections()[0].Content, 0, 8,
+                                    Endianness::Little),
+            0x1FF8U);
+  ASSERT_EQ(Absolute.rebases().size(), 1U);
+
+  std::vector<WasmEdge::Byte> CallBytes(16);
+  ASSERT_TRUE(Internal::writeUnsigned(CallBytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0x00000097)));
+  ASSERT_TRUE(Internal::writeUnsigned(CallBytes, 4, 4, Endianness::Little,
+                                      UINT32_C(0x000080E7)));
+  auto Call = makeELFRelocationGraph(Target::RISCV64, Endianness::Little, 18, 8,
+                                     0x11234, 0x10000, 0, 0, false,
+                                     std::move(CallBytes));
+  ASSERT_TRUE(applyRelocations(Call));
+  EXPECT_EQ(*Internal::readUnsigned(Call.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            UINT32_C(0x00001097));
+  EXPECT_EQ(*Internal::readUnsigned(Call.sections()[0].Content, 4, 4,
+                                    Endianness::Little),
+            UINT32_C(0x234080E7));
+
+  auto Unwind = makeELFRelocationGraph(Target::RISCV64, Endianness::Little, 57,
+                                       4, 0x0F00, 0x1000, 0, 4);
+  ASSERT_TRUE(applyRelocations(Unwind));
+  EXPECT_EQ(*Internal::readSigned(Unwind.sections()[0].Content, 0, 4,
+                                  Endianness::Little),
+            -0xFC);
+}
+
+TEST(RISCVRelocationTest, PairsPcrelLowWithMarkedHighSiteAndAllowsRelax) {
+  LinkGraph Graph(Target::RISCV64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  std::vector<WasmEdge::Byte> Bytes(12);
+  ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0x00000297)));
+  ASSERT_TRUE(Internal::writeUnsigned(Bytes, 4, 4, Endianness::Little,
+                                      UINT32_C(0x00028293)));
+  auto Text = Graph.addSection(
+      Section{".text", SectionKind::Text, 4, 12, 0x1000, 0, std::move(Bytes)});
+  auto Data = Graph.addSection(
+      Section{".data", SectionKind::Data, 1, 1, 0x2234, 0, {0}});
+  ASSERT_TRUE(Text && Data);
+  auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Data, 0, 1, false});
+  auto HighSite = Graph.addSymbol(Symbol{"high", *Text, 0, 0, false});
+  ASSERT_TRUE(TargetSymbol && HighSite);
+  ASSERT_TRUE(Graph.addRelocation(
+      Relocation{*Text, 0, 23, *TargetSymbol, 0, false, ObjectFormat::ELF, 4}));
+  ASSERT_TRUE(Graph.addRelocation(
+      Relocation{*Text, 4, 24, *HighSite, 0, false, ObjectFormat::ELF, 4}));
+  ASSERT_TRUE(Graph.addRelocation(
+      Relocation{*Text, 0, 51, *TargetSymbol, 0, false, ObjectFormat::ELF, 0}));
+  ASSERT_TRUE(applyRelocations(Graph));
+  EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            UINT32_C(0x00001297));
+  EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 4, 4,
+                                    Endianness::Little),
+            UINT32_C(0x23428293));
+}
+
+TEST(RISCVRelocationTest, RejectsMissingLowPairAndInvalidOpcodes) {
+  std::vector<WasmEdge::Byte> Bytes(16);
+  ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0x00000293)));
+  auto Missing =
+      makeELFRelocationGraph(Target::RISCV64, Endianness::Little, 24, 4, 0x1000,
+                             0x1000, 0, 0, false, std::move(Bytes));
+  EXPECT_FALSE(applyRelocations(Missing));
+
+  auto BadCall = makeELFRelocationGraph(Target::RISCV64, Endianness::Little, 18,
+                                        8, 0x1100, 0x1000);
+  EXPECT_FALSE(applyRelocations(BadCall));
+}
+
+TEST(S390XRelocationTest, AppliesBigEndianAbsoluteAndPcRelativeRelocations) {
+  auto Absolute = makeELFRelocationGraph(Target::S390X, Endianness::Big, 22, 8,
+                                         0x2000, 0x1000, 0, -8);
+  ASSERT_TRUE(applyRelocations(Absolute));
+  EXPECT_EQ(*Internal::readUnsigned(Absolute.sections()[0].Content, 0, 8,
+                                    Endianness::Big),
+            0x1FF8U);
+  ASSERT_EQ(Absolute.rebases().size(), 1U);
+
+  auto PC32 = makeELFRelocationGraph(Target::S390X, Endianness::Big, 5, 4,
+                                     0x0F00, 0x1000, 0, 4);
+  ASSERT_TRUE(applyRelocations(PC32));
+  EXPECT_EQ(
+      *Internal::readSigned(PC32.sections()[0].Content, 0, 4, Endianness::Big),
+      -0xFC);
+}
+
+TEST(RelocationTest, RejectsGeneratedRebaseOverlapForEveryAbsoluteWriter) {
+  struct Case {
+    Target Architecture;
+    Endianness Endian;
+    uint32_t Type;
+    uint8_t Width;
+  };
+  const std::array<Case, 4> Cases{{
+      {Target::ARM, Endianness::Little, 2, 4},
+      {Target::AArch64, Endianness::Little, 0x101, 8},
+      {Target::RISCV64, Endianness::Little, 2, 8},
+      {Target::S390X, Endianness::Big, 22, 8},
+  }};
+  for (const auto &Test : Cases) {
+    auto Graph = makeELFRelocationGraph(Test.Architecture, Test.Endian,
+                                        Test.Type, Test.Width, 0x2000);
+    ASSERT_TRUE(Graph.addRebase(Rebase{0, 0, Test.Type, 0, Test.Width}));
+    const auto Snapshot = Graph;
+    EXPECT_FALSE(applyRelocations(Graph));
+    expectGraphStateEquals(Graph, Snapshot);
+  }
+}
+
+TEST(S390XRelocationTest, ChecksDoubledDisplacementRangeAndAlignment) {
+  struct Case {
+    int64_t Delta;
+    bool Accepted;
+  };
+  const std::array<Case, 6> Cases{{
+      {-INT64_C(4294967296), true},
+      {INT64_C(4294967294), true},
+      {-INT64_C(4294967298), false},
+      {INT64_C(4294967296), false},
+      {2, true},
+      {1, false},
+  }};
+  constexpr uint64_t Patch = UINT64_C(0x200000000);
+  for (const uint32_t Type : {19U, 20U}) {
+    for (const auto &Test : Cases) {
+      const uint64_t Target = Test.Delta < 0
+                                  ? Patch - static_cast<uint64_t>(-Test.Delta)
+                                  : Patch + static_cast<uint64_t>(Test.Delta);
+      auto Graph = makeELFRelocationGraph(Target::S390X, Endianness::Big, Type,
+                                          4, Target, Patch);
+      EXPECT_EQ(static_cast<bool>(applyRelocations(Graph)), Test.Accepted);
+    }
+  }
+
+  auto Little =
+      makeELFRelocationGraph(Target::S390X, Endianness::Little, 5, 4, 0x1100);
+  EXPECT_FALSE(applyRelocations(Little));
+}
+
+TEST(RelocationTest, ReadsAndRelocatesGeneratedLinuxObjectsForEveryTarget) {
+  struct Case {
+    const char *Triple;
+    Target Architecture;
+  };
+  const std::array<Case, 4> Cases{{
+      {"armv7-unknown-linux-gnueabihf", Target::ARM},
+      {"aarch64-unknown-linux-gnu", Target::AArch64},
+      {"riscv64-unknown-linux-gnu", Target::RISCV64},
+      {"s390x-unknown-linux-gnu", Target::S390X},
+  }};
+  for (const auto &Test : Cases) {
+    const auto ObjectBytes = makeObject(llvm::Triple(Test.Triple), false, false,
+                                        "f0", {}, true, true);
+    auto Object =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(ObjectBytes.data()),
+                            ObjectBytes.size()),
+            "inventory.o"));
+    ASSERT_TRUE(static_cast<bool>(Object));
+    for (const auto &Section : (*Object)->sections()) {
+      for (const auto &Relocation : Section.relocations()) {
+        EXPECT_TRUE(relocationPatchSize(ObjectFormat::ELF, Test.Architecture,
+                                        Relocation.getType(), 1))
+            << Test.Triple << " relocation " << Relocation.getType();
+      }
+    }
+    auto Graph = ObjectReader::read(ObjectBytes, Test.Architecture);
+    ASSERT_TRUE(Graph) << Test.Triple;
+    ASSERT_TRUE(layout(*Graph, 0x1000)) << Test.Triple;
+    EXPECT_TRUE(applyRelocations(*Graph)) << Test.Triple;
+  }
 }
 
 TEST(RelocationTest, AppliesGeneratedELF64PC32AndPLT32RelocationsExactly) {
@@ -1712,7 +2086,9 @@ TEST(ObjectReaderTest, RejectsTruncatedELFCrelRelocation) {
 
 TEST(ObjectReaderTest, MarksELFRelAddendsImplicit) {
   auto Result = ObjectReader::read(
-      makeObject(llvm::Triple("armv7-unknown-linux-gnueabihf")), Target::ARM);
+      makeObject(llvm::Triple("armv7-unknown-linux-gnueabihf"), false, false,
+                 "f0", {}, false, true),
+      Target::ARM);
   ASSERT_TRUE(Result);
   ASSERT_FALSE(Result->relocations().empty());
   EXPECT_TRUE(Result->relocations()[0].AddendIsImplicit);

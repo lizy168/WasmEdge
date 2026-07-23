@@ -5,6 +5,7 @@
 
 #include "common/spdlog.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <string_view>
@@ -30,6 +31,20 @@ template <typename T> Expect<T> fieldError() noexcept {
 } // namespace
 
 namespace Internal {
+
+bool hasRebaseOverlap(Span<const Rebase> Rebases, SectionId Section,
+                      uint64_t Offset, uint8_t Width) noexcept {
+  return std::any_of(Rebases.begin(), Rebases.end(), [&](const auto &Old) {
+    if (Old.Section != Section) {
+      return false;
+    }
+    const uint64_t OldWidth = std::max<uint8_t>(Old.Width, 1);
+    if (Offset <= Old.Offset) {
+      return Width > Old.Offset - Offset;
+    }
+    return OldWidth > Offset - Old.Offset;
+  });
+}
 
 Expect<uint64_t> readUnsigned(Span<const Byte> Bytes, uint64_t Offset,
                               uint8_t Width, Endianness Endian) noexcept {
@@ -112,16 +127,36 @@ Expect<void> applyRelocations(LinkGraph &Graph) noexcept {
     spdlog::error("native linker: invalid graph: {}"sv, Valid.error().Message);
     return Unexpect(ErrCode::Value::IllegalPath);
   }
-  if (Graph.target() != Target::X86_64) {
-    spdlog::error("native linker: unsupported target {}"sv,
-                  static_cast<uint32_t>(Graph.target()));
-    return Unexpect(ErrCode::Value::AOTNotImpl);
-  }
-  if (Graph.endianness() != Endianness::Little) {
-    spdlog::error("native linker: x86_64 requires little-endian input"sv);
+  const bool CorrectEndian = Graph.target() == Target::S390X
+                                 ? Graph.endianness() == Endianness::Big
+                                 : Graph.endianness() == Endianness::Little;
+  if (!CorrectEndian) {
+    spdlog::error("native linker: target input has wrong endianness"sv);
     return Unexpect(ErrCode::Value::IllegalPath);
   }
-  auto Result = Internal::applyX86_64(Graph);
+  Expect<Internal::RelocationResult> Result =
+      Unexpect(ErrCode::Value::AOTNotImpl);
+  switch (Graph.target()) {
+  case Target::X86_64:
+    Result = Internal::applyX86_64(Graph);
+    break;
+  case Target::ARM:
+    Result = Internal::applyARM(Graph);
+    break;
+  case Target::AArch64:
+    Result = Internal::applyAArch64(Graph);
+    break;
+  case Target::RISCV64:
+    Result = Internal::applyRISCV(Graph);
+    break;
+  case Target::S390X:
+    Result = Internal::applyS390X(Graph);
+    break;
+  default:
+    spdlog::error("native linker: unsupported target {}"sv,
+                  static_cast<uint32_t>(Graph.target()));
+    break;
+  }
   if (!Result) {
     return Unexpect(Result.error());
   }

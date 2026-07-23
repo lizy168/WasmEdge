@@ -587,6 +587,13 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     if (SymbolName == "$section") {
       SymbolName += std::to_string((*InputSection)->getIndex());
     }
+    if (!Exported && std::any_of(Graph.symbols().begin(), Graph.symbols().end(),
+                                 [&](const auto &Value) {
+                                   return Value.Name == SymbolName;
+                                 })) {
+      SymbolName += "." + std::to_string((*InputSection)->getIndex()) + "." +
+                    std::to_string(SymbolIds.size());
+    }
     auto Added = Graph.addSymbol(Symbol{
         std::move(SymbolName), Section->second, Address - Base,
         SymbolSizes[InputSymbol.getRawDataRefImpl()], Exported, ExportName});
