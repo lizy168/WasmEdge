@@ -78,7 +78,12 @@ LinkExpect<void> overflow(const Section &SectionValue, SectionId Id,
 
 } // namespace
 
-LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
+LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase,
+                        uint64_t SegmentAlignment) noexcept {
+  if (SegmentAlignment == 0 ||
+      (SegmentAlignment & (SegmentAlignment - 1)) != 0) {
+    return fail<void>(Diagnostic{"invalid segment alignment"});
+  }
   if (Graph.relocationsApplied()) {
     return fail<void>(Diagnostic{"cannot layout relocated link graph"});
   }
@@ -99,8 +104,14 @@ LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
   std::vector<Placement> Placements(Sections.size());
   uint64_t Address = ImageBase;
   uint64_t FileOffset = 0;
+  SectionOrder Previous = SectionOrder::Invalid;
   for (const SectionId Id : Order) {
     const auto &SectionValue = Sections[Id];
+    const auto Current = kindOrder(SectionValue.Kind);
+    if (Previous != SectionOrder::Invalid && Current != Previous &&
+        !checkedAlign(Address, SegmentAlignment, Address)) {
+      return overflow(SectionValue, Id, "section segment alignment overflows");
+    }
     if (!checkedAlign(Address, SectionValue.Alignment, Address)) {
       return overflow(SectionValue, Id, "section address alignment overflows");
     }
@@ -118,6 +129,7 @@ LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
         !checkedAdd(FileOffset, SectionValue.Content.size(), FileOffset)) {
       return overflow(SectionValue, Id, "section file size overflows");
     }
+    Previous = Current;
   }
 
   for (SectionId Id = 0; Id < Placements.size(); ++Id) {

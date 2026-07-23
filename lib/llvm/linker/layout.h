@@ -11,7 +11,8 @@ namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
 
-LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase = 0) noexcept;
+LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase = 0,
+                        uint64_t SegmentAlignment = 1) noexcept;
 
 } // namespace Linker
 } // namespace LLVM

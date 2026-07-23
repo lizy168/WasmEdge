@@ -3,19 +3,17 @@
 
 #include "llvm/codegen.h"
 
-#include "aot/version.h"
 #include "common/defines.h"
 #include "common/hash.h"
 #include "data.h"
+#include "linker/native_linker.h"
 #include "llvm.h"
 
 #include <lld/Common/Driver.h>
 
-#include <charconv>
 #include <fstream>
 #include <mutex>
 #include <random>
-#include <sstream>
 
 #if LLVM_VERSION_MAJOR >= 14
 #include <lld/Common/CommonLinkerContext.h>
@@ -34,18 +32,6 @@ LLD_HAS_DRIVER(coff)
 #include <sys/utsname.h>
 #include <unistd.h>
 #endif
-#if WASMEDGE_OS_WINDOWS
-#include <llvm/Object/COFF.h>
-#endif
-
-#if WASMEDGE_OS_LINUX
-#define SYMBOL(X) X
-#elif WASMEDGE_OS_MACOS
-#define SYMBOL(X) "_" X
-#elif WASMEDGE_OS_WINDOWS
-#define SYMBOL(X) X
-#endif
-
 namespace LLVM = WasmEdge::LLVM;
 using namespace std::literals;
 
@@ -106,49 +92,6 @@ std::pair<uint32_t, uint32_t> getSDKVersionPair() noexcept {
   return {UINT32_C(12), UINT32_C(1)};
 }
 #endif
-
-Expect<void> WriteByte(std::ostream &OS, uint8_t Data) noexcept {
-  OS.put(static_cast<char>(Data));
-  return {};
-}
-
-Expect<void> WriteU32(std::ostream &OS, uint32_t Data) noexcept {
-  do {
-    uint8_t Byte = static_cast<uint8_t>(Data & UINT32_C(0x7f));
-    Data >>= 7;
-    if (Data > UINT32_C(0)) {
-      Byte |= UINT8_C(0x80);
-    }
-    WriteByte(OS, Byte);
-  } while (Data > UINT32_C(0));
-  return {};
-}
-
-Expect<void> WriteU64(std::ostream &OS, uint64_t Data) noexcept {
-  do {
-    uint8_t Byte = static_cast<uint8_t>(Data & UINT64_C(0x7f));
-    Data >>= 7;
-    if (Data > UINT64_C(0)) {
-      Byte |= UINT8_C(0x80);
-    }
-    WriteByte(OS, Byte);
-  } while (Data > UINT64_C(0));
-  return {};
-}
-
-Expect<void> WriteName(std::ostream &OS, std::string_view Data) noexcept {
-  WriteU32(OS, static_cast<uint32_t>(Data.size()));
-  for (const auto C : Data) {
-    WriteByte(OS, static_cast<uint8_t>(C));
-  }
-  return {};
-}
-
-inline constexpr bool startsWith(std::string_view Value,
-                                 std::string_view Prefix) noexcept {
-  return Value.size() >= Prefix.size() &&
-         Value.substr(0, Prefix.size()) == Prefix;
-}
 
 std::filesystem::path uniquePath(const std::filesystem::path Model) noexcept {
   using size_type = std::filesystem::path::string_type::size_type;
@@ -302,209 +245,6 @@ Expect<void> outputNativeLibrary(const std::filesystem::path &OutputPath,
   return {};
 }
 
-Expect<void> outputWasmLibrary(LLVM::Context LLContext,
-                               const std::filesystem::path &OutputPath,
-                               Span<const Byte> Data,
-                               const LLVM::MemoryBuffer &OSVec) noexcept {
-  std::filesystem::path SharedObjectName;
-  {
-    // tempfile
-    std::filesystem::path SOPath(OutputPath);
-    SOPath.replace_extension("%%%%%%%%%%" WASMEDGE_LIB_EXTENSION);
-    SharedObjectName = createTemp(SOPath);
-    if (SharedObjectName.empty()) {
-      // TODO:return error
-      spdlog::error("so file creation failed:{}"sv, SOPath.u8string());
-      return Unexpect(ErrCode::Value::IllegalPath);
-    }
-    std::ofstream OS(SharedObjectName, std::ios_base::binary);
-    OS.write(OSVec.data(), static_cast<std::streamsize>(OSVec.size()));
-    OS.close();
-  }
-
-  EXPECTED_TRY(outputNativeLibrary(SharedObjectName, OSVec));
-
-  LLVM::MemoryBuffer SOFile;
-  if (auto [Res, ErrorMessage] =
-          LLVM::MemoryBuffer::getFile(SharedObjectName.u8string().c_str());
-      unlikely(ErrorMessage)) {
-    spdlog::error("object file open error:{}"sv, ErrorMessage.string_view());
-    return Unexpect(ErrCode::Value::IllegalPath);
-  } else {
-    SOFile = std::move(Res);
-  }
-
-  LLVM::Binary ObjFile;
-  if (auto [Res, ErrorMessage] = LLVM::Binary::create(SOFile, LLContext);
-      unlikely(ErrorMessage)) {
-    spdlog::error("object file parse error:{}"sv, ErrorMessage.string_view());
-    return Unexpect(ErrCode::Value::IllegalPath);
-  } else {
-    ObjFile = std::move(Res);
-  }
-
-  std::string OSCustomSecVec;
-  {
-    std::ostringstream OS;
-    WriteName(OS, "wasmedge"sv);
-    WriteU32(OS, AOT::kBinaryVersion);
-
-#if WASMEDGE_OS_LINUX
-    WriteByte(OS, UINT8_C(1));
-#elif WASMEDGE_OS_MACOS
-    WriteByte(OS, UINT8_C(2));
-#elif WASMEDGE_OS_WINDOWS
-    WriteByte(OS, UINT8_C(3));
-#else
-#error Unsupported operating system!
-#endif
-
-#if defined(__x86_64__)
-    WriteByte(OS, UINT8_C(1));
-#elif defined(__aarch64__)
-    WriteByte(OS, UINT8_C(2));
-#elif defined(__riscv) && __riscv_xlen == 64
-    WriteByte(OS, UINT8_C(3));
-#elif defined(__arm__) && __ARM_ARCH == 7
-    WriteByte(OS, UINT8_C(4));
-#elif defined(__s390x__)
-    WriteByte(OS, UINT8_C(5));
-#else
-#error Unsupported hardware architecture!
-#endif
-
-    std::vector<std::pair<std::string, uint64_t>> SymbolTable;
-#if !WASMEDGE_OS_WINDOWS
-    for (auto Symbol = ObjFile.symbols();
-         Symbol && !ObjFile.isSymbolEnd(Symbol); Symbol.next()) {
-      SymbolTable.emplace_back(Symbol.getName(), Symbol.getAddress());
-    }
-#else
-    for (auto &Symbol :
-         llvm::object::unwrap<llvm::object::COFFObjectFile>(ObjFile.unwrap())
-             ->export_directories()) {
-      llvm::StringRef Name;
-      if (auto Error = Symbol.getSymbolName(Name); unlikely(!!Error)) {
-        continue;
-      } else if (Name.empty()) {
-        continue;
-      }
-      uint32_t Offset = 0;
-      if (auto Error = Symbol.getExportRVA(Offset); unlikely(!!Error)) {
-        continue;
-      }
-      SymbolTable.emplace_back(Name.str(), Offset);
-    }
-#endif
-    uint64_t VersionAddress = 0, IntrinsicsAddress = 0;
-    std::vector<uint64_t> Types;
-    std::vector<uint64_t> Codes;
-    uint64_t CodesMin = std::numeric_limits<uint64_t>::max();
-    for (const auto &[Name, Address] : SymbolTable) {
-      if (Name == SYMBOL("version"sv)) {
-        VersionAddress = Address;
-      } else if (Name == SYMBOL("intrinsics"sv)) {
-        IntrinsicsAddress = Address;
-      } else if (startsWith(Name, SYMBOL("t"sv))) {
-        uint64_t Index = 0;
-        std::from_chars(Name.data() + SYMBOL("t"sv).size(),
-                        Name.data() + Name.size(), Index);
-        if (Types.size() < Index + 1) {
-          Types.resize(Index + 1);
-        }
-        Types[Index] = Address;
-      } else if (startsWith(Name, SYMBOL("f"sv))) {
-        uint64_t Index = 0;
-        std::from_chars(Name.data() + SYMBOL("f"sv).size(),
-                        Name.data() + Name.size(), Index);
-        if (Codes.size() < Index + 1) {
-          Codes.resize(Index + 1);
-        }
-        CodesMin = std::min(CodesMin, Index);
-        Codes[Index] = Address;
-      }
-    }
-    if (CodesMin != std::numeric_limits<uint64_t>::max()) {
-      Codes.erase(Codes.begin(),
-                  Codes.begin() + static_cast<int64_t>(CodesMin));
-    }
-    WriteU64(OS, VersionAddress);
-    WriteU64(OS, IntrinsicsAddress);
-    WriteU64(OS, Types.size());
-    for (const uint64_t TypeAddress : Types) {
-      WriteU64(OS, TypeAddress);
-    }
-    WriteU64(OS, Codes.size());
-    for (const uint64_t CodeAddress : Codes) {
-      WriteU64(OS, CodeAddress);
-    }
-
-    uint32_t SectionCount = 0;
-    for (auto Section = ObjFile.sections(); !ObjFile.isSectionEnd(Section);
-         Section.next()) {
-      if (Section.getSize() == 0) {
-        continue;
-      }
-      if (!Section.isEHFrame() && !Section.isPData() && !Section.isText() &&
-          !Section.isData() && !Section.isBSS()) {
-        continue;
-      }
-      ++SectionCount;
-    }
-    WriteU32(OS, SectionCount);
-
-    for (auto Section = ObjFile.sections(); !ObjFile.isSectionEnd(Section);
-         Section.next()) {
-      if (Section.getSize() == 0) {
-        continue;
-      }
-      std::vector<char> Content(Section.getSize());
-      if (!Section.isVirtual()) {
-        if (auto Res = Section.getContents(); unlikely(Res.empty())) {
-          assumingUnreachable();
-        } else {
-          Content.assign(Res.begin(), Res.end());
-        }
-      }
-      if (Section.isEHFrame() || Section.isPData()) {
-        WriteByte(OS, UINT8_C(4));
-      } else if (Section.isText()) {
-        WriteByte(OS, UINT8_C(1));
-      } else if (Section.isData()) {
-        WriteByte(OS, UINT8_C(2));
-      } else if (Section.isBSS()) {
-        WriteByte(OS, UINT8_C(3));
-      } else {
-        continue;
-      }
-
-      WriteU64(OS, Section.getAddress());
-      WriteU64(OS, Content.size());
-      WriteName(OS, std::string_view(Content.data(), Content.size()));
-    }
-    OSCustomSecVec = OS.str();
-  }
-
-  spdlog::info("output start"sv);
-
-  std::ofstream OS(OutputPath, std::ios_base::binary);
-  if (!OS) {
-    spdlog::error("output failed."sv);
-    return Unexpect(ErrCode::Value::IllegalPath);
-  }
-  OS.write(reinterpret_cast<const char *>(Data.data()),
-           static_cast<std::streamsize>(Data.size()));
-  // Custom section id
-  WriteByte(OS, UINT8_C(0x00));
-  WriteName(OS, std::string_view(OSCustomSecVec.data(), OSCustomSecVec.size()));
-
-  std::error_code Error;
-  std::filesystem::remove(SharedObjectName, Error);
-
-  spdlog::info("output done"sv);
-  return {};
-}
-
 } // namespace
 
 namespace WasmEdge::LLVM {
@@ -638,7 +378,10 @@ Expect<void> CodeGen::codegen(Span<const Byte> WasmData, Data D,
 
     if (Conf.getCompilerConfigure().getOutputFormat() ==
         CompilerConfigure::OutputFormat::Wasm) {
-      EXPECTED_TRY(outputWasmLibrary(LLContext, OutputPath, WasmData, OSVec));
+      const auto Object = Span<const Byte>(
+          reinterpret_cast<const Byte *>(OSVec.data()), OSVec.size());
+      EXPECTED_TRY(Linker::NativeLinker::link(
+          Object, WasmData, OutputPath, Linker::OutputKind::UniversalWasm));
     } else {
       EXPECTED_TRY(outputNativeLibrary(OutputPath, OSVec));
     }

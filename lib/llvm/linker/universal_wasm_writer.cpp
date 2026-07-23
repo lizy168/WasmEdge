@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The WasmEdge Authors
+
+#include "linker/universal_wasm_writer.h"
+
+#include "aot/version.h"
+#include "common/defines.h"
+#include "linker/writer.h"
+
+#include <algorithm>
+#include <charconv>
+#include <limits>
+#include <optional>
+#include <string_view>
+#include <vector>
+
+using namespace std::literals;
+
+namespace WasmEdge {
+namespace LLVM {
+namespace Linker {
+
+namespace {
+
+enum class AOTSectionKind : uint8_t {
+  Text = 1,
+  Data = 2,
+  BSS = 3,
+  Unwind = 4,
+};
+
+enum class AOTOSType : uint8_t { Linux = 1, MacOS = 2, Windows = 3 };
+enum class AOTArchType : uint8_t {
+  X86_64 = 1,
+  AArch64 = 2,
+  RISCV64 = 3,
+  ARM = 4,
+  S390X = 5,
+};
+
+constexpr uint8_t CustomSectionId = 0;
+
+Expect<void> writeError() noexcept {
+  return Unexpect(ErrCode::Value::IllegalPath);
+}
+
+std::optional<uint8_t> hostOS() noexcept {
+#if WASMEDGE_OS_LINUX
+  return static_cast<uint8_t>(AOTOSType::Linux);
+#elif WASMEDGE_OS_MACOS
+  return static_cast<uint8_t>(AOTOSType::MacOS);
+#elif WASMEDGE_OS_WINDOWS
+  return static_cast<uint8_t>(AOTOSType::Windows);
+#else
+  return std::nullopt;
+#endif
+}
+
+std::optional<uint8_t> architecture(Target Value) noexcept {
+  switch (Value) {
+  case Target::X86_64:
+    return static_cast<uint8_t>(AOTArchType::X86_64);
+  case Target::AArch64:
+    return static_cast<uint8_t>(AOTArchType::AArch64);
+  case Target::RISCV64:
+    return static_cast<uint8_t>(AOTArchType::RISCV64);
+  case Target::ARM:
+    return static_cast<uint8_t>(AOTArchType::ARM);
+  case Target::S390X:
+    return static_cast<uint8_t>(AOTArchType::S390X);
+  }
+  return std::nullopt;
+}
+
+std::optional<AOTSectionKind> sectionKind(SectionKind Kind) noexcept {
+  switch (Kind) {
+  case SectionKind::Text:
+    return AOTSectionKind::Text;
+  case SectionKind::ReadOnly:
+  case SectionKind::Data:
+    return AOTSectionKind::Data;
+  case SectionKind::BSS:
+    return AOTSectionKind::BSS;
+  case SectionKind::Unwind:
+    return AOTSectionKind::Unwind;
+  }
+  return std::nullopt;
+}
+
+std::optional<uint64_t> symbolAddress(const LinkGraph &Graph,
+                                      const Symbol &Value) noexcept {
+  if (Value.Section >= Graph.sections().size()) {
+    return std::nullopt;
+  }
+  const auto Base = Graph.sections()[Value.Section].Address;
+  if (Value.Offset > std::numeric_limits<uint64_t>::max() - Base) {
+    return std::nullopt;
+  }
+  return Base + Value.Offset;
+}
+
+bool indexedSymbol(std::string_view Name, char Prefix,
+                   uint64_t &Index) noexcept {
+  if (Name.size() < 2 || Name.front() != Prefix) {
+    return false;
+  }
+  const auto Result =
+      std::from_chars(Name.data() + 1, Name.data() + Name.size(), Index);
+  return Result.ec == std::errc{} && Result.ptr == Name.data() + Name.size();
+}
+
+Expect<void> writeAddresses(Writer &Output, const LinkGraph &Graph) noexcept {
+  uint64_t Version = 0;
+  uint64_t Intrinsics = 0;
+  std::vector<uint64_t> Types;
+  std::vector<uint64_t> Codes;
+  uint64_t FirstCode = std::numeric_limits<uint64_t>::max();
+  for (const auto &SymbolValue : Graph.symbols()) {
+    const auto Address = symbolAddress(Graph, SymbolValue);
+    if (!Address) {
+      return writeError();
+    }
+    if (SymbolValue.Name == "version") {
+      Version = *Address;
+    } else if (SymbolValue.Name == "intrinsics") {
+      Intrinsics = *Address;
+    } else {
+      uint64_t Index = 0;
+      if (indexedSymbol(SymbolValue.Name, 't', Index)) {
+        if (Index == std::numeric_limits<uint64_t>::max() ||
+            Index >= std::numeric_limits<size_t>::max()) {
+          return writeError();
+        }
+        Types.resize(std::max(Types.size(), static_cast<size_t>(Index + 1)));
+        Types[Index] = *Address;
+      } else if (indexedSymbol(SymbolValue.Name, 'f', Index)) {
+        if (Index == std::numeric_limits<uint64_t>::max() ||
+            Index >= std::numeric_limits<size_t>::max()) {
+          return writeError();
+        }
+        Codes.resize(std::max(Codes.size(), static_cast<size_t>(Index + 1)));
+        Codes[Index] = *Address;
+        FirstCode = std::min(FirstCode, Index);
+      }
+    }
+  }
+  if (FirstCode != std::numeric_limits<uint64_t>::max()) {
+    Codes.erase(Codes.begin(), Codes.begin() + static_cast<size_t>(FirstCode));
+  }
+  EXPECTED_TRY(Output.writeU64(Version));
+  EXPECTED_TRY(Output.writeU64(Intrinsics));
+  EXPECTED_TRY(Output.writeU64(Types.size()));
+  for (const auto Address : Types) {
+    EXPECTED_TRY(Output.writeU64(Address));
+  }
+  EXPECTED_TRY(Output.writeU64(Codes.size()));
+  for (const auto Address : Codes) {
+    EXPECTED_TRY(Output.writeU64(Address));
+  }
+  return {};
+}
+
+} // namespace
+
+Expect<void>
+UniversalWasmWriter::write(const LinkGraph &Graph, Span<const Byte> Wasm,
+                           const std::filesystem::path &Output) noexcept {
+  const auto OS = hostOS();
+  const auto Arch = architecture(Graph.target());
+  if (!OS || !Arch || !Graph.relocationsApplied()) {
+    return writeError();
+  }
+
+  std::vector<Byte> Payload;
+  Writer Section(Payload);
+  EXPECTED_TRY(Section.writeName("wasmedge"sv));
+  EXPECTED_TRY(Section.writeU32(AOT::kBinaryVersion));
+  EXPECTED_TRY(Section.writeByte(*OS));
+  EXPECTED_TRY(Section.writeByte(*Arch));
+  EXPECTED_TRY(writeAddresses(Section, Graph));
+  const auto SectionCount =
+      std::count_if(Graph.sections().begin(), Graph.sections().end(),
+                    [](const auto &Value) { return Value.VirtualSize != 0; });
+  if (SectionCount > std::numeric_limits<uint32_t>::max()) {
+    return writeError();
+  }
+  EXPECTED_TRY(Section.writeU32(static_cast<uint32_t>(SectionCount)));
+  for (const auto &Value : Graph.sections()) {
+    if (Value.VirtualSize == 0) {
+      continue;
+    }
+    const auto Kind = sectionKind(Value.Kind);
+    if (!Kind || Value.Content.size() > Value.VirtualSize) {
+      return writeError();
+    }
+    EXPECTED_TRY(Section.writeByte(static_cast<uint8_t>(*Kind)));
+    EXPECTED_TRY(Section.writeU64(Value.Address));
+    EXPECTED_TRY(Section.writeU64(Value.VirtualSize));
+    EXPECTED_TRY(Section.writeName(
+        std::string_view(reinterpret_cast<const char *>(Value.Content.data()),
+                         Value.Content.size())));
+  }
+  EXPECTED_TRY(Section.close());
+  if (Payload.size() > UINT32_MAX) {
+    return writeError();
+  }
+
+  Writer Result(Output);
+  EXPECTED_TRY(Result.write(Wasm));
+  EXPECTED_TRY(Result.writeByte(CustomSectionId));
+  EXPECTED_TRY(Result.writeU32(static_cast<uint32_t>(Payload.size())));
+  EXPECTED_TRY(Result.write(Payload));
+  return Result.close();
+}
+
+} // namespace Linker
+} // namespace LLVM
+} // namespace WasmEdge

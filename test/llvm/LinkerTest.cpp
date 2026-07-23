@@ -3,8 +3,13 @@
 
 #include "linker/layout.h"
 #include "linker/link_graph.h"
+#include "linker/native_linker.h"
 #include "linker/object_reader.h"
 #include "linker/relocation.h"
+#include "linker/universal_wasm_writer.h"
+
+#include "aot/version.h"
+#include "loader/loader.h"
 
 #include <gtest/gtest.h>
 
@@ -34,8 +39,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -496,6 +504,162 @@ Target nativeTarget() {
 #else
 #error Unsupported test host
 #endif
+}
+
+class LinkerOutputTest : public testing::Test {
+protected:
+  void SetUp() override {
+    Directory =
+        std::filesystem::temp_directory_path() /
+        ("WasmEdgeLinker-" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    ASSERT_TRUE(std::filesystem::create_directory(Directory));
+  }
+
+  void TearDown() override { std::filesystem::remove_all(Directory); }
+
+  std::vector<WasmEdge::Byte>
+  readFile(const std::filesystem::path &Path) const {
+    std::ifstream Input(Path, std::ios_base::binary | std::ios_base::ate);
+    EXPECT_TRUE(Input);
+    const auto Size = Input.tellg();
+    EXPECT_GE(Size, 0);
+    std::vector<WasmEdge::Byte> Result(static_cast<size_t>(Size));
+    Input.seekg(0);
+    EXPECT_TRUE(Input.read(reinterpret_cast<char *>(Result.data()), Size));
+    return Result;
+  }
+
+  void expectNoTemporaryFiles() const {
+    for (const auto &Entry : std::filesystem::directory_iterator(Directory)) {
+      EXPECT_EQ(Entry.path().extension(), ".wasm");
+    }
+  }
+
+  std::filesystem::path Directory;
+};
+
+TEST_F(LinkerOutputTest, UniversalWasmWriterSerializesLoaderSchema) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  LinkGraph Graph(nativeTarget(), nativeTarget() == Target::S390X
+                                      ? Endianness::Big
+                                      : Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("golden.o"));
+  auto Text = Graph.addSection(
+      Section{".text", SectionKind::Text, 4, 4, 0x20, 0, {1, 2, 3, 4}});
+  auto Data = Graph.addSection(
+      Section{".data", SectionKind::Data, 8, 3, 0x28, 4, {5, 6, 7}});
+  auto Bss =
+      Graph.addSection(Section{".bss", SectionKind::BSS, 16, 9, 0x30, 0, {}});
+  auto Unwind = Graph.addSection(
+      Section{".eh_frame", SectionKind::Unwind, 8, 2, 0x40, 7, {8, 9}});
+  ASSERT_TRUE(Text && Data && Bss && Unwind);
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"version", *Data, 1, 1, true}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"intrinsics", *Data, 2, 1, true}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"f0", *Text, 3, 1, true}));
+  ASSERT_TRUE(applyRelocations(Graph));
+  const auto Output = Directory / "golden.wasm";
+
+  ASSERT_TRUE(UniversalWasmWriter::write(Graph, TinyWasm, Output));
+  WasmEdge::Configure Conf;
+  Conf.getRuntimeConfigure().setRunMode(WasmEdge::RunMode::AOT);
+  WasmEdge::Loader::Loader Loader(Conf);
+  auto Module = Loader.parseModule(Output);
+  ASSERT_TRUE(Module);
+  const auto &AOT = (*Module)->getAOTSection();
+  EXPECT_EQ(AOT.getVersion(), WasmEdge::AOT::kBinaryVersion);
+#if WASMEDGE_OS_LINUX
+  EXPECT_EQ(AOT.getOSType(), 1U);
+#elif WASMEDGE_OS_MACOS
+  EXPECT_EQ(AOT.getOSType(), 2U);
+#elif WASMEDGE_OS_WINDOWS
+  EXPECT_EQ(AOT.getOSType(), 3U);
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+  EXPECT_EQ(AOT.getArchType(), 1U);
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  EXPECT_EQ(AOT.getArchType(), 2U);
+#elif defined(__riscv) && __riscv_xlen == 64
+  EXPECT_EQ(AOT.getArchType(), 3U);
+#elif defined(__arm__) || defined(_M_ARM)
+  EXPECT_EQ(AOT.getArchType(), 4U);
+#elif defined(__s390x__)
+  EXPECT_EQ(AOT.getArchType(), 5U);
+#endif
+  EXPECT_EQ(AOT.getVersionAddress(), 0x29U);
+  EXPECT_EQ(AOT.getIntrinsicsAddress(), 0x2AU);
+  EXPECT_TRUE(AOT.getTypesAddress().empty());
+  EXPECT_EQ(AOT.getCodesAddress(), (std::vector<uintptr_t>{0x23}));
+  EXPECT_EQ(AOT.getSections().size(), 4U);
+  EXPECT_EQ(
+      AOT.getSections()[0],
+      (std::tuple<uint8_t, uint64_t, uint64_t, std::vector<WasmEdge::Byte>>{
+          1, 0x20, 4, {1, 2, 3, 4}}));
+  EXPECT_EQ(
+      AOT.getSections()[1],
+      (std::tuple<uint8_t, uint64_t, uint64_t, std::vector<WasmEdge::Byte>>{
+          2, 0x28, 3, {5, 6, 7}}));
+  EXPECT_EQ(
+      AOT.getSections()[2],
+      (std::tuple<uint8_t, uint64_t, uint64_t, std::vector<WasmEdge::Byte>>{
+          3, 0x30, 9, {}}));
+  EXPECT_EQ(
+      AOT.getSections()[3],
+      (std::tuple<uint8_t, uint64_t, uint64_t, std::vector<WasmEdge::Byte>>{
+          4, 0x40, 2, {8, 9}}));
+}
+
+TEST_F(LinkerOutputTest, NativeLinkerRejectsUnsupportedOutputAtomically) {
+  const auto Output = Directory / "existing.wasm";
+  const std::array<WasmEdge::Byte, 3> Existing{1, 2, 3};
+  {
+    std::ofstream File(Output, std::ios_base::binary);
+    File.write(reinterpret_cast<const char *>(Existing.data()),
+               Existing.size());
+  }
+  const auto Object = makeNativeObject();
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                    0x01, 0x00, 0x00, 0x00};
+
+  EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output, OutputKind::ELF));
+  EXPECT_EQ(readFile(Output),
+            (std::vector<WasmEdge::Byte>(Existing.begin(), Existing.end())));
+  expectNoTemporaryFiles();
+}
+
+TEST_F(LinkerOutputTest, NativeLinkerCreatesNoNativeTemporary) {
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                    0x01, 0x00, 0x00, 0x00};
+  const auto Output = Directory / "output.wasm";
+
+  ASSERT_TRUE(NativeLinker::link(makeNativeObject(), EmptyWasm, Output,
+                                 OutputKind::UniversalWasm));
+  ASSERT_TRUE(std::filesystem::is_regular_file(Output));
+  expectNoTemporaryFiles();
+}
+
+TEST_F(LinkerOutputTest, NativeLinkerRejectsBadObjectsAtomically) {
+  const auto Output = Directory / "existing.wasm";
+  const std::array<WasmEdge::Byte, 3> Existing{1, 2, 3};
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                    0x01, 0x00, 0x00, 0x00};
+  for (const auto &Object :
+       {std::vector<WasmEdge::Byte>{0, 1, 2}, makeNativeObject(true)}) {
+    {
+      std::ofstream File(Output, std::ios_base::binary | std::ios_base::trunc);
+      File.write(reinterpret_cast<const char *>(Existing.data()),
+                 Existing.size());
+    }
+    EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output,
+                                    OutputKind::UniversalWasm));
+    EXPECT_EQ(readFile(Output),
+              (std::vector<WasmEdge::Byte>(Existing.begin(), Existing.end())));
+    expectNoTemporaryFiles();
+  }
 }
 
 static_assert(sizeof(Target) == sizeof(uint8_t));
@@ -1165,6 +1329,21 @@ TEST(LayoutTest, AppliesNonzeroImageBase) {
   ASSERT_TRUE(layout(Graph, 0x1003));
   EXPECT_EQ(Graph.sections()[*Text].Address, 0x1010U);
   EXPECT_EQ(Graph.sections()[*Text].FileOffset, 0U);
+}
+
+TEST(LayoutTest, AlignsUniversalPermissionGroupsToPages) {
+  constexpr uint64_t PageSize = 4096;
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text = Graph.addSection(Section{".text", SectionKind::Text, 16, 32, 0, 0,
+                                       std::vector<WasmEdge::Byte>(32)});
+  auto Data = Graph.addSection(Section{".data", SectionKind::Data, 8, 8, 0, 0,
+                                       std::vector<WasmEdge::Byte>(8)});
+  ASSERT_TRUE(Text && Data);
+
+  ASSERT_TRUE(layout(Graph, 0, PageSize));
+  EXPECT_EQ(Graph.sections()[*Text].Address, 0U);
+  EXPECT_EQ(Graph.sections()[*Data].Address, PageSize);
 }
 
 TEST(LayoutTest, IsIdempotent) {

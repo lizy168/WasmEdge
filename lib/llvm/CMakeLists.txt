@@ -29,6 +29,7 @@ set(WASMEDGE_LLVM_SOURCES
   lazyjit.cpp
   linker/layout.cpp
   linker/link_graph.cpp
+  linker/native_linker.cpp
   linker/object_reader.cpp
   linker/relocation.cpp
   linker/relocation_aarch64.cpp
@@ -36,6 +37,8 @@ set(WASMEDGE_LLVM_SOURCES
   linker/relocation_riscv.cpp
   linker/relocation_s390x.cpp
   linker/relocation_x86_64.cpp
+  linker/universal_wasm_writer.cpp
+  linker/writer.cpp
   llvm.cpp
 )
 
