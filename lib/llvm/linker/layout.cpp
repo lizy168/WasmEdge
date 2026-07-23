@@ -4,7 +4,6 @@
 #include "linker/layout.h"
 
 #include <algorithm>
-#include <array>
 #include <limits>
 #include <numeric>
 #include <tuple>
@@ -17,24 +16,38 @@ namespace Linker {
 
 namespace {
 
+enum class SectionOrder : uint8_t {
+  Text,
+  ReadOnly,
+  Unwind,
+  Data,
+  BSS,
+  Invalid = UINT8_MAX,
+};
+
+struct Placement {
+  uint64_t Address;
+  uint64_t FileOffset;
+};
+
 template <typename T> LinkExpect<T> fail(Diagnostic Value) {
   return Unexpected<Diagnostic>(std::move(Value));
 }
 
-uint8_t kindOrder(SectionKind Kind) noexcept {
+SectionOrder kindOrder(SectionKind Kind) noexcept {
   switch (Kind) {
   case SectionKind::Text:
-    return 0;
+    return SectionOrder::Text;
   case SectionKind::ReadOnly:
-    return 1;
+    return SectionOrder::ReadOnly;
   case SectionKind::Unwind:
-    return 2;
+    return SectionOrder::Unwind;
   case SectionKind::Data:
-    return 3;
+    return SectionOrder::Data;
   case SectionKind::BSS:
-    return 4;
+    return SectionOrder::BSS;
   }
-  return std::numeric_limits<uint8_t>::max();
+  return SectionOrder::Invalid;
 }
 
 bool checkedAlign(uint64_t Value, uint64_t Alignment,
@@ -83,7 +96,7 @@ LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
            std::tuple(kindOrder(R.Kind), R.Name, Right);
   });
 
-  std::vector<std::array<uint64_t, 2>> Placements(Sections.size());
+  std::vector<Placement> Placements(Sections.size());
   uint64_t Address = ImageBase;
   uint64_t FileOffset = 0;
   for (const SectionId Id : Order) {
@@ -96,8 +109,8 @@ LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
       return overflow(SectionValue, Id,
                       "section file offset alignment overflows");
     }
-    Placements[Id] = {Address,
-                      SectionValue.Kind == SectionKind::BSS ? 0 : FileOffset};
+    Placements[Id] = Placement{
+        Address, SectionValue.Kind == SectionKind::BSS ? 0 : FileOffset};
     if (!checkedAdd(Address, SectionValue.VirtualSize, Address)) {
       return overflow(SectionValue, Id, "section virtual size overflows");
     }
@@ -108,10 +121,11 @@ LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase) noexcept {
   }
 
   for (SectionId Id = 0; Id < Placements.size(); ++Id) {
-    if (auto Result = Graph.setSectionAddress(Id, Placements[Id][0]); !Result) {
+    if (auto Result = Graph.setSectionAddress(Id, Placements[Id].Address);
+        !Result) {
       return Result;
     }
-    if (auto Result = Graph.setSectionFileOffset(Id, Placements[Id][1]);
+    if (auto Result = Graph.setSectionFileOffset(Id, Placements[Id].FileOffset);
         !Result) {
       return Result;
     }

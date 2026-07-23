@@ -3,6 +3,10 @@
 
 #include "linker/link_graph.h"
 
+#include <llvm/BinaryFormat/COFF.h>
+#include <llvm/BinaryFormat/ELF.h>
+#include <llvm/BinaryFormat/MachO.h>
+
 #include <algorithm>
 #include <utility>
 
@@ -42,25 +46,31 @@ LinkExpect<void> relocated() {
 std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
                                            Target TargetValue, uint32_t Type,
                                            uint8_t MetadataSize) noexcept {
+  constexpr uint8_t BytePatch = 1;
+  constexpr uint8_t HalfPatch = 2;
+  constexpr uint8_t WordPatch = 4;
+  constexpr uint8_t DoubleWordPatch = 8;
   if (TargetValue == Target::X86_64) {
     if (Format == ObjectFormat::ELF) {
       switch (Type) {
-      case 1:
-        return 8;
-      case 2:
-      case 4:
-      case 41:
-      case 42:
-        return 4;
+      case llvm::ELF::R_X86_64_64:
+        return DoubleWordPatch;
+      case llvm::ELF::R_X86_64_PC32:
+      case llvm::ELF::R_X86_64_PLT32:
+      case llvm::ELF::R_X86_64_GOTPCRELX:
+      case llvm::ELF::R_X86_64_REX_GOTPCRELX:
+        return WordPatch;
       default:
         return std::nullopt;
       }
     }
-    if (Format == ObjectFormat::MachO && Type == 1) {
-      return 4;
+    if (Format == ObjectFormat::MachO &&
+        Type == llvm::MachO::X86_64_RELOC_SIGNED) {
+      return WordPatch;
     }
-    if (Format == ObjectFormat::COFF && Type == 4) {
-      return 4;
+    if (Format == ObjectFormat::COFF &&
+        Type == llvm::COFF::IMAGE_REL_AMD64_REL32) {
+      return WordPatch;
     }
     return std::nullopt;
   }
@@ -69,69 +79,68 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
   }
   if (TargetValue == Target::ARM) {
     switch (Type) {
-    case 0:
-      return 0;
-    case 2:
-    case 3:
-    case 28:
-    case 29:
-    case 42:
-      return 4;
+    case llvm::ELF::R_ARM_NONE:
+      return NoPatch;
+    case llvm::ELF::R_ARM_ABS32:
+    case llvm::ELF::R_ARM_REL32:
+    case llvm::ELF::R_ARM_CALL:
+    case llvm::ELF::R_ARM_JUMP24:
+    case llvm::ELF::R_ARM_PREL31:
+      return WordPatch;
     default:
       return std::nullopt;
     }
   }
   if (TargetValue == Target::AArch64) {
     switch (Type) {
-    case 0x101:
-      return 8;
-    case 0x105:
-    case 0x113:
-    case 0x115:
-    case 0x116:
-    case 0x11A:
-    case 0x11B:
-    case 0x11C:
-    case 0x11D:
-    case 0x11E:
-    case 0x12B:
-      return 4;
+    case llvm::ELF::R_AARCH64_ABS64:
+      return DoubleWordPatch;
+    case llvm::ELF::R_AARCH64_PREL32:
+    case llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21:
+    case llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST8_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_JUMP26:
+    case llvm::ELF::R_AARCH64_CALL26:
+    case llvm::ELF::R_AARCH64_LDST16_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST32_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST64_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST128_ABS_LO12_NC:
+      return WordPatch;
     default:
       return std::nullopt;
     }
   }
   if (TargetValue == Target::RISCV64) {
     switch (Type) {
-    case 2:
-      return 8;
-    case 18:
-    case 19:
-      return 8;
-    case 23:
-    case 24:
-    case 25:
-    case 57:
-      return 4;
-    case 51:
-      return 0;
+    case llvm::ELF::R_RISCV_64:
+    case llvm::ELF::R_RISCV_CALL:
+    case llvm::ELF::R_RISCV_CALL_PLT:
+      return DoubleWordPatch;
+    case llvm::ELF::R_RISCV_PCREL_HI20:
+    case llvm::ELF::R_RISCV_PCREL_LO12_I:
+    case llvm::ELF::R_RISCV_PCREL_LO12_S:
+    case llvm::ELF::R_RISCV_32_PCREL:
+      return WordPatch;
+    case llvm::ELF::R_RISCV_RELAX:
+      return NoPatch;
     default:
       return std::nullopt;
     }
   }
   if (TargetValue == Target::S390X) {
     switch (Type) {
-    case 22:
-      return 8;
-    case 5:
-    case 19:
-    case 20:
-      return 4;
+    case llvm::ELF::R_390_64:
+      return DoubleWordPatch;
+    case llvm::ELF::R_390_PC32:
+    case llvm::ELF::R_390_PC32DBL:
+    case llvm::ELF::R_390_PLT32DBL:
+      return WordPatch;
     default:
       return std::nullopt;
     }
   }
-  if (MetadataSize == 1 || MetadataSize == 2 || MetadataSize == 4 ||
-      MetadataSize == 8) {
+  if (MetadataSize == BytePatch || MetadataSize == HalfPatch ||
+      MetadataSize == WordPatch || MetadataSize == DoubleWordPatch) {
     return MetadataSize;
   }
   return std::nullopt;
@@ -262,7 +271,7 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
     Diag.Offset = Value.Offset;
     return fail<void>(std::move(Diag));
   }
-  if (Value.PatchSize != 0 &&
+  if (Value.PatchSize != NoPatch &&
       std::any_of(Relocations.begin(), Relocations.end(), [&](const auto &Old) {
         return overlaps(Value, Old, [](const auto &RelocationValue) {
           return RelocationValue.PatchSize;
@@ -290,7 +299,7 @@ LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
     Diag.Offset = Value.Offset;
     return fail<void>(std::move(Diag));
   }
-  const uint8_t Width = std::max<uint8_t>(Value.Width, 1);
+  const uint8_t Width = std::max<uint8_t>(Value.Width, MinimumRebaseWidth);
   if (extendsBeyond(Value.Offset, Width,
                     Sections[Value.Section].Content.size())) {
     Diagnostic Diag{"rebase offset is outside section content"};
@@ -301,7 +310,7 @@ LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
   }
   if (std::any_of(Rebases.begin(), Rebases.end(), [&](const auto &Old) {
         return overlaps(Value, Old, [](const auto &RebaseValue) {
-          return std::max<uint8_t>(RebaseValue.Width, 1);
+          return std::max<uint8_t>(RebaseValue.Width, MinimumRebaseWidth);
         });
       })) {
     Diagnostic Diag{"overlapping rebase patches"};
@@ -394,7 +403,8 @@ LinkExpect<void> LinkGraph::validate() const {
   }
   for (size_t I = 0; I < Relocations.size(); ++I) {
     for (size_t J = I + 1; J < Relocations.size(); ++J) {
-      if (Relocations[I].PatchSize != 0 && Relocations[J].PatchSize != 0 &&
+      if (Relocations[I].PatchSize != NoPatch &&
+          Relocations[J].PatchSize != NoPatch &&
           overlaps(Relocations[I], Relocations[J],
                    [](const auto &Value) { return Value.PatchSize; })) {
         return fail<void>(Diagnostic{"overlapping relocation patches"});
@@ -409,7 +419,8 @@ LinkExpect<void> LinkGraph::validate() const {
       Diag.Offset = Value.Offset;
       return fail<void>(std::move(Diag));
     }
-    if (extendsBeyond(Value.Offset, std::max<uint8_t>(Value.Width, 1),
+    if (extendsBeyond(Value.Offset,
+                      std::max<uint8_t>(Value.Width, MinimumRebaseWidth),
                       Sections[Value.Section].Content.size())) {
       Diagnostic Diag{"rebase offset is outside section content"};
       Diag.Section = Value.Section;
@@ -421,7 +432,7 @@ LinkExpect<void> LinkGraph::validate() const {
   for (size_t I = 0; I < Rebases.size(); ++I) {
     for (size_t J = I + 1; J < Rebases.size(); ++J) {
       if (overlaps(Rebases[I], Rebases[J], [](const auto &Value) {
-            return std::max<uint8_t>(Value.Width, 1);
+            return std::max<uint8_t>(Value.Width, MinimumRebaseWidth);
           })) {
         return fail<void>(Diagnostic{"overlapping rebase patches"});
       }

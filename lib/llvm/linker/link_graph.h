@@ -28,6 +28,8 @@ using SectionId = uint32_t;
 using SymbolId = uint32_t;
 inline constexpr SectionId InvalidSectionId = UINT32_MAX;
 inline constexpr SymbolId InvalidSymbolId = UINT32_MAX;
+inline constexpr uint8_t NoPatch = 0;
+inline constexpr uint8_t MinimumRebaseWidth = 1;
 
 struct Section {
   std::string Name;
@@ -56,7 +58,7 @@ struct Relocation {
   int64_t Addend;
   bool AddendIsImplicit = false;
   ObjectFormat Format = ObjectFormat::ELF;
-  uint8_t PatchSize = 0;
+  uint8_t PatchSize = NoPatch;
   bool PCRelative = false;
   bool External = false;
   bool Scattered = false;
@@ -67,7 +69,7 @@ struct Rebase {
   uint64_t Offset;
   uint32_t Type;
   int64_t Addend;
-  uint8_t Width = 0;
+  uint8_t Width = NoPatch;
   ObjectFormat Format = ObjectFormat::ELF;
 };
 

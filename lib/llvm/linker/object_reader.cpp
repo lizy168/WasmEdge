@@ -7,6 +7,7 @@
 
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/ELF.h>
+#include <llvm/BinaryFormat/MachO.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Object/ELFObjectFile.h>
@@ -30,6 +31,59 @@ namespace LLVM {
 namespace Linker {
 
 namespace {
+
+constexpr uint8_t BytePatch = 1;
+
+enum class ELFIdentification : uint64_t {
+  Size = llvm::ELF::EI_NIDENT,
+  Magic0 = llvm::ELF::EI_MAG0,
+  Magic1 = llvm::ELF::EI_MAG1,
+  Magic2 = llvm::ELF::EI_MAG2,
+  Magic3 = llvm::ELF::EI_MAG3,
+  Class = llvm::ELF::EI_CLASS,
+  Data = llvm::ELF::EI_DATA,
+};
+
+enum class ELF32Offset : uint64_t {
+  SectionTable = 32,
+  SectionEntrySize = 46,
+  SectionCount = 48,
+  SectionType = 4,
+  SectionOffset = 16,
+  SectionSize = 20,
+  SectionLink = 24,
+  SectionEntry = 36,
+  RelocationInfo = 4,
+};
+
+enum class ELF64Offset : uint64_t {
+  SectionTable = 40,
+  SectionEntrySize = 58,
+  SectionCount = 60,
+  SectionType = 4,
+  SectionOffset = 24,
+  SectionSize = 32,
+  SectionLink = 40,
+  SectionEntry = 56,
+  RelocationInfo = 8,
+};
+
+constexpr uint64_t value(ELFIdentification Value) noexcept {
+  return static_cast<uint64_t>(Value);
+}
+
+constexpr uint64_t value(ELF32Offset Value) noexcept {
+  return static_cast<uint64_t>(Value);
+}
+
+constexpr uint64_t value(ELF64Offset Value) noexcept {
+  return static_cast<uint64_t>(Value);
+}
+
+static_assert(value(ELF32Offset::SectionTable) == 32);
+static_assert(value(ELF32Offset::SectionEntrySize) == 46);
+static_assert(value(ELF64Offset::SectionTable) == 40);
+static_assert(value(ELF64Offset::SectionEntrySize) == 58);
 
 template <typename T> Expect<T> fail(std::string_view Message) {
   spdlog::error("object reader: {}"sv, Message);
@@ -92,63 +146,92 @@ bool symbolFlags(const llvm::object::SymbolRef &Symbol, uint32_t &Flags) {
 template <typename T>
 bool readELFInteger(Span<const Byte> Buffer, uint64_t Offset, bool LittleEndian,
                     T &Value) noexcept {
+  constexpr uint8_t BitsPerByte = 8;
   if (Offset > Buffer.size() || sizeof(T) > Buffer.size() - Offset) {
     return false;
   }
   Value = 0;
   for (size_t I = 0; I < sizeof(T); ++I) {
-    const size_t Shift = LittleEndian ? I * 8 : (sizeof(T) - I - 1) * 8;
+    const size_t Shift =
+        LittleEndian ? I * BitsPerByte : (sizeof(T) - I - 1) * BitsPerByte;
     Value |= static_cast<T>(Buffer[Offset + I]) << Shift;
   }
   return true;
 }
 
 bool validELFRelocations(Span<const Byte> Buffer) noexcept {
-  if (Buffer.size() < 16 || Buffer[0] != 0x7F || Buffer[1] != 'E' ||
-      Buffer[2] != 'L' || Buffer[3] != 'F') {
+  constexpr uint64_t MinimumCrelEntrySize = 1;
+  constexpr uint64_t ELF32SectionEntrySize = 40;
+  constexpr uint64_t ELF64SectionEntrySize = 64;
+  constexpr uint64_t ELF32RelEntrySize = 8;
+  constexpr uint64_t ELF32RelaEntrySize = 12;
+  constexpr uint64_t ELF64RelEntrySize = 16;
+  constexpr uint64_t ELF64RelaEntrySize = 24;
+  constexpr uint64_t ELF32SymbolEntrySize = 16;
+  constexpr uint64_t ELF64SymbolEntrySize = 24;
+  constexpr unsigned ELF32SymbolIndexShift = 8;
+  constexpr unsigned ELF64SymbolIndexShift = 32;
+  if (Buffer.size() < value(ELFIdentification::Size) ||
+      Buffer[value(ELFIdentification::Magic0)] != llvm::ELF::ElfMagic[0] ||
+      Buffer[value(ELFIdentification::Magic1)] != llvm::ELF::ElfMagic[1] ||
+      Buffer[value(ELFIdentification::Magic2)] != llvm::ELF::ElfMagic[2] ||
+      Buffer[value(ELFIdentification::Magic3)] != llvm::ELF::ElfMagic[3]) {
     return true;
   }
-  const bool Is64 = Buffer[4] == llvm::ELF::ELFCLASS64;
-  const bool Is32 = Buffer[4] == llvm::ELF::ELFCLASS32;
-  const bool LittleEndian = Buffer[5] == llvm::ELF::ELFDATA2LSB;
+  const bool Is64 =
+      Buffer[value(ELFIdentification::Class)] == llvm::ELF::ELFCLASS64;
+  const bool Is32 =
+      Buffer[value(ELFIdentification::Class)] == llvm::ELF::ELFCLASS32;
+  const bool LittleEndian =
+      Buffer[value(ELFIdentification::Data)] == llvm::ELF::ELFDATA2LSB;
   if ((!Is32 && !Is64) ||
-      (!LittleEndian && Buffer[5] != llvm::ELF::ELFDATA2MSB)) {
+      (!LittleEndian &&
+       Buffer[value(ELFIdentification::Data)] != llvm::ELF::ELFDATA2MSB)) {
     return false;
   }
   uint64_t SectionOffset = 0;
   uint16_t SectionEntrySize = 0;
   uint16_t SectionCount16 = 0;
   if (Is64) {
-    if (!readELFInteger(Buffer, 40, LittleEndian, SectionOffset) ||
-        !readELFInteger(Buffer, 58, LittleEndian, SectionEntrySize) ||
-        !readELFInteger(Buffer, 60, LittleEndian, SectionCount16)) {
+    if (!readELFInteger(Buffer, value(ELF64Offset::SectionTable), LittleEndian,
+                        SectionOffset) ||
+        !readELFInteger(Buffer, value(ELF64Offset::SectionEntrySize),
+                        LittleEndian, SectionEntrySize) ||
+        !readELFInteger(Buffer, value(ELF64Offset::SectionCount), LittleEndian,
+                        SectionCount16)) {
       return false;
     }
   } else {
     uint32_t Offset32 = 0;
-    if (!readELFInteger(Buffer, 32, LittleEndian, Offset32) ||
-        !readELFInteger(Buffer, 46, LittleEndian, SectionEntrySize) ||
-        !readELFInteger(Buffer, 48, LittleEndian, SectionCount16)) {
+    if (!readELFInteger(Buffer, value(ELF32Offset::SectionTable), LittleEndian,
+                        Offset32) ||
+        !readELFInteger(Buffer, value(ELF32Offset::SectionEntrySize),
+                        LittleEndian, SectionEntrySize) ||
+        !readELFInteger(Buffer, value(ELF32Offset::SectionCount), LittleEndian,
+                        SectionCount16)) {
       return false;
     }
     SectionOffset = Offset32;
   }
   uint64_t SectionCount = SectionCount16;
-  const uint64_t RequiredSectionSize = Is64 ? 64 : 40;
+  const uint64_t RequiredSectionSize =
+      Is64 ? ELF64SectionEntrySize : ELF32SectionEntrySize;
   if (SectionEntrySize < RequiredSectionSize || SectionOffset > Buffer.size() ||
       SectionEntrySize > Buffer.size() - SectionOffset) {
     return false;
   }
   if (SectionCount == 0) {
     if (Is64) {
-      if (!readELFInteger(Buffer, SectionOffset + 32, LittleEndian,
-                          SectionCount)) {
+      if (!readELFInteger(Buffer,
+                          SectionOffset + value(ELF64Offset::SectionSize),
+                          LittleEndian, SectionCount)) {
         return false;
       }
     } else {
       uint32_t ExtendedCount = 0;
-      if (!readELFInteger(Buffer, SectionOffset + 20, LittleEndian,
-                          ExtendedCount)) {
+      if (!readELFInteger(Buffer,
+                          SectionOffset + value(ELF32Offset::SectionSize),
+                          LittleEndian, ExtendedCount)) {
         return false;
       }
       SectionCount = ExtendedCount;
@@ -166,21 +249,33 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
       return false;
     }
     const uint64_t Base = SectionOffset + Index * SectionEntrySize;
-    if (!readELFInteger(Buffer, Base + 4, LittleEndian, Type) ||
-        !readELFInteger(Buffer, Base + (Is64 ? 40 : 24), LittleEndian, Link)) {
+    if (!readELFInteger(Buffer,
+                        Base + (Is64 ? value(ELF64Offset::SectionType)
+                                     : value(ELF32Offset::SectionType)),
+                        LittleEndian, Type) ||
+        !readELFInteger(Buffer,
+                        Base + (Is64 ? value(ELF64Offset::SectionLink)
+                                     : value(ELF32Offset::SectionLink)),
+                        LittleEndian, Link)) {
       return false;
     }
     if (Is64) {
-      return readELFInteger(Buffer, Base + 24, LittleEndian, Offset) &&
-             readELFInteger(Buffer, Base + 32, LittleEndian, Size) &&
-             readELFInteger(Buffer, Base + 56, LittleEndian, EntrySize);
+      return readELFInteger(Buffer, Base + value(ELF64Offset::SectionOffset),
+                            LittleEndian, Offset) &&
+             readELFInteger(Buffer, Base + value(ELF64Offset::SectionSize),
+                            LittleEndian, Size) &&
+             readELFInteger(Buffer, Base + value(ELF64Offset::SectionEntry),
+                            LittleEndian, EntrySize);
     }
     uint32_t Offset32 = 0;
     uint32_t Size32 = 0;
     uint32_t EntrySize32 = 0;
-    if (!readELFInteger(Buffer, Base + 16, LittleEndian, Offset32) ||
-        !readELFInteger(Buffer, Base + 20, LittleEndian, Size32) ||
-        !readELFInteger(Buffer, Base + 36, LittleEndian, EntrySize32)) {
+    if (!readELFInteger(Buffer, Base + value(ELF32Offset::SectionOffset),
+                        LittleEndian, Offset32) ||
+        !readELFInteger(Buffer, Base + value(ELF32Offset::SectionSize),
+                        LittleEndian, Size32) ||
+        !readELFInteger(Buffer, Base + value(ELF32Offset::SectionEntry),
+                        LittleEndian, EntrySize32)) {
       return false;
     }
     Offset = Offset32;
@@ -207,9 +302,11 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
       continue;
     }
     const uint64_t ExpectedEntrySize =
-        IsCrel ? 1
-        : Is64 ? (Type == llvm::ELF::SHT_RELA ? 24 : 16)
-               : (Type == llvm::ELF::SHT_RELA ? 12 : 8);
+        IsCrel ? MinimumCrelEntrySize
+        : Is64 ? (Type == llvm::ELF::SHT_RELA ? ELF64RelaEntrySize
+                                              : ELF64RelEntrySize)
+               : (Type == llvm::ELF::SHT_RELA ? ELF32RelaEntrySize
+                                              : ELF32RelEntrySize);
     uint32_t SymbolType = 0;
     uint32_t SymbolLink = 0;
     uint64_t SymbolOffset = 0;
@@ -221,7 +318,8 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
                      SymbolEntrySize) ||
         (SymbolType != llvm::ELF::SHT_SYMTAB &&
          SymbolType != llvm::ELF::SHT_DYNSYM) ||
-        SymbolEntrySize != (Is64 ? 24U : 16U) ||
+        SymbolEntrySize !=
+            (Is64 ? ELF64SymbolEntrySize : ELF32SymbolEntrySize) ||
         SymbolSize % SymbolEntrySize != 0 || SymbolOffset > Buffer.size() ||
         SymbolSize > Buffer.size() - SymbolOffset) {
       return false;
@@ -260,17 +358,19 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
       continue;
     }
     for (uint64_t J = 0; J < Size / EntrySize; ++J) {
-      const uint64_t InfoOffset = Offset + J * EntrySize + (Is64 ? 8 : 4);
+      const uint64_t InfoOffset = Offset + J * EntrySize +
+                                  (Is64 ? value(ELF64Offset::RelocationInfo)
+                                        : value(ELF32Offset::RelocationInfo));
       uint64_t Info = 0;
       if (Is64) {
         if (!readELFInteger(Buffer, InfoOffset, LittleEndian, Info) ||
-            (Info >> 32) >= SymbolCount) {
+            (Info >> ELF64SymbolIndexShift) >= SymbolCount) {
           return false;
         }
       } else {
         uint32_t Info32 = 0;
         if (!readELFInteger(Buffer, InfoOffset, LittleEndian, Info32) ||
-            (Info32 >> 8) >= SymbolCount) {
+            (Info32 >> ELF32SymbolIndexShift) >= SymbolCount) {
           return false;
         }
       }
@@ -349,7 +449,7 @@ ObjectFormat objectFormat(const llvm::object::ObjectFile &Object) noexcept {
 }
 
 struct RelocationMetadata {
-  uint8_t PatchSize = 1;
+  uint8_t PatchSize = BytePatch;
   bool PCRelative = false;
   bool External = false;
   bool Scattered = false;
@@ -359,6 +459,9 @@ std::optional<RelocationMetadata>
 relocationMetadata(const llvm::object::ObjectFile &Object,
                    const llvm::object::RelocationRef &Relocation,
                    Target TargetValue) noexcept {
+  constexpr uint8_t WordPatch = 4;
+  constexpr uint8_t DoubleWordPatch = 8;
+  constexpr unsigned MachORelocationLengthMax = 3;
   RelocationMetadata Metadata;
   const uint32_t Type = static_cast<uint32_t>(Relocation.getType());
   if (const auto *MachO =
@@ -367,34 +470,36 @@ relocationMetadata(const llvm::object::ObjectFile &Object,
     Metadata.Scattered = MachO->isRelocationScattered(Raw);
     Metadata.PCRelative = MachO->getAnyRelocationPCRel(Raw) != 0;
     const unsigned Length = MachO->getAnyRelocationLength(Raw);
-    if (Length > 3) {
+    if (Length > MachORelocationLengthMax) {
       return std::nullopt;
     }
-    Metadata.PatchSize = static_cast<uint8_t>(1U << Length);
+    Metadata.PatchSize = static_cast<uint8_t>(BytePatch << Length);
     Metadata.External =
         !Metadata.Scattered && MachO->getPlainRelocationExternal(Raw);
     if (TargetValue == Target::X86_64 && Metadata.Scattered) {
       return std::nullopt;
     }
-    if (TargetValue == Target::X86_64 && Type == 1 &&
-        (!Metadata.PCRelative || Metadata.PatchSize != 4)) {
+    if (TargetValue == Target::X86_64 &&
+        Type == llvm::MachO::X86_64_RELOC_SIGNED &&
+        (!Metadata.PCRelative || Metadata.PatchSize != WordPatch)) {
       return std::nullopt;
     }
     return Metadata;
   }
   if (TargetValue == Target::X86_64 && Object.isELF()) {
     if (Type == llvm::ELF::R_X86_64_64) {
-      Metadata.PatchSize = 8;
+      Metadata.PatchSize = DoubleWordPatch;
     } else if (Type == llvm::ELF::R_X86_64_PC32 ||
                Type == llvm::ELF::R_X86_64_PLT32 ||
                Type == llvm::ELF::R_X86_64_GOTPCRELX ||
                Type == llvm::ELF::R_X86_64_REX_GOTPCRELX) {
-      Metadata.PatchSize = 4;
+      Metadata.PatchSize = WordPatch;
       Metadata.PCRelative = true;
     }
-  } else if (TargetValue == Target::X86_64 && Object.isCOFF() && Type >= 4 &&
-             Type <= 9) {
-    Metadata.PatchSize = 4;
+  } else if (TargetValue == Target::X86_64 && Object.isCOFF() &&
+             Type >= llvm::COFF::IMAGE_REL_AMD64_REL32 &&
+             Type <= llvm::COFF::IMAGE_REL_AMD64_REL32_5) {
+    Metadata.PatchSize = WordPatch;
     Metadata.PCRelative = true;
   }
   return Metadata;
@@ -410,6 +515,8 @@ uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept {
 
 std::optional<std::map<std::string, std::string>>
 parseCOFFExports(std::string_view Input) {
+  constexpr llvm::StringLiteral COFFExportPrefix = "/export:";
+  constexpr size_t QuotedTokenDelimiterCount = 2;
   llvm::StringRef Directives(Input.data(), Input.size());
   std::map<std::string, std::string> Exports;
   while (!Directives.trim().empty()) {
@@ -421,19 +528,21 @@ parseCOFFExports(std::string_view Input) {
         return std::nullopt;
       }
       Token = Directives.substr(1, End);
-      Directives = Directives.drop_front(End + 2);
+      Directives = Directives.drop_front(End + QuotedTokenDelimiterCount);
     } else {
       std::tie(Token, Directives) = Directives.split(' ');
     }
-    if (Token.size() < 8 ||
+    if (Token.size() < COFFExportPrefix.size() ||
 #if LLVM_VERSION_MAJOR >= 19
-        !Token.take_front(8).equals_insensitive("/export:")) {
+        !Token.take_front(COFFExportPrefix.size())
+             .equals_insensitive(COFFExportPrefix)) {
 #else
-        !Token.take_front(8).equals_lower("/export:")) {
+        !Token.take_front(COFFExportPrefix.size())
+             .equals_lower(COFFExportPrefix)) {
 #endif
       continue;
     }
-    Token = Token.drop_front(8);
+    Token = Token.drop_front(COFFExportPrefix.size());
     Token = Token.split(',').first;
     const auto [ExportName, SymbolName] = Token.split('=');
     if (ExportName.empty()) {

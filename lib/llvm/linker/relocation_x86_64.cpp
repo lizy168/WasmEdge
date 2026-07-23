@@ -5,6 +5,10 @@
 
 #include "common/spdlog.h"
 
+#include <llvm/BinaryFormat/COFF.h>
+#include <llvm/BinaryFormat/ELF.h>
+#include <llvm/BinaryFormat/MachO.h>
+
 #include <algorithm>
 #include <limits>
 #include <string_view>
@@ -18,11 +22,37 @@ namespace {
 
 using namespace std::literals;
 
-constexpr uint32_t R_X86_64_64 = 1;
-constexpr uint32_t R_X86_64_PC32 = 2;
-constexpr uint32_t R_X86_64_PLT32 = 4;
-constexpr uint32_t R_X86_64_GOTPCRELX = 41;
-constexpr uint32_t R_X86_64_REX_GOTPCRELX = 42;
+enum class Opcode : uint8_t {
+  Group5 = 0xFF,
+  Load = 0x8B,
+  LoadEffectiveAddress = 0x8D,
+  CallRelative = 0xE8,
+  JumpRelative = 0xE9,
+  Nop = 0x90,
+};
+
+enum class ModRM : uint8_t {
+  CallPCRelative = 0x15,
+  JumpPCRelative = 0x25,
+  LoadPCRelative = 0x05,
+};
+
+enum class Prefix : uint8_t {
+  AddressSizeOverride = 0x67,
+  Rex = 0x40,
+};
+
+constexpr uint8_t value(Opcode Value) noexcept {
+  return static_cast<uint8_t>(Value);
+}
+
+constexpr uint8_t value(ModRM Value) noexcept {
+  return static_cast<uint8_t>(Value);
+}
+
+constexpr uint8_t value(Prefix Value) noexcept {
+  return static_cast<uint8_t>(Value);
+}
 
 uint64_t magnitude(int64_t Value) noexcept {
   return Value < 0 ? static_cast<uint64_t>(-(Value + 1)) + 1
@@ -48,6 +78,7 @@ bool addUnsigned(uint64_t Value, int64_t Addend, uint64_t &Result) noexcept {
 
 bool delta32(uint64_t Symbol, int64_t Addend, uint64_t Place,
              int64_t &Result) noexcept {
+  constexpr uint64_t NegativeInt32Magnitude = UINT64_C(2147483648);
   bool Negative = Symbol < Place;
   uint64_t Amount = Negative ? Place - Symbol : Symbol - Place;
   const bool AddendNegative = Addend < 0;
@@ -64,7 +95,7 @@ bool delta32(uint64_t Symbol, int64_t Addend, uint64_t Place,
     Negative = AddendNegative;
   }
   if ((!Negative && Amount > static_cast<uint64_t>(INT32_MAX)) ||
-      (Negative && Amount > UINT64_C(2147483648))) {
+      (Negative && Amount > NegativeInt32Magnitude)) {
     return false;
   }
   Result =
@@ -84,6 +115,9 @@ Expect<RelocationResult> fail(const Relocation &RelocationValue,
 } // namespace
 
 Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
+  constexpr uint8_t WordWidth = 4;
+  constexpr uint8_t DoubleWordWidth = 8;
+  constexpr int64_t PCRelativeAddendBias = -4;
   RelocationResult Result;
   Result.Content.reserve(Graph.sections().size());
   for (const auto &Section : Graph.sections()) {
@@ -98,29 +132,29 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
     int64_t FormatAdjustment = 0;
     if (RelocationValue.Format == ObjectFormat::ELF) {
       switch (RelocationValue.Type) {
-      case R_X86_64_64:
-        Width = 8;
+      case llvm::ELF::R_X86_64_64:
+        Width = DoubleWordWidth;
         Absolute = true;
         break;
-      case R_X86_64_PC32:
-      case R_X86_64_PLT32:
-        Width = 4;
+      case llvm::ELF::R_X86_64_PC32:
+      case llvm::ELF::R_X86_64_PLT32:
+        Width = WordWidth;
         break;
-      case R_X86_64_GOTPCRELX:
-      case R_X86_64_REX_GOTPCRELX:
-        Width = 4;
+      case llvm::ELF::R_X86_64_GOTPCRELX:
+      case llvm::ELF::R_X86_64_REX_GOTPCRELX:
+        Width = WordWidth;
         Relax = true;
         break;
       default:
         return fail(RelocationValue, "unsupported x86_64 relocation type");
       }
     } else if (RelocationValue.Format == ObjectFormat::MachO &&
-               RelocationValue.Type == 1) {
-      Width = 4;
+               RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED) {
+      Width = WordWidth;
     } else if (RelocationValue.Format == ObjectFormat::COFF &&
-               RelocationValue.Type == 4) {
-      Width = 4;
-      FormatAdjustment = -4;
+               RelocationValue.Type == llvm::COFF::IMAGE_REL_AMD64_REL32) {
+      Width = WordWidth;
+      FormatAdjustment = PCRelativeAddendBias;
     } else {
       return fail(RelocationValue, "unsupported x86_64 relocation type");
     }
@@ -168,7 +202,8 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
             if (Old.Section != RelocationValue.Section) {
               return false;
             }
-            const uint64_t OldWidth = std::max<uint8_t>(Old.Width, 1);
+            const uint64_t OldWidth =
+                std::max<uint8_t>(Old.Width, MinimumRebaseWidth);
             if (RelocationValue.Offset <= Old.Offset) {
               return Width > Old.Offset - RelocationValue.Offset;
             }
@@ -184,32 +219,50 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
       continue;
     }
     if (Relax) {
-      if (RelocationValue.AddendIsImplicit || Addend != -4 ||
-          RelocationValue.Offset < 2) {
+      constexpr uint8_t RexPrefixMask = 0xF0;
+      constexpr uint8_t LoadModRMMask = 0xC7;
+      constexpr uint64_t OpcodeAndModRMSize = 2;
+      constexpr uint64_t RexOpcodeAndModRMSize = 3;
+      constexpr uint64_t ModRMOffsetFromOpcode = 1;
+      constexpr int64_t NextInstructionBias = 1;
+      constexpr uint64_t DisplacementFieldBacktrack = 1;
+      constexpr uint64_t TrailingNopOffsetFromPatch = 3;
+      if (RelocationValue.AddendIsImplicit || Addend != PCRelativeAddendBias ||
+          RelocationValue.Offset < OpcodeAndModRMSize) {
         return fail(RelocationValue, "unsupported GOTPCRELX instruction");
       }
-      const size_t Opcode = static_cast<size_t>(RelocationValue.Offset - 2);
-      const uint8_t Op = Bytes[Opcode];
-      const uint8_t ModRM = Bytes[Opcode + 1];
-      const bool HasRex = RelocationValue.Offset >= 3 &&
-                          (Bytes[RelocationValue.Offset - 3] & 0xF0) == 0x40;
-      if (RelocationValue.Type == R_X86_64_REX_GOTPCRELX && !HasRex) {
+      const size_t OpcodeOffset =
+          static_cast<size_t>(RelocationValue.Offset - OpcodeAndModRMSize);
+      const uint8_t Op = Bytes[OpcodeOffset];
+      const uint8_t ModRMByte = Bytes[OpcodeOffset + ModRMOffsetFromOpcode];
+      const bool HasRex =
+          RelocationValue.Offset >= RexOpcodeAndModRMSize &&
+          (Bytes[RelocationValue.Offset - RexOpcodeAndModRMSize] &
+           RexPrefixMask) == value(Prefix::Rex);
+      if (RelocationValue.Type == llvm::ELF::R_X86_64_REX_GOTPCRELX &&
+          !HasRex) {
         return fail(RelocationValue, "unsupported GOTPCRELX instruction");
       }
-      if (Op == 0x8B && (ModRM & 0xC7) == 0x05) {
-        Bytes[Opcode] = 0x8D;
-      } else if (Op == 0xFF && ModRM == 0x15) {
-        Bytes[Opcode] = 0x67;
-        Bytes[Opcode + 1] = 0xE8;
-      } else if (Op == 0xFF && ModRM == 0x25) {
+      if (Op == value(Opcode::Load) &&
+          (ModRMByte & LoadModRMMask) == value(ModRM::LoadPCRelative)) {
+        Bytes[OpcodeOffset] = value(Opcode::LoadEffectiveAddress);
+      } else if (Op == value(Opcode::Group5) &&
+                 ModRMByte == value(ModRM::CallPCRelative)) {
+        Bytes[OpcodeOffset] = value(Prefix::AddressSizeOverride);
+        Bytes[OpcodeOffset + ModRMOffsetFromOpcode] =
+            value(Opcode::CallRelative);
+      } else if (Op == value(Opcode::Group5) &&
+                 ModRMByte == value(ModRM::JumpPCRelative)) {
         int64_t Value = 0;
-        if (!delta32(S, Addend + 1, P, Value) ||
-            !writeSigned(Bytes, RelocationValue.Offset - 1, Width,
-                         Graph.endianness(), Value)) {
+        if (!delta32(S, Addend + NextInstructionBias, P, Value) ||
+            !writeSigned(Bytes,
+                         RelocationValue.Offset - DisplacementFieldBacktrack,
+                         Width, Graph.endianness(), Value)) {
           return fail(RelocationValue, "PC-relative relocation overflows");
         }
-        Bytes[Opcode] = 0xE9;
-        Bytes[RelocationValue.Offset + 3] = 0x90;
+        Bytes[OpcodeOffset] = value(Opcode::JumpRelative);
+        Bytes[RelocationValue.Offset + TrailingNopOffsetFromPatch] =
+            value(Opcode::Nop);
         continue;
       } else {
         return fail(RelocationValue, "unsupported GOTPCRELX instruction");
