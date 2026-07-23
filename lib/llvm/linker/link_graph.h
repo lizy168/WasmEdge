@@ -56,7 +56,7 @@ struct Relocation {
   int64_t Addend;
   bool AddendIsImplicit = false;
   ObjectFormat Format = ObjectFormat::ELF;
-  uint8_t PatchSize = 1;
+  uint8_t PatchSize = 0;
   bool PCRelative = false;
   bool External = false;
   bool Scattered = false;
@@ -84,6 +84,10 @@ struct Diagnostic {
 };
 
 template <typename T> using LinkExpect = Expected<T, Diagnostic>;
+
+std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
+                                           Target TargetValue, uint32_t Type,
+                                           uint8_t MetadataSize) noexcept;
 
 class LinkGraph {
 public:

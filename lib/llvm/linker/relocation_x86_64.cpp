@@ -198,10 +198,10 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
       }
       if (Op == 0x8B && (ModRM & 0xC7) == 0x05) {
         Bytes[Opcode] = 0x8D;
-      } else if (Op == 0xFF && ModRM == 0x15 && S <= UINT32_MAX) {
+      } else if (Op == 0xFF && ModRM == 0x15) {
         Bytes[Opcode] = 0x67;
         Bytes[Opcode + 1] = 0xE8;
-      } else if (Op == 0xFF && ModRM == 0x25 && S <= UINT32_MAX) {
+      } else if (Op == 0xFF && ModRM == 0x25) {
         int64_t Value = 0;
         if (!delta32(S, Addend + 1, P, Value) ||
             !writeSigned(Bytes, RelocationValue.Offset - 1, Width,

@@ -405,7 +405,9 @@ TEST(LinkGraphTest, StoresRelocationsAndRebases) {
   auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 4, false});
   ASSERT_TRUE(TargetSymbol);
 
-  ASSERT_TRUE(Graph.addRelocation(Relocation{*Text, 1, 42, *TargetSymbol, -4}));
+  Relocation Stored{*Text, 0, 42, *TargetSymbol, -4};
+  Stored.PatchSize = 4;
+  ASSERT_TRUE(Graph.addRelocation(Stored));
   ASSERT_TRUE(Graph.addRebase(Rebase{*Text, 2, 7, 8}));
   ASSERT_EQ(Graph.relocations().size(), 1U);
   EXPECT_EQ(Graph.relocations()[0].Symbol, *TargetSymbol);
@@ -431,6 +433,105 @@ TEST(LinkGraphTest, RejectsOverlappingRelocationsRegardlessOfOrder) {
     ASSERT_FALSE(Result);
     EXPECT_EQ(Result.error().Message, "overlapping relocation patches");
   }
+}
+
+TEST(LinkGraphTest, EnforcesCanonicalX86RelocationPatchSizes) {
+  struct Case {
+    ObjectFormat Format;
+    uint32_t Type;
+    uint8_t Width;
+  };
+  const std::array<Case, 7> Cases{{
+      {ObjectFormat::ELF, 1, 8},
+      {ObjectFormat::ELF, 2, 4},
+      {ObjectFormat::ELF, 4, 4},
+      {ObjectFormat::ELF, 41, 4},
+      {ObjectFormat::ELF, 42, 4},
+      {ObjectFormat::MachO, 1, 4},
+      {ObjectFormat::COFF, 4, 4},
+  }};
+  for (const auto &Test : Cases) {
+    for (const uint8_t Width :
+         {uint8_t{0}, uint8_t{1}, uint8_t{4}, uint8_t{8}}) {
+      LinkGraph Graph(Target::X86_64, Endianness::Little);
+      ASSERT_TRUE(Graph.beginInput("input.o"));
+      auto Text = Graph.addSection(
+          Section{".text",
+                  SectionKind::Text,
+                  1,
+                  16,
+                  0,
+                  0,
+                  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}});
+      ASSERT_TRUE(Text);
+      auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+      ASSERT_TRUE(TargetSymbol);
+      Relocation Value{*Text, 0, Test.Type, *TargetSymbol, 0};
+      Value.Format = Test.Format;
+      Value.PatchSize = Width;
+      auto Result = Graph.addRelocation(Value);
+      EXPECT_EQ(static_cast<bool>(Result), Width == Test.Width);
+      if (!Result) {
+        EXPECT_EQ(Result.error().Message, "invalid relocation patch size");
+      }
+    }
+  }
+}
+
+TEST(LinkGraphTest, RejectsUnsupportedX86RelocationBeforeRangeValidation) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text = Graph.addSection(Section{
+      ".text", SectionKind::Text, 1, 8, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}});
+  ASSERT_TRUE(Text);
+  auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+  ASSERT_TRUE(TargetSymbol);
+  Relocation Unknown{*Text, 0, 0xFFFF, *TargetSymbol, 0};
+  Unknown.PatchSize = 1;
+  auto Result = Graph.addRelocation(Unknown);
+  ASSERT_FALSE(Result);
+  EXPECT_EQ(Result.error().Message, "unsupported relocation patch size");
+}
+
+TEST(LinkGraphTest, WrongPatchSizeCannotBypassOverlapDetection) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text = Graph.addSection(
+      Section{".text",
+              SectionKind::Text,
+              1,
+              16,
+              0,
+              0,
+              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}});
+  ASSERT_TRUE(Text);
+  auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+  ASSERT_TRUE(TargetSymbol);
+  Relocation First{*Text, 0, 1, *TargetSymbol, 0};
+  First.PatchSize = 8;
+  ASSERT_TRUE(Graph.addRelocation(First));
+  Relocation Bypass{*Text, 7, 2, *TargetSymbol, 0};
+  Bypass.PatchSize = 1;
+  auto Result = Graph.addRelocation(Bypass);
+  ASSERT_FALSE(Result);
+  EXPECT_EQ(Result.error().Message, "invalid relocation patch size");
+}
+
+TEST(LinkGraphTest, ValidationRejectsMutatedRelocationPatchSize) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text = Graph.addSection(Section{
+      ".text", SectionKind::Text, 1, 8, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}});
+  ASSERT_TRUE(Text);
+  auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
+  ASSERT_TRUE(TargetSymbol);
+  Relocation Value{*Text, 0, 1, *TargetSymbol, 0};
+  Value.PatchSize = 8;
+  ASSERT_TRUE(Graph.addRelocation(Value));
+  const_cast<std::vector<Relocation> &>(Graph.relocations())[0].PatchSize = 1;
+  auto Result = Graph.validate();
+  ASSERT_FALSE(Result);
+  EXPECT_EQ(Result.error().Message, "invalid relocation patch size");
 }
 
 TEST(LinkGraphTest, RejectsOverlappingRebasesRegardlessOfOrder) {
@@ -481,8 +582,9 @@ TEST(LinkGraphTest, RejectsPatchOffsetsOutsideSectionContent) {
   auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
   ASSERT_TRUE(TargetSymbol);
 
-  auto RelocationResult =
-      Graph.addRelocation(Relocation{*Text, 1, 42, *TargetSymbol, 0});
+  Relocation Outside{*Text, 1, 42, *TargetSymbol, 0};
+  Outside.PatchSize = 4;
+  auto RelocationResult = Graph.addRelocation(Outside);
   ASSERT_FALSE(RelocationResult);
   EXPECT_EQ(RelocationResult.error().Offset, 1U);
   EXPECT_EQ(RelocationResult.error().Message,
@@ -497,13 +599,15 @@ TEST(LinkGraphTest, RejectsPatchOffsetsOutsideSectionContent) {
 TEST(LinkGraphTest, ProvidesCheckedMutableGraphAccess) {
   LinkGraph Graph(Target::X86_64, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("input.o"));
-  auto Text =
-      Graph.addSection(Section{".text", SectionKind::Text, 1, 2, 0, 0, {0, 0}});
+  auto Text = Graph.addSection(
+      Section{".text", SectionKind::Text, 1, 5, 0, 0, {0, 0, 0, 0, 0}});
   ASSERT_TRUE(Text);
   auto TargetSymbol = Graph.addSymbol(Symbol{"target", *Text, 0, 1, false});
   ASSERT_TRUE(TargetSymbol);
-  ASSERT_TRUE(Graph.addRelocation(Relocation{*Text, 0, 42, *TargetSymbol, 0}));
-  ASSERT_TRUE(Graph.addRebase(Rebase{*Text, 1, 7, 0}));
+  Relocation Mutable{*Text, 0, 42, *TargetSymbol, 0};
+  Mutable.PatchSize = 4;
+  ASSERT_TRUE(Graph.addRelocation(Mutable));
+  ASSERT_TRUE(Graph.addRebase(Rebase{*Text, 4, 7, 0}));
 
   ASSERT_TRUE(Graph.setSectionAddress(*Text, 64));
   ASSERT_TRUE(Graph.setSectionFileOffset(*Text, 32));
@@ -551,13 +655,14 @@ TEST(LinkGraphTest, ValidatesMutatedPatchOffsets) {
   LinkGraph RelocationGraph(Target::X86_64, Endianness::Little);
   ASSERT_TRUE(RelocationGraph.beginInput("input.o"));
   auto Text = RelocationGraph.addSection(
-      Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}});
+      Section{".text", SectionKind::Text, 1, 4, 0, 0, {0, 0, 0, 0}});
   ASSERT_TRUE(Text);
   auto TargetSymbol =
       RelocationGraph.addSymbol(Symbol{"target", *Text, 0, 1, false});
   ASSERT_TRUE(TargetSymbol);
-  ASSERT_TRUE(RelocationGraph.addRelocation(
-      Relocation{*Text, 0, 42, *TargetSymbol, 0}));
+  Relocation Mutable{*Text, 0, 42, *TargetSymbol, 0};
+  Mutable.PatchSize = 4;
+  ASSERT_TRUE(RelocationGraph.addRelocation(Mutable));
   const_cast<std::vector<Relocation> &>(RelocationGraph.relocations())[0]
       .Offset = 1;
   auto RelocationResult = RelocationGraph.validate();
@@ -988,7 +1093,7 @@ TEST(RelocationTest, RejectsBigEndianX86_64WithoutMutation) {
       Graph.addSymbol(Symbol{"target", *DataSection, 0, 8, false});
   ASSERT_TRUE(TargetSymbol);
   ASSERT_TRUE(Graph.addRelocation(Relocation{*DataSection, 0, 1, *TargetSymbol,
-                                             0, false, ObjectFormat::ELF}));
+                                             0, false, ObjectFormat::ELF, 8}));
   const auto Content = Graph.sections()[0].Content;
   EXPECT_FALSE(applyRelocations(Graph));
   EXPECT_EQ(Graph.sections()[0].Content, Content);
@@ -1120,10 +1225,14 @@ TEST(RelocationTest, RejectsInvalidGraphUnsupportedTargetTypeAndFormat) {
   ASSERT_TRUE(UnsupportedTarget.beginInput("input.o"));
   EXPECT_FALSE(applyRelocations(UnsupportedTarget));
 
-  auto UnsupportedType = makeRelocationGraph(0xFFFF, 0);
+  auto UnsupportedType = makeRelocationGraph(2, 0);
+  auto &UnsupportedTypeValue =
+      const_cast<std::vector<Relocation> &>(UnsupportedType.relocations())[0];
+  UnsupportedTypeValue.Type = 0xFFFF;
   EXPECT_FALSE(applyRelocations(UnsupportedType));
-  auto UnsupportedFormat =
-      makeRelocationGraph(2, -4, false, 0x1100, 0x1000, ObjectFormat::COFF);
+  auto UnsupportedFormat = makeRelocationGraph(2, -4);
+  const_cast<std::vector<Relocation> &>(UnsupportedFormat.relocations())[0]
+      .Format = ObjectFormat::COFF;
   EXPECT_FALSE(applyRelocations(UnsupportedFormat));
 }
 
@@ -1202,9 +1311,34 @@ TEST(RelocationTest, RelaxesExactGotpcrelxIndirectCallAndJump) {
   }
 }
 
-TEST(RelocationTest, RejectsGotpcrelxIndirectBranchAboveUint32) {
-  auto Graph = makeRelocationGraph(41, -4, false, UINT64_C(0x100000100),
-                                   UINT64_C(0x100000000));
+TEST(RelocationTest, RelaxesGotpcrelxIndirectBranchesAboveFourGiB) {
+  struct Case {
+    WasmEdge::Byte ModRM;
+    std::array<WasmEdge::Byte, 6> Expected;
+  };
+  const std::array<Case, 2> Cases{{
+      {0x15, {0x67, 0xE8, 0xFA, 0x00, 0x00, 0x00}},
+      {0x25, {0xE9, 0xFB, 0x00, 0x00, 0x00, 0x90}},
+  }};
+  for (const auto &Test : Cases) {
+    auto Graph = makeRelocationGraph(41, -4, false, UINT64_C(0x100000100),
+                                     UINT64_C(0x100000000));
+    auto Content = Graph.sectionContent(0);
+    ASSERT_TRUE(Content);
+    (*Content)[0] = 0xFF;
+    (*Content)[1] = Test.ModRM;
+    auto &RelocationValue =
+        const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
+    RelocationValue.Offset = 2;
+    RelocationValue.PatchSize = 4;
+    ASSERT_TRUE(applyRelocations(Graph));
+    EXPECT_TRUE(std::equal(Test.Expected.begin(), Test.Expected.end(),
+                           Graph.sections()[0].Content.begin()));
+  }
+}
+
+TEST(RelocationTest, RejectsGotpcrelxIndirectBranchDisplacementOverflow) {
+  auto Graph = makeRelocationGraph(41, -4, false, UINT64_C(0x80001007), 0x1000);
   auto Content = Graph.sectionContent(0);
   ASSERT_TRUE(Content);
   (*Content)[0] = 0xFF;

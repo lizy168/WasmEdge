@@ -625,10 +625,17 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       if (!Metadata) {
         return fail<LinkGraph>("malformed relocation metadata");
       }
+      const auto PatchSize =
+          relocationPatchSize(objectFormat(Object), *ActualTarget,
+                              static_cast<uint32_t>(InputRelocation.getType()),
+                              Metadata->PatchSize);
+      if (!PatchSize) {
+        return fail<LinkGraph>("unsupported relocation patch size");
+      }
       auto Added = Graph.addRelocation(Relocation{
           Section->second, InputRelocation.getOffset(),
           static_cast<uint32_t>(InputRelocation.getType()), Symbol->second,
-          Addend, Implicit, objectFormat(Object), Metadata->PatchSize,
+          Addend, Implicit, objectFormat(Object), *PatchSize,
           Metadata->PCRelative, Metadata->External, Metadata->Scattered});
       if (!Added) {
         return fail<LinkGraph>(Added.error().Message);

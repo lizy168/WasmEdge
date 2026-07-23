@@ -39,6 +39,38 @@ LinkExpect<void> relocated() {
 
 } // namespace
 
+std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
+                                           Target TargetValue, uint32_t Type,
+                                           uint8_t MetadataSize) noexcept {
+  if (TargetValue == Target::X86_64) {
+    if (Format == ObjectFormat::ELF) {
+      switch (Type) {
+      case 1:
+        return 8;
+      case 2:
+      case 4:
+      case 41:
+      case 42:
+        return 4;
+      default:
+        return std::nullopt;
+      }
+    }
+    if (Format == ObjectFormat::MachO && Type == 1) {
+      return 4;
+    }
+    if (Format == ObjectFormat::COFF && Type == 4) {
+      return 4;
+    }
+    return std::nullopt;
+  }
+  if (MetadataSize == 1 || MetadataSize == 2 || MetadataSize == 4 ||
+      MetadataSize == 8) {
+    return MetadataSize;
+  }
+  return std::nullopt;
+}
+
 LinkExpect<void> LinkGraph::beginInput(std::string_view Name) {
   if (RelocationsApplied) {
     return relocated();
@@ -131,6 +163,24 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
   }
   if (Value.Symbol >= Symbols.size()) {
     Diagnostic Diag{"invalid symbol ID"};
+    Diag.Section = Value.Section;
+    Diag.Symbol = Value.Symbol;
+    Diag.RelocationType = Value.Type;
+    Diag.Offset = Value.Offset;
+    return fail<void>(std::move(Diag));
+  }
+  const auto Canonical = relocationPatchSize(Value.Format, TargetValue,
+                                             Value.Type, Value.PatchSize);
+  if (!Canonical) {
+    Diagnostic Diag{"unsupported relocation patch size"};
+    Diag.Section = Value.Section;
+    Diag.Symbol = Value.Symbol;
+    Diag.RelocationType = Value.Type;
+    Diag.Offset = Value.Offset;
+    return fail<void>(std::move(Diag));
+  }
+  if (*Canonical != Value.PatchSize) {
+    Diagnostic Diag{"invalid relocation patch size"};
     Diag.Section = Value.Section;
     Diag.Symbol = Value.Symbol;
     Diag.RelocationType = Value.Type;
@@ -248,6 +298,17 @@ LinkExpect<void> LinkGraph::validate() const {
     }
     if (Value.Symbol >= Symbols.size()) {
       Diagnostic Diag{"invalid symbol ID"};
+      Diag.Section = Value.Section;
+      Diag.Symbol = Value.Symbol;
+      Diag.RelocationType = Value.Type;
+      Diag.Offset = Value.Offset;
+      return fail<void>(std::move(Diag));
+    }
+    const auto Canonical = relocationPatchSize(Value.Format, TargetValue,
+                                               Value.Type, Value.PatchSize);
+    if (!Canonical || *Canonical != Value.PatchSize) {
+      Diagnostic Diag{Canonical ? "invalid relocation patch size"
+                                : "unsupported relocation patch size"};
       Diag.Section = Value.Section;
       Diag.Symbol = Value.Symbol;
       Diag.RelocationType = Value.Type;
