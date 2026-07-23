@@ -58,8 +58,7 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
   }
   Result.Rebases = Graph.rebases();
   for (const auto &Rel : Graph.relocations()) {
-    if (Rel.Format != ObjectFormat::ELF ||
-        (Rel.Offset & InstructionAlignmentMask) != 0) {
+    if (Rel.Format != ObjectFormat::ELF) {
       return fail(Rel, "invalid relocation field");
     }
     auto &Bytes = Result.Content[Rel.Section];
@@ -83,6 +82,17 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
                                       Rel.Addend, DoubleWordWidth});
       continue;
     }
+    if (Rel.Type == llvm::ELF::R_AARCH64_PREL64) {
+      constexpr uint8_t DoubleWordWidth = 8;
+      constexpr unsigned DoubleWordBits = 64;
+      const int128_t Value = S - P;
+      if (!signedBits(Value, DoubleWordBits) ||
+          !writeSigned(Bytes, Rel.Offset, DoubleWordWidth, Endianness::Little,
+                       static_cast<int64_t>(Value))) {
+        return fail(Rel, "PREL64 relocation overflows");
+      }
+      continue;
+    }
     if (Rel.Type == llvm::ELF::R_AARCH64_PREL32) {
       constexpr unsigned WordBits = 32;
       const int128_t Value = S - P;
@@ -92,6 +102,9 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
         return fail(Rel, "PREL32 relocation overflows");
       }
       continue;
+    }
+    if ((Rel.Offset & InstructionAlignmentMask) != 0) {
+      return fail(Rel, "invalid relocation field");
     }
     auto Word =
         readUnsigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little);

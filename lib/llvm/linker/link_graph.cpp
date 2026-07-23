@@ -95,6 +95,7 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
   if (TargetValue == Target::AArch64) {
     switch (Type) {
     case llvm::ELF::R_AARCH64_ABS64:
+    case llvm::ELF::R_AARCH64_PREL64:
       return DoubleWordPatch;
     case llvm::ELF::R_AARCH64_PREL32:
     case llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21:

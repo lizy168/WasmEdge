@@ -48,12 +48,84 @@ namespace {
 
 using namespace WasmEdge::LLVM::Linker;
 
+std::optional<uint8_t> expectedELFPatchWidth(Target Architecture,
+                                             uint32_t Type) {
+  constexpr uint8_t NoBytes = 0;
+  constexpr uint8_t WordBytes = 4;
+  constexpr uint8_t DoubleWordBytes = 8;
+  switch (Architecture) {
+  case Target::ARM:
+    switch (Type) {
+    case llvm::ELF::R_ARM_NONE:
+      return NoBytes;
+    case llvm::ELF::R_ARM_ABS32:
+    case llvm::ELF::R_ARM_REL32:
+    case llvm::ELF::R_ARM_THM_CALL:
+    case llvm::ELF::R_ARM_CALL:
+    case llvm::ELF::R_ARM_JUMP24:
+    case llvm::ELF::R_ARM_PREL31:
+      return WordBytes;
+    default:
+      return std::nullopt;
+    }
+  case Target::AArch64:
+    switch (Type) {
+    case llvm::ELF::R_AARCH64_ABS64:
+    case llvm::ELF::R_AARCH64_PREL64:
+      return DoubleWordBytes;
+    case llvm::ELF::R_AARCH64_PREL32:
+    case llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21:
+    case llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST8_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_JUMP26:
+    case llvm::ELF::R_AARCH64_CALL26:
+    case llvm::ELF::R_AARCH64_LDST16_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST32_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST64_ABS_LO12_NC:
+    case llvm::ELF::R_AARCH64_LDST128_ABS_LO12_NC:
+      return WordBytes;
+    default:
+      return std::nullopt;
+    }
+  case Target::RISCV64:
+    switch (Type) {
+    case llvm::ELF::R_RISCV_64:
+    case llvm::ELF::R_RISCV_CALL:
+    case llvm::ELF::R_RISCV_CALL_PLT:
+      return DoubleWordBytes;
+    case llvm::ELF::R_RISCV_PCREL_HI20:
+    case llvm::ELF::R_RISCV_PCREL_LO12_I:
+    case llvm::ELF::R_RISCV_PCREL_LO12_S:
+    case llvm::ELF::R_RISCV_32_PCREL:
+      return WordBytes;
+    case llvm::ELF::R_RISCV_RELAX:
+      return NoBytes;
+    default:
+      return std::nullopt;
+    }
+  case Target::S390X:
+    switch (Type) {
+    case llvm::ELF::R_390_64:
+      return DoubleWordBytes;
+    case llvm::ELF::R_390_PC32:
+    case llvm::ELF::R_390_PC32DBL:
+    case llvm::ELF::R_390_PLT32DBL:
+      return WordBytes;
+    default:
+      return std::nullopt;
+    }
+  default:
+    return std::nullopt;
+  }
+}
+
 std::vector<WasmEdge::Byte> makeObject(
     const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
     std::string FunctionName = "f0", std::string Directives = {},
     bool Hidden = false, bool HiddenData = false, std::string CPU = "generic",
     std::string Features = {}, bool UnwindTable = false, bool Optimize = false,
-    bool Interruptible = false, bool Atomic = false) {
+    bool Interruptible = false, bool Atomic = false,
+    bool Representative = false, bool Exceptions = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -82,13 +154,13 @@ std::vector<WasmEdge::Byte> makeObject(
   if (Machine == nullptr) {
     return {};
   }
-  if (Optimize) {
 #if LLVM_VERSION_MAJOR >= 18
-    Machine->setOptLevel(llvm::CodeGenOptLevel::Aggressive);
+  Machine->setOptLevel(Optimize ? llvm::CodeGenOptLevel::Default
+                                : llvm::CodeGenOptLevel::None);
 #else
-    Machine->setOptLevel(llvm::CodeGenOpt::Aggressive);
+  Machine->setOptLevel(Optimize ? llvm::CodeGenOpt::Default
+                                : llvm::CodeGenOpt::None);
 #endif
-  }
 
   llvm::LLVMContext Context;
   llvm::Module Module("object-reader-test", Context);
@@ -131,6 +203,49 @@ std::vector<WasmEdge::Byte> makeObject(
     Loaded->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
     Loaded->setAlignment(llvm::Align(4));
   }
+  llvm::Value *Result = Loaded;
+  if (Representative) {
+    constexpr uint64_t LinearMemorySize = 64;
+    constexpr unsigned VectorLanes = 4;
+    auto *MemoryType =
+        llvm::ArrayType::get(llvm::Type::getInt8Ty(Context), LinearMemorySize);
+    auto *Memory = new llvm::GlobalVariable(
+        Module, MemoryType, false, llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantAggregateZero::get(MemoryType), "memory");
+    Memory->setAlignment(llvm::Align(16));
+    auto *MemoryAddress = Builder.CreateInBoundsGEP(
+        MemoryType, Memory,
+        {llvm::ConstantInt::get(I32, 0), llvm::ConstantInt::get(I32, 8)});
+    auto *MemoryValue =
+        Builder.CreateLoad(llvm::Type::getInt8Ty(Context), MemoryAddress, true);
+    Builder.CreateStore(MemoryValue, MemoryAddress, true);
+
+    auto *VectorType = llvm::VectorType::get(I32, VectorLanes, false);
+    auto *Vector = new llvm::GlobalVariable(
+        Module, VectorType, false, llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantAggregateZero::get(VectorType), "vector");
+    Vector->setAlignment(llvm::Align(16));
+    auto *VectorValue = Builder.CreateLoad(VectorType, Vector, true);
+    auto *VectorResult = Builder.CreateAdd(VectorValue, VectorValue);
+    Builder.CreateStore(VectorResult, Vector, true);
+
+    auto *Direct = llvm::Function::Create(llvm::FunctionType::get(I32, false),
+                                          llvm::GlobalValue::InternalLinkage,
+                                          "direct", Module);
+    Direct->addFnAttr(llvm::Attribute::NoUnwind);
+    Direct->addFnAttr(llvm::Attribute::NoInline);
+    Direct->setSection(".text.direct");
+    llvm::IRBuilder<> DirectBuilder(
+        llvm::BasicBlock::Create(Context, "entry", Direct));
+    DirectBuilder.CreateRet(llvm::ConstantInt::get(I32, 3));
+    auto *Table = new llvm::GlobalVariable(Module, Direct->getType(), true,
+                                           llvm::GlobalValue::InternalLinkage,
+                                           Direct, "table");
+    auto *Indirect = Builder.CreateLoad(Direct->getType(), Table, true);
+    Result = Builder.CreateAdd(Result, Builder.CreateCall(Direct));
+    Result = Builder.CreateAdd(
+        Result, Builder.CreateCall(Direct->getFunctionType(), Indirect));
+  }
   if (Interruptible) {
     auto *Poll = llvm::Function::Create(
         llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false),
@@ -142,7 +257,42 @@ std::vector<WasmEdge::Byte> makeObject(
     PollBuilder.CreateRetVoid();
     Builder.CreateCall(Poll);
   }
-  Builder.CreateRet(Loaded);
+  if (Exceptions) {
+    F0->removeFnAttr(llvm::Attribute::NoUnwind);
+    auto *PersonalityType = llvm::FunctionType::get(I32, true);
+    auto *Personality = llvm::Function::Create(
+        PersonalityType, llvm::GlobalValue::InternalLinkage, "personality",
+        Module);
+    llvm::IRBuilder<> PersonalityBuilder(
+        llvm::BasicBlock::Create(Context, "entry", Personality));
+    PersonalityBuilder.CreateRet(llvm::ConstantInt::get(I32, 0));
+    F0->setPersonalityFn(Personality);
+    auto *MayThrow = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false),
+        llvm::GlobalValue::InternalLinkage, "may_throw", Module);
+    MayThrow->addFnAttr(llvm::Attribute::NoInline);
+    llvm::IRBuilder<> ThrowBuilder(
+        llvm::BasicBlock::Create(Context, "entry", MayThrow));
+    ThrowBuilder.CreateStore(llvm::ConstantInt::get(I32, 1), Value, true);
+    ThrowBuilder.CreateRetVoid();
+    auto *Normal = llvm::BasicBlock::Create(Context, "normal", F0);
+    auto *Unwind = llvm::BasicBlock::Create(Context, "unwind", F0);
+    Builder.CreateInvoke(MayThrow, Normal, Unwind);
+    Builder.SetInsertPoint(Normal);
+    Builder.CreateRet(Result);
+    Builder.SetInsertPoint(Unwind);
+    auto *LandingPadType = llvm::StructType::get(
+#if LLVM_VERSION_MAJOR >= 15
+        llvm::PointerType::getUnqual(Context), I32);
+#else
+        llvm::Type::getInt8PtrTy(Context), I32);
+#endif
+    auto *LandingPad = Builder.CreateLandingPad(LandingPadType, 0);
+    LandingPad->setCleanup(true);
+    Builder.CreateRet(Result);
+  } else {
+    Builder.CreateRet(Result);
+  }
   if (!Directives.empty()) {
     Module.setModuleInlineAsm(".section .drectve\n.ascii \" " + Directives +
                               "\"");
@@ -2105,35 +2255,43 @@ TEST(RelocationTest, ReadsAndRelocatesGeneratedLinuxObjectsForEveryTarget) {
        Target::ARM,
        "cortex-a8",
        "",
-       {llvm::ELF::R_ARM_REL32, llvm::ELF::R_ARM_CALL,
+       {llvm::ELF::R_ARM_ABS32, llvm::ELF::R_ARM_REL32, llvm::ELF::R_ARM_CALL,
         llvm::ELF::R_ARM_PREL31}},
       {"aarch64-unknown-linux-gnu",
        Target::AArch64,
        "cortex-a53",
        "",
-       {llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21,
-        llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC, llvm::ELF::R_AARCH64_CALL26}},
+       {llvm::ELF::R_AARCH64_ABS64, llvm::ELF::R_AARCH64_PREL64,
+        llvm::ELF::R_AARCH64_PREL32, llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21,
+        llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC,
+        llvm::ELF::R_AARCH64_LDST8_ABS_LO12_NC, llvm::ELF::R_AARCH64_CALL26,
+        llvm::ELF::R_AARCH64_LDST32_ABS_LO12_NC,
+        llvm::ELF::R_AARCH64_LDST64_ABS_LO12_NC,
+        llvm::ELF::R_AARCH64_LDST128_ABS_LO12_NC}},
       {"riscv64-unknown-linux-gnu",
        Target::RISCV64,
        "generic-rv64",
        "+a",
-       {llvm::ELF::R_RISCV_CALL_PLT, llvm::ELF::R_RISCV_PCREL_HI20,
-        llvm::ELF::R_RISCV_PCREL_LO12_I}},
+       {llvm::ELF::R_RISCV_64, llvm::ELF::R_RISCV_CALL_PLT,
+        llvm::ELF::R_RISCV_PCREL_HI20, llvm::ELF::R_RISCV_PCREL_LO12_I,
+        llvm::ELF::R_RISCV_PCREL_LO12_S, llvm::ELF::R_RISCV_32_PCREL}},
       {"s390x-unknown-linux-gnu",
        Target::S390X,
        "z13",
        "",
-       {llvm::ELF::R_390_PC32DBL, llvm::ELF::R_390_PLT32DBL}},
+       {llvm::ELF::R_390_PC32, llvm::ELF::R_390_PC32DBL,
+        llvm::ELF::R_390_PLT32DBL, llvm::ELF::R_390_64}},
   }};
   for (const auto &Test : Cases) {
     std::set<uint64_t> GeneratedTypes;
     for (const bool Optimize : {false, true}) {
       for (const bool Tuned : {false, true}) {
         for (const bool Interruptible : {false, true}) {
-          const auto ObjectBytes =
-              makeObject(llvm::Triple(Test.Triple), false, false, "f0", {},
-                         true, true, Tuned ? Test.TunedCPU : "generic",
-                         Test.Features, false, Optimize, Interruptible, true);
+          const bool Exceptions = Test.Architecture != Target::ARM;
+          const auto ObjectBytes = makeObject(
+              llvm::Triple(Test.Triple), false, false, "representative", {},
+              true, true, Tuned ? Test.TunedCPU : "generic", Test.Features,
+              false, Optimize, Interruptible, true, true, Exceptions);
           auto Object =
               llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
                   llvm::StringRef(
@@ -2144,18 +2302,30 @@ TEST(RelocationTest, ReadsAndRelocatesGeneratedLinuxObjectsForEveryTarget) {
           for (const auto &Section : (*Object)->sections()) {
             for (const auto &Relocation : Section.relocations()) {
               GeneratedTypes.insert(Relocation.getType());
-              ASSERT_TRUE(relocationPatchSize(ObjectFormat::ELF,
-                                              Test.Architecture,
-                                              Relocation.getType(), 1))
+              ASSERT_TRUE(expectedELFPatchWidth(Test.Architecture,
+                                                Relocation.getType()))
                   << Test.Triple << " relocation " << Relocation.getType();
             }
           }
           auto Graph = ObjectReader::read(ObjectBytes, Test.Architecture);
           ASSERT_TRUE(Graph) << Test.Triple;
+          for (const std::string_view Name :
+               {"memory", "vector", "table", "direct"}) {
+            EXPECT_TRUE(std::any_of(
+                Graph->symbols().begin(), Graph->symbols().end(),
+                [&](const auto &Value) { return Value.Name == Name; }))
+                << Test.Triple << " missing representative " << Name;
+          }
+          if (Exceptions) {
+            EXPECT_TRUE(std::any_of(Graph->sections().begin(),
+                                    Graph->sections().end(),
+                                    [](const auto &Value) {
+                                      return Value.Kind == SectionKind::Unwind;
+                                    }))
+                << Test.Triple << " missing landingpad unwind data";
+          }
           for (const auto &Relocation : Graph->relocations()) {
-            EXPECT_EQ(relocationPatchSize(Relocation.Format, Test.Architecture,
-                                          Relocation.Type,
-                                          Relocation.PatchSize),
+            EXPECT_EQ(expectedELFPatchWidth(Test.Architecture, Relocation.Type),
                       Relocation.PatchSize);
           }
           ASSERT_TRUE(layout(*Graph, 0x1000)) << Test.Triple;
@@ -2172,19 +2342,61 @@ TEST(RelocationTest, ReadsAndRelocatesGeneratedLinuxObjectsForEveryTarget) {
   }
 }
 
-TEST(RelocationTest, RejectsUnsupportedGeneratedRelocationAtomically) {
-  auto Graph =
-      ObjectReader::read(makeObject(llvm::Triple("aarch64-unknown-linux-gnu"),
-                                    false, false, "f0", {}, true, true),
-                         Target::AArch64);
-  ASSERT_TRUE(Graph);
-  ASSERT_FALSE(Graph->relocations().empty());
-  ASSERT_TRUE(layout(*Graph, 0x1000));
-  const_cast<std::vector<Relocation> &>(Graph->relocations())[0].Type =
-      UINT32_MAX;
-  const auto Snapshot = *Graph;
-  EXPECT_FALSE(applyRelocations(*Graph));
-  expectGraphStateEquals(*Graph, Snapshot);
+TEST(RelocationTest, RejectsFailingGeneratedRelocationAtomically) {
+  struct Case {
+    const char *Triple;
+    Target Architecture;
+    Endianness WrongEndian;
+    uint32_t AbsoluteType;
+    uint8_t Width;
+    const char *Features;
+  };
+  constexpr uint8_t WordBytes = 4;
+  constexpr uint8_t DoubleWordBytes = 8;
+  const std::array<Case, 4> Cases{{
+      {"armv7-unknown-linux-gnueabihf", Target::ARM, Endianness::Big,
+       llvm::ELF::R_ARM_ABS32, WordBytes, ""},
+      {"aarch64-unknown-linux-gnu", Target::AArch64, Endianness::Big,
+       llvm::ELF::R_AARCH64_ABS64, DoubleWordBytes, ""},
+      {"riscv64-unknown-linux-gnu", Target::RISCV64, Endianness::Big,
+       llvm::ELF::R_RISCV_64, DoubleWordBytes, "+a"},
+      {"s390x-unknown-linux-gnu", Target::S390X, Endianness::Little,
+       llvm::ELF::R_390_64, DoubleWordBytes, ""},
+  }};
+  for (const auto &Test : Cases) {
+    const auto ObjectBytes =
+        makeObject(llvm::Triple(Test.Triple), false, false, "representative",
+                   {}, true, true, "generic", Test.Features, false, false, true,
+                   true, true, Test.Architecture != Target::ARM);
+    auto Graph = ObjectReader::read(ObjectBytes, Test.Architecture);
+    ASSERT_TRUE(Graph) << Test.Triple;
+    ASSERT_TRUE(layout(*Graph, 0x1000));
+    auto Patch = Graph->addSection(
+        Section{".failure", SectionKind::Data, Test.Width, Test.Width, 0, 0,
+                std::vector<WasmEdge::Byte>(Test.Width)});
+    auto TargetSection = Graph->addSection(
+        Section{".failure.target", SectionKind::Data, 1, 0, UINT64_MAX});
+    ASSERT_TRUE(Patch && TargetSection);
+    auto TargetSymbol =
+        Graph->addSymbol(Symbol{"failure.target", *TargetSection, 0, 0, false});
+    ASSERT_TRUE(TargetSymbol);
+    ASSERT_TRUE(Graph->addRelocation(
+        Relocation{*Patch, 0, Test.AbsoluteType, *TargetSymbol, 1, false,
+                   ObjectFormat::ELF, Test.Width}));
+    const auto Snapshot = *Graph;
+    EXPECT_FALSE(applyRelocations(*Graph)) << Test.Triple;
+    expectGraphStateEquals(*Graph, Snapshot);
+
+    LinkGraph WrongEndianGraph(Test.Architecture, Test.WrongEndian);
+    ASSERT_TRUE(WrongEndianGraph.beginInput("wrong-endian.o"));
+    const auto WrongEndianSnapshot = WrongEndianGraph;
+    EXPECT_FALSE(applyRelocations(WrongEndianGraph)) << Test.Triple;
+    expectGraphStateEquals(WrongEndianGraph, WrongEndianSnapshot);
+
+    const auto Mismatch =
+        Test.Architecture == Target::ARM ? Target::AArch64 : Target::ARM;
+    EXPECT_FALSE(ObjectReader::read(ObjectBytes, Mismatch)) << Test.Triple;
+  }
 }
 
 TEST(RelocationTest, AppliesGeneratedELF64PC32AndPLT32RelocationsExactly) {

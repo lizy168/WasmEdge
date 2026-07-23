@@ -32,7 +32,7 @@ bool signedBits(int128_t Value, unsigned Bits) {
 } // namespace
 
 Expect<RelocationResult> applyS390X(const LinkGraph &Graph) {
-  constexpr uint8_t HalfWordAlignment = 2;
+  constexpr uint8_t HalfWordScale = 2;
   constexpr uint8_t WordWidth = 4;
   constexpr unsigned WordBits = 32;
   RelocationResult Result;
@@ -41,8 +41,7 @@ Expect<RelocationResult> applyS390X(const LinkGraph &Graph) {
   }
   Result.Rebases = Graph.rebases();
   for (const auto &Rel : Graph.relocations()) {
-    if (Rel.Format != ObjectFormat::ELF ||
-        (Rel.Offset & (HalfWordAlignment - 1)) != 0) {
+    if (Rel.Format != ObjectFormat::ELF) {
       return fail(Rel, "invalid relocation field");
     }
     auto &Bytes = Result.Content[Rel.Section];
@@ -69,10 +68,10 @@ Expect<RelocationResult> applyS390X(const LinkGraph &Graph) {
     int128_t Value = S - P;
     if (Rel.Type == llvm::ELF::R_390_PC32DBL ||
         Rel.Type == llvm::ELF::R_390_PLT32DBL) {
-      if ((Value & (HalfWordAlignment - 1)) != 0) {
+      if ((Value & (HalfWordScale - 1)) != 0) {
         return fail(Rel, "doubled displacement is not even");
       }
-      Value /= HalfWordAlignment;
+      Value /= HalfWordScale;
     } else if (Rel.Type != llvm::ELF::R_390_PC32) {
       return fail(Rel, "unsupported s390x relocation type");
     }

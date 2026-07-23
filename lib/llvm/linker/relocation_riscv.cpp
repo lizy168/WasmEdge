@@ -48,9 +48,7 @@ Expect<RelocationResult> applyRISCV(const LinkGraph &Graph) {
   Result.Rebases = Graph.rebases();
   std::map<std::pair<SectionId, uint64_t>, int128_t> HighValues;
   for (const auto &Rel : Graph.relocations()) {
-    if (Rel.Format != ObjectFormat::ELF ||
-        (Rel.PatchSize != NoPatch &&
-         (Rel.Offset & InstructionAlignmentMask) != 0)) {
+    if (Rel.Format != ObjectFormat::ELF) {
       return fail(Rel, "invalid relocation field");
     }
     if (Rel.Type == llvm::ELF::R_RISCV_RELAX) {
@@ -85,6 +83,9 @@ Expect<RelocationResult> applyRISCV(const LinkGraph &Graph) {
         return fail(Rel, "32_PCREL relocation overflows");
       }
       continue;
+    }
+    if ((Rel.Offset & InstructionAlignmentMask) != 0) {
+      return fail(Rel, "invalid relocation field");
     }
     auto Word =
         readUnsigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little);
