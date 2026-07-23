@@ -51,7 +51,10 @@ Expect<RelocationResult> applyARM(const LinkGraph &Graph) {
     auto &Bytes = Result.Content[Rel.Section];
     auto Word =
         readUnsigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little);
-    if (!Word || (Rel.Offset & InstructionAlignmentMask) != 0) {
+    const bool ThumbBranch = Rel.Type == llvm::ELF::R_ARM_THM_CALL;
+    const uint64_t AlignmentMask =
+        ThumbBranch ? UINT64_C(1) : InstructionAlignmentMask;
+    if (!Word || (Rel.Offset & AlignmentMask) != 0) {
       return fail(Rel, "invalid relocation field");
     }
     const auto &Symbol = Graph.symbols()[Rel.Symbol];
@@ -61,7 +64,7 @@ Expect<RelocationResult> applyARM(const LinkGraph &Graph) {
         int128_t(Graph.sections()[Rel.Section].Address) + Rel.Offset;
     int64_t Addend = Rel.Addend;
     if (Rel.AddendIsImplicit && Rel.Type != llvm::ELF::R_ARM_PREL31 &&
-        Rel.Type != llvm::ELF::R_ARM_CALL &&
+        Rel.Type != llvm::ELF::R_ARM_CALL && !ThumbBranch &&
         Rel.Type != llvm::ELF::R_ARM_JUMP24) {
       auto Value =
           readSigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little);
@@ -90,6 +93,67 @@ Expect<RelocationResult> applyARM(const LinkGraph &Graph) {
           !writeSigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little,
                        static_cast<int64_t>(Value))) {
         return fail(Rel, "relative relocation overflows");
+      }
+    } else if (ThumbBranch) {
+      constexpr unsigned BranchDisplacementBits = 25;
+      constexpr unsigned BranchImmediateShift = 1;
+      constexpr uint16_t FirstOpcodeMask = UINT16_C(0xF800);
+      constexpr uint16_t FirstOpcode = UINT16_C(0xF000);
+      constexpr uint16_t SecondOpcodeMask = UINT16_C(0xD000);
+      constexpr uint16_t SecondCallOpcode = UINT16_C(0xD000);
+      constexpr uint16_t SignMask = UINT16_C(0x0400);
+      constexpr uint16_t Imm10Mask = UINT16_C(0x03FF);
+      constexpr uint16_t J1Mask = UINT16_C(0x2000);
+      constexpr uint16_t J2Mask = UINT16_C(0x0800);
+      constexpr uint16_t Imm11Mask = UINT16_C(0x07FF);
+      constexpr unsigned SignShift = 24;
+      constexpr unsigned I1Shift = 23;
+      constexpr unsigned I2Shift = 22;
+      constexpr unsigned Imm10Shift = 12;
+      constexpr unsigned J1Shift = 13;
+      constexpr unsigned J2Shift = 11;
+      const uint16_t First = static_cast<uint16_t>(*Word);
+      const uint16_t Second = static_cast<uint16_t>(*Word >> 16);
+      if ((First & FirstOpcodeMask) != FirstOpcode ||
+          (Second & SecondOpcodeMask) != SecondCallOpcode) {
+        return fail(Rel, "invalid Thumb branch instruction");
+      }
+      if (Rel.AddendIsImplicit) {
+        const uint32_t SBit = (First & SignMask) != 0;
+        const uint32_t J1 = (Second & J1Mask) != 0;
+        const uint32_t J2 = (Second & J2Mask) != 0;
+        const uint32_t I1 = !(J1 ^ SBit);
+        const uint32_t I2 = !(J2 ^ SBit);
+        const uint32_t Encoded = (SBit << SignShift) | (I1 << I1Shift) |
+                                 (I2 << I2Shift) |
+                                 ((First & Imm10Mask) << Imm10Shift) |
+                                 ((Second & Imm11Mask) << BranchImmediateShift);
+        Addend = (Encoded & (UINT32_C(1) << SignShift)) != 0
+                     ? static_cast<int64_t>(
+                           static_cast<int32_t>(Encoded | UINT32_C(0xFE000000)))
+                     : static_cast<int64_t>(Encoded);
+      }
+      const int128_t Value = S + Addend - P;
+      if ((Value & 1) != 0 || !signedBits(Value, BranchDisplacementBits)) {
+        return fail(Rel, "Thumb branch displacement overflows");
+      }
+      const uint32_t Encoded = static_cast<uint32_t>(Value);
+      const uint32_t SBit = (Encoded >> SignShift) & 1;
+      const uint32_t I1 = (Encoded >> I1Shift) & 1;
+      const uint32_t I2 = (Encoded >> I2Shift) & 1;
+      const uint32_t J1 = !(I1 ^ SBit);
+      const uint32_t J2 = !(I2 ^ SBit);
+      const uint16_t EncodedFirst = static_cast<uint16_t>(
+          (First & FirstOpcodeMask) | (SBit ? SignMask : 0) |
+          ((Encoded >> Imm10Shift) & Imm10Mask));
+      const uint16_t EncodedSecond = static_cast<uint16_t>(
+          (Second & SecondOpcodeMask) | (J1 << J1Shift) | (J2 << J2Shift) |
+          ((Encoded >> BranchImmediateShift) & Imm11Mask));
+      if (!writeUnsigned(Bytes, Rel.Offset, InstructionWidth,
+                         Endianness::Little,
+                         static_cast<uint32_t>(EncodedFirst) |
+                             (static_cast<uint32_t>(EncodedSecond) << 16))) {
+        return fail(Rel, "cannot encode Thumb branch");
       }
     } else if (Rel.Type == llvm::ELF::R_ARM_CALL ||
                Rel.Type == llvm::ELF::R_ARM_JUMP24) {

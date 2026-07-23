@@ -407,7 +407,8 @@ SectionKind sectionKind(const llvm::object::SectionRef &Section,
   if (Section.isBSS() || Section.isVirtual()) {
     return SectionKind::BSS;
   }
-  if (Name.contains("eh_frame") || Name.contains("unwind") ||
+  if (Name == ".ARM.exidx" || Name.contains("eh_frame") ||
+      Name.contains("unwind") ||
 #if LLVM_VERSION_MAJOR >= 19
       Name.starts_with(".pdata") || Name.starts_with(".xdata")) {
 #else
