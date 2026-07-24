@@ -47,6 +47,13 @@ struct Section {
   uint64_t FileOffset = 0;
   std::vector<Byte> Content{};
   SectionPurpose Purpose = SectionPurpose::Default;
+  uint64_t InputAddress = 0;
+};
+
+struct EHFrameReference {
+  SectionId Section;
+  uint64_t Offset;
+  SymbolId Symbol;
 };
 
 struct Symbol {
@@ -114,6 +121,7 @@ public:
   LinkExpect<SymbolId> addSymbol(Symbol Value);
   LinkExpect<void> addRelocation(Relocation Value);
   LinkExpect<void> addRebase(Rebase Value);
+  LinkExpect<void> addEHFrameReference(EHFrameReference Value);
   LinkExpect<void> validate() const;
   LinkExpect<void> setSectionAddress(SectionId Id, uint64_t Address);
   LinkExpect<void> setSectionFileOffset(SectionId Id, uint64_t FileOffset);
@@ -128,6 +136,9 @@ public:
     return Relocations;
   }
   const std::vector<Rebase> &rebases() const noexcept { return Rebases; }
+  const std::vector<EHFrameReference> &ehFrameReferences() const noexcept {
+    return EHFrameReferences;
+  }
   bool relocationsApplied() const noexcept { return RelocationsApplied; }
 
 private:
@@ -139,9 +150,17 @@ private:
   std::vector<Symbol> Symbols;
   std::vector<Relocation> Relocations;
   std::vector<Rebase> Rebases;
+  std::vector<EHFrameReference> EHFrameReferences;
   bool RelocationsApplied = false;
 
   friend Expect<void> applyRelocations(LinkGraph &);
+  friend Expect<void> normalizeMachOEHFrame(LinkGraph &);
+
+  Span<Section> mutableSectionsForEHFrame() noexcept { return Sections; }
+  Span<Relocation> mutableRelocationsForEHFrame() noexcept {
+    return Relocations;
+  }
+  void removeEHFrameRelocations(Span<const uint8_t> Remove);
 };
 
 } // namespace Linker

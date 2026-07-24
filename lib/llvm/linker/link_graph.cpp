@@ -396,6 +396,15 @@ LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
   return {};
 }
 
+void LinkGraph::removeEHFrameRelocations(Span<const uint8_t> Remove) {
+  size_t Out = 0;
+  for (size_t I = 0; I < Relocations.size(); ++I) {
+    if (!Remove[I])
+      Relocations[Out++] = Relocations[I];
+  }
+  Relocations.resize(Out);
+}
+
 LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
   if (RelocationsApplied) {
     return relocated();
@@ -428,6 +437,15 @@ LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
     return fail<void>(std::move(Diag));
   }
   Rebases.push_back(Value);
+  return {};
+}
+
+LinkExpect<void> LinkGraph::addEHFrameReference(EHFrameReference Value) {
+  if (Value.Section >= Sections.size() || Value.Symbol >= Symbols.size() ||
+      Sections[Value.Section].Purpose != SectionPurpose::EHFrame ||
+      extendsBeyond(Value.Offset, 8, Sections[Value.Section].Content.size()))
+    return fail<void>(Diagnostic{"invalid EH frame reference"});
+  EHFrameReferences.push_back(Value);
   return {};
 }
 

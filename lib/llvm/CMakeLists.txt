@@ -28,6 +28,7 @@ set(WASMEDGE_LLVM_SOURCES
   jit.cpp
   lazyjit.cpp
   linker/layout.cpp
+  linker/eh_frame.cpp
   linker/link_graph.cpp
   linker/native_linker.cpp
   linker/object_reader.cpp

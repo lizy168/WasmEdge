@@ -4,6 +4,7 @@
 #include "linker/native_linker.h"
 
 #include "common/defines.h"
+#include "linker/eh_frame.h"
 #include "linker/layout.h"
 #include "linker/object_reader.h"
 #include "linker/relocation.h"
@@ -106,7 +107,8 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     if (!TargetValue) {
       return Unexpect(ErrCode::Value::AOTNotImpl);
     }
-    EXPECTED_TRY(auto Graph, ObjectReader::read(Object, *TargetValue));
+    EXPECTED_TRY(auto Graph, ObjectReader::read(Object, *TargetValue,
+                                                ObjectReaderPolicy::Universal));
 #if WASMEDGE_OS_MACOS && defined(__aarch64__)
     constexpr uint64_t HostPageSize = 16384;
 #else
@@ -114,6 +116,9 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
 #endif
     if (auto Result = layout(Graph, 0, HostPageSize); !Result) {
       return linkError();
+    }
+    if (Graph.format() == ObjectFormat::MachO) {
+      EXPECTED_TRY(normalizeMachOEHFrame(Graph));
     }
     EXPECTED_TRY(applyRelocations(Graph));
 

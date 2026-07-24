@@ -576,7 +576,8 @@ parseCOFFExports(std::string_view Input) {
 } // namespace Internal
 
 Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
-                                     Target ExpectedTarget) {
+                                     Target ExpectedTarget,
+                                     ObjectReaderPolicy Policy) {
   if (Buffer.empty()) {
     return fail<LinkGraph>("empty object buffer");
   }
@@ -616,6 +617,19 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
   }
   std::map<uint64_t, SectionId> SectionIds;
   std::map<std::string, std::string> COFFExports;
+  bool HasEHFrame = false;
+  bool HasCompactUnwind = false;
+  for (const auto &InputSection : Object.sections()) {
+    llvm::StringRef Name;
+    if (!take(InputSection.getName(), Name, "cannot read section name"))
+      return Unexpect(ErrCode::Value::IllegalPath);
+    const auto Purpose = sectionPurpose(Object, Name);
+    HasEHFrame |= Purpose == SectionPurpose::EHFrame;
+    HasCompactUnwind |= Purpose == SectionPurpose::CompactUnwind;
+  }
+  if (Policy == ObjectReaderPolicy::Universal && Object.isMachO() &&
+      HasCompactUnwind && !HasEHFrame)
+    return fail<LinkGraph>("Mach-O object lacks registered DWARF unwind");
   for (const auto &InputSection : Object.sections()) {
     llvm::StringRef Name;
     if (!take(InputSection.getName(), Name, "cannot read section name")) {
@@ -642,12 +656,23 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     }
     std::vector<Byte> Bytes(Contents.bytes_begin(), Contents.bytes_end());
     const auto Purpose = sectionPurpose(Object, Name);
-    if (Purpose == SectionPurpose::CompactUnwind)
+    if (Policy == ObjectReaderPolicy::Universal &&
+        Purpose == SectionPurpose::CompactUnwind)
       continue;
+    constexpr uint64_t EHFrameTerminatorSize = 4;
+    const uint64_t VirtualSize =
+        InputSection.getSize() +
+        (Object.isMachO() && Purpose == SectionPurpose::EHFrame
+             ? EHFrameTerminatorSize
+             : 0);
+    if (VirtualSize < InputSection.getSize())
+      return fail<LinkGraph>("section size overflows");
+    if (VirtualSize != InputSection.getSize())
+      Bytes.resize(static_cast<size_t>(VirtualSize));
     auto Added = Graph.addSection(
         Section{Name.str(), sectionKind(InputSection, Purpose),
-                sectionAlignment(InputSection), InputSection.getSize(), 0, 0,
-                std::move(Bytes), Purpose});
+                sectionAlignment(InputSection), VirtualSize, 0, 0,
+                std::move(Bytes), Purpose, InputSection.getAddress()});
     if (!Added) {
       return fail<LinkGraph>(Added.error().Message);
     }
@@ -752,6 +777,9 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     if (Section == SectionIds.end()) {
       continue;
     }
+    if (Graph.sections()[Section->second].Purpose ==
+        SectionPurpose::CompactUnwind)
+      continue;
     if (Graph.sections()[Section->second].Purpose == SectionPurpose::XData &&
         InputSection.relocation_begin() != InputSection.relocation_end()) {
       return fail<LinkGraph>("personality relocation in .xdata is unsupported");
@@ -764,6 +792,20 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       const auto Symbol = SymbolIds.find(InputSymbol->getRawDataRefImpl());
       if (Symbol == SymbolIds.end()) {
         return fail<LinkGraph>("relocation targets an unsupported symbol");
+      }
+      if (Object.isMachO() && Graph.sections()[Section->second].Purpose ==
+                                  SectionPurpose::EHFrame) {
+        if (*ActualTarget == Target::AArch64 &&
+            InputRelocation.getType() == llvm::MachO::ARM64_RELOC_SUBTRACTOR)
+          continue;
+        if (*ActualTarget == Target::AArch64 &&
+            InputRelocation.getType() == llvm::MachO::ARM64_RELOC_UNSIGNED) {
+          if (!Graph.addEHFrameReference(
+                  EHFrameReference{Section->second, InputRelocation.getOffset(),
+                                   Symbol->second}))
+            return fail<LinkGraph>("invalid Mach-O EH frame relocation");
+          continue;
+        }
       }
       const auto [Addend, Implicit] = relocationAddend(Object, InputRelocation);
       const auto Metadata =

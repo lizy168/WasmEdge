@@ -364,6 +364,19 @@ public:
   inline Value getNamedFunction(const char *Name) noexcept;
   inline Message printModuleToFile(const char *File) noexcept;
   inline Message verify(LLVMVerifierFailureAction Action) noexcept;
+  std::string getInlineAsm() const {
+    size_t Size = 0;
+    const char *Data = LLVMGetModuleInlineAsm(Ref, &Size);
+    return std::string(Data, Size);
+  }
+  void setInlineAsm(std::string_view Value) noexcept {
+#if LLVM_VERSION_MAJOR >= 12
+    LLVMSetModuleInlineAsm2(Ref, Value.data(), Value.size());
+#else
+    const std::string Copy(Value);
+    LLVMSetModuleInlineAsm(Ref, Copy.c_str());
+#endif
+  }
 
   constexpr operator bool() const noexcept { return Ref != nullptr; }
   constexpr auto &unwrap() const noexcept { return Ref; }

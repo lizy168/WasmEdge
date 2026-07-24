@@ -17,6 +17,11 @@ namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
 
+enum class ObjectReaderPolicy : uint8_t {
+  Default,
+  Universal,
+};
+
 namespace Internal {
 
 uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept;
@@ -27,7 +32,9 @@ parseCOFFExports(std::string_view Directives);
 
 class ObjectReader {
 public:
-  static Expect<LinkGraph> read(Span<const Byte> Buffer, Target ExpectedTarget);
+  static Expect<LinkGraph>
+  read(Span<const Byte> Buffer, Target ExpectedTarget,
+       ObjectReaderPolicy Policy = ObjectReaderPolicy::Default);
 };
 
 } // namespace Linker

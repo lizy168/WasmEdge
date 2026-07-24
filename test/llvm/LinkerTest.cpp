@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
+#include "linker/eh_frame.h"
 #include "linker/layout.h"
 #include "linker/link_graph.h"
 #include "linker/native_linker.h"
@@ -183,13 +184,15 @@ bool expectedELFPCRelative(Target Architecture, uint32_t Type) {
   }
 }
 
-std::vector<WasmEdge::Byte> makeObject(
-    const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
-    std::string FunctionName = "f0", std::string Directives = {},
-    bool Hidden = false, bool HiddenData = false, std::string CPU = "generic",
-    std::string Features = {}, bool UnwindTable = false, bool Optimize = false,
-    bool Interruptible = false, bool Atomic = false,
-    bool Representative = false, bool Exceptions = false) {
+std::vector<WasmEdge::Byte>
+makeObject(const llvm::Triple &Triple, bool Undefined = false,
+           bool DLLExport = false, std::string FunctionName = "f0",
+           std::string Directives = {}, bool Hidden = false,
+           bool HiddenData = false, std::string CPU = "generic",
+           std::string Features = {}, bool UnwindTable = false,
+           bool Optimize = false, bool Interruptible = false,
+           bool Atomic = false, bool Representative = false,
+           bool Exceptions = false, std::string ModuleAssembly = {}) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -206,6 +209,10 @@ std::vector<WasmEdge::Byte> makeObject(
     return {};
   }
   llvm::TargetOptions Options;
+#if LLVM_VERSION_MAJOR >= 15
+  if (!ModuleAssembly.empty() && Triple.isOSBinFormatMachO())
+    Options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
+#endif
   std::unique_ptr<llvm::TargetMachine> Machine(
       NativeTarget->createTargetMachine(
 #if LLVM_VERSION_MAJOR >= 21
@@ -234,6 +241,7 @@ std::vector<WasmEdge::Byte> makeObject(
   Module.setTargetTriple(Triple.str());
 #endif
   Module.setDataLayout(Machine->createDataLayout());
+  Module.setModuleInlineAsm(ModuleAssembly);
   auto *I32 = llvm::Type::getInt32Ty(Context);
   auto *Value = new llvm::GlobalVariable(
       Module, I32, false, llvm::GlobalValue::ExternalLinkage,
@@ -3847,6 +3855,77 @@ TEST(RelocationTest, ReadsRealisticPortableObjectsWithoutPersonality) {
     ASSERT_TRUE(layout(*Graph, 0x4000, 0x4000));
     EXPECT_TRUE(applyRelocations(*Graph)) << Test.Triple;
   }
+}
+
+TEST(EHFrameTest, NormalizesGeneratedMachOFrames) {
+  constexpr std::string_view Anchor = R"(
+.private_extern _wasmedge_unwind_anchor
+_wasmedge_unwind_anchor:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  .cfi_escape 0x2e, 0x10
+  ret
+  .cfi_endproc
+)";
+  for (const auto &[Triple, Architecture] :
+       std::array<std::pair<const char *, Target>, 2>{{
+           {"x86_64-apple-macosx", Target::X86_64},
+           {"arm64-apple-macosx", Target::AArch64},
+       }}) {
+    const auto Object = makeObject(
+        llvm::Triple(Triple), false, false, "f0", {}, false, false, "generic",
+        {}, true, false, false, false, false, false, std::string(Anchor));
+    auto Graph = ObjectReader::read(Object, Architecture);
+    ASSERT_TRUE(Graph) << Triple;
+    ASSERT_TRUE(layout(*Graph, 0, 0x4000));
+    ASSERT_TRUE(normalizeMachOEHFrame(*Graph)) << Triple;
+    constexpr uint64_t FirstBase = UINT64_C(0x100000000);
+    constexpr uint64_t SecondBase = UINT64_C(0x700000000);
+    const auto First = machOEHFrameStarts(*Graph, FirstBase);
+    const auto Second = machOEHFrameStarts(*Graph, SecondBase);
+    ASSERT_TRUE(First) << Triple;
+    ASSERT_TRUE(Second) << Triple;
+    ASSERT_EQ(First->size(), Second->size());
+    EXPECT_GE(First->size(), 2U) << Triple;
+    for (size_t I = 0; I < First->size(); ++I)
+      EXPECT_EQ((*First)[I] - FirstBase, (*Second)[I] - SecondBase) << Triple;
+    for (const std::string_view Name : {"_f0", "_wasmedge_unwind_anchor"}) {
+      const auto Symbol =
+          std::find_if(Graph->symbols().begin(), Graph->symbols().end(),
+                       [&](const auto &Value) { return Value.Name == Name; });
+      ASSERT_NE(Symbol, Graph->symbols().end()) << Triple << " " << Name;
+      const uint64_t Address = FirstBase +
+                               Graph->sections()[Symbol->Section].Address +
+                               Symbol->Offset;
+      EXPECT_NE(std::find(First->begin(), First->end(), Address), First->end())
+          << Triple << " " << Name;
+    }
+  }
+}
+
+TEST(EHFrameTest, RejectsMalformedRecordsAtomically) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("malformed.o"));
+  ASSERT_TRUE(Graph.addSection(Section{"__eh_frame",
+                                       SectionKind::Unwind,
+                                       8,
+                                       8,
+                                       0,
+                                       0,
+                                       {4, 0, 0, 0, 0, 0, 0, 0},
+                                       SectionPurpose::EHFrame}));
+  const auto Before = Graph.sections()[0].Content;
+  EXPECT_FALSE(normalizeMachOEHFrame(Graph));
+  EXPECT_EQ(Graph.sections()[0].Content, Before);
+}
+
+TEST(ObjectReaderTest, AppliesUniversalMachOUnwindPolicy) {
+  const auto CompactOnly =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true);
+  EXPECT_TRUE(ObjectReader::read(CompactOnly, Target::AArch64));
+  EXPECT_FALSE(ObjectReader::read(CompactOnly, Target::AArch64,
+                                  ObjectReaderPolicy::Universal));
 }
 
 TEST(RelocationTest, RejectsPortablePersonalityObjects) {
