@@ -6,6 +6,7 @@
 #include "linker/relocation.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -157,6 +158,7 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   for (const auto &Section : Sections)
     Content.push_back(Section.Content);
   std::vector<uint8_t> Remove(Relocations.size());
+  std::set<SymbolId> CoveredSymbols;
   bool HasEHFrame = false;
   for (size_t I = 0; I < Sections.size(); ++I) {
     if (Sections[I].Purpose != SectionPurpose::EHFrame)
@@ -174,8 +176,11 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
       uint64_t Raw = 0;
       if (!readU64(Content[I], Field, Raw))
         return fail();
-      const uint64_t Target =
-          Sections[I].InputAddress + Field + static_cast<int64_t>(Raw);
+      const int128_t TargetValue = int128_t(Sections[I].InputAddress) + Field +
+                                   static_cast<int64_t>(Raw);
+      if (TargetValue < 0 || TargetValue > UINT64_MAX)
+        return fail();
+      const uint64_t Target = static_cast<uint64_t>(TargetValue);
       const auto Symbol = std::find_if(
           Graph.symbols().begin(), Graph.symbols().end(),
           [&](const auto &Value) {
@@ -199,15 +204,20 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
       const auto &Symbol = Graph.symbols()[Relocation.Symbol];
       if (Symbol.Section >= Sections.size())
         return fail();
-      const uint64_t S = Sections[Symbol.Section].Address + Symbol.Offset;
-      const uint64_t P = Sections[I].Address + Relocation.Offset;
-      const int64_t Delta = static_cast<int64_t>(S - P);
+      const int128_t Delta = int128_t(Sections[Symbol.Section].Address) +
+                             Symbol.Offset - int128_t(Sections[I].Address) -
+                             Relocation.Offset;
+      if (Delta < std::numeric_limits<int64_t>::min() ||
+          Delta > std::numeric_limits<int64_t>::max())
+        return fail();
       if (!Internal::writeSigned(Content[I], Relocation.Offset, PointerWidth,
-                                 Endianness::Little, Delta))
+                                 Endianness::Little,
+                                 static_cast<int64_t>(Delta)))
         return fail();
       Remove[J] = true;
     }
     for (const auto &[Field, SymbolId] : References) {
+      CoveredSymbols.insert(SymbolId);
       const auto &Symbol = Graph.symbols()[SymbolId];
       const int128_t S =
           int128_t(Sections[Symbol.Section].Address) + Symbol.Offset;
@@ -225,6 +235,19 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   }
   if (!HasEHFrame)
     return fail();
+  for (SymbolId I = 0; I < Graph.symbols().size(); ++I) {
+    std::string_view Name = Graph.symbols()[I].Name;
+    if (!Name.empty() && Name.front() == '_')
+      Name.remove_prefix(1);
+    if (Name.size() < 2 || Name.front() != 'f')
+      continue;
+    uint64_t Index = 0;
+    const auto Parsed =
+        std::from_chars(Name.data() + 1, Name.data() + Name.size(), Index);
+    if (Parsed.ec == std::errc{} && Parsed.ptr == Name.data() + Name.size() &&
+        CoveredSymbols.count(I) == 0)
+      return fail();
+  }
   for (size_t I = 0; I < Sections.size(); ++I)
     Sections[I].Content = std::move(Content[I]);
   Graph.removeEHFrameRelocations(Remove);
