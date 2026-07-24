@@ -121,6 +121,7 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
       return Unexpect(ErrCode::Value::AOTNotImpl);
     }
     Configure Conf;
+    Conf.addProposal(Proposal::Threads);
     Loader::Loader WasmLoader(Conf);
     if (!WasmLoader.parseModule(Wasm))
       return linkError();
