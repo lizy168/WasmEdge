@@ -499,7 +499,9 @@ TEST(ELFWriterTest, WritesARMExidxAndHardFloatABI) {
                                         0,
                                         0,
                                         {0, 0, 0, 0, 1, 0, 0, 0},
-                                        SectionPurpose::ARMExidx});
+                                        SectionPurpose::ARMExidx,
+                                        0,
+                                        *Text});
   ASSERT_TRUE(Text && Exidx);
   ASSERT_TRUE(ELFWriter::layout(Graph));
   ASSERT_TRUE(applyRelocations(Graph));
@@ -559,6 +561,87 @@ TEST(ELFWriterTest, WritesARMExidxAndHardFloatABI) {
   EXPECT_TRUE(HasExidx);
   llvm::object::SectionRef HeaderStorage;
   EXPECT_EQ(findSection(**Object, ".eh_frame_hdr", HeaderStorage), nullptr);
+}
+
+TEST(ELFWriterTest, PreservesARMExidxAssociationsAndUsesOneSegment) {
+  LinkGraph Graph(Target::ARM, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("many-arm.o"));
+  ASSERT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
+                                llvm::ELF::EF_ARM_ABI_FLOAT_HARD));
+  constexpr size_t SectionCount = 10;
+  std::array<SectionId, SectionCount> Texts{};
+  std::array<SectionId, SectionCount> Exidxs{};
+  for (size_t I = 0; I < SectionCount; ++I) {
+    auto Text =
+        Graph.addSection(Section{".text." + std::to_string(I),
+                                 SectionKind::Text,
+                                 4,
+                                 4,
+                                 0,
+                                 0,
+                                 {static_cast<WasmEdge::Byte>(I), 0, 0, 0}});
+    ASSERT_TRUE(Text);
+    Texts[I] = *Text;
+    auto Exidx = Graph.addSection(
+        Section{".ARM.exidx." + std::to_string(I),
+                SectionKind::Unwind,
+                4,
+                8,
+                0,
+                0,
+                {static_cast<WasmEdge::Byte>(I), 0, 0, 0, 1, 0, 0, 0},
+                SectionPurpose::ARMExidx,
+                0,
+                *Text});
+    ASSERT_TRUE(Exidx);
+    Exidxs[I] = *Exidx;
+  }
+  ASSERT_TRUE(ELFWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(ELFWriter::write(Graph, Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "many-arm.so"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+
+  const uint64_t SectionHeaderOffset =
+      readInteger(Bytes, 32, 4, Endianness::Little);
+  uint64_t FirstAddress = UINT64_MAX;
+  uint64_t LastEnd = 0;
+  for (size_t I = 0; I < SectionCount; ++I) {
+    llvm::object::SectionRef Storage;
+    const auto *Exidx =
+        findSection(**Object, ".ARM.exidx." + std::to_string(I), Storage);
+    ASSERT_NE(Exidx, nullptr);
+    const uint64_t Header = SectionHeaderOffset + Exidx->getIndex() * 40;
+    EXPECT_EQ(readInteger(Bytes, Header + 24, 4, Endianness::Little),
+              Texts[I] + 1);
+    FirstAddress = std::min(FirstAddress, Exidx->getAddress());
+    LastEnd = std::max(LastEnd, Exidx->getAddress() + Exidx->getSize());
+  }
+  const uint64_t ProgramHeaderOffset =
+      readInteger(Bytes, 28, 4, Endianness::Little);
+  const uint16_t ProgramHeaderSize =
+      static_cast<uint16_t>(readInteger(Bytes, 42, 2, Endianness::Little));
+  const uint16_t ProgramHeaderCount =
+      static_cast<uint16_t>(readInteger(Bytes, 44, 2, Endianness::Little));
+  size_t ExidxSegmentCount = 0;
+  for (uint16_t I = 0; I < ProgramHeaderCount; ++I) {
+    const uint64_t Offset = ProgramHeaderOffset + I * ProgramHeaderSize;
+    if (readInteger(Bytes, Offset, 4, Endianness::Little) !=
+        llvm::ELF::PT_ARM_EXIDX)
+      continue;
+    ++ExidxSegmentCount;
+    EXPECT_EQ(readInteger(Bytes, Offset + 8, 4, Endianness::Little),
+              FirstAddress);
+    EXPECT_EQ(readInteger(Bytes, Offset + 16, 4, Endianness::Little),
+              LastEnd - FirstAddress);
+  }
+  EXPECT_EQ(ExidxSegmentCount, 1U);
 }
 
 TEST(ELFWriterTest, RejectsConflictingARMABIFlags) {
@@ -632,6 +715,66 @@ TEST(ELFWriterTest, RejectsUnsupportedPersonalityEncodings) {
     Writer Output(Bytes);
     EXPECT_FALSE(ELFWriter::write(Graph, Output));
     EXPECT_TRUE(Bytes.empty());
+  }
+}
+
+TEST(ELFWriterTest, AcceptsIndirectPersonalityWithRelativeSlot) {
+  for (const bool HasRebase : {false, true}) {
+    LinkGraph Graph(Target::X86_64, Endianness::Little);
+    ASSERT_TRUE(Graph.beginInput("indirect-personality.o"));
+    auto Text = Graph.addSection(
+        Section{".text", SectionKind::Text, 16, 4, 0, 0, {0xC3, 0, 0xC3, 0}});
+    auto Data = Graph.addSection(Section{".data", SectionKind::Data, 8, 8, 0, 0,
+                                         std::vector<WasmEdge::Byte>(8)});
+    auto EH = Graph.addSection(
+        Section{".eh_frame", SectionKind::Unwind, 8,
+                makePersonalityEHFrame(Endianness::Little, 0x9B).size(), 0, 0,
+                makePersonalityEHFrame(Endianness::Little, 0x9B),
+                SectionPurpose::EHFrame});
+    ASSERT_TRUE(Text && Data && EH);
+    ASSERT_TRUE(
+        Graph.addSymbol(Symbol{"f0", *Text, 0, 1, true, std::nullopt, true}));
+    ASSERT_TRUE(Graph.addSymbol(
+        Symbol{"personality", *Text, 2, 1, false, std::nullopt, false}));
+    ASSERT_TRUE(ELFWriter::layout(Graph));
+    auto DataContent = Graph.sectionContent(*Data);
+    auto EHContent = Graph.sectionContent(*EH);
+    ASSERT_TRUE(DataContent && EHContent);
+    for (uint8_t I = 0; I < 8; ++I)
+      (*DataContent)[I] = static_cast<WasmEdge::Byte>(
+          (Graph.sections()[*Text].Address + 2) >> (I * 8));
+    const int64_t SlotDelta =
+        static_cast<int64_t>(Graph.sections()[*Data].Address) -
+        static_cast<int64_t>(Graph.sections()[*EH].Address + 18);
+    const int64_t FunctionDelta =
+        static_cast<int64_t>(Graph.sections()[*Text].Address) -
+        static_cast<int64_t>(Graph.sections()[*EH].Address + 31);
+    for (uint8_t I = 0; I < 4; ++I) {
+      (*EHContent)[18 + I] = static_cast<WasmEdge::Byte>(
+          static_cast<uint32_t>(SlotDelta) >> (I * 8));
+      (*EHContent)[31 + I] = static_cast<WasmEdge::Byte>(
+          static_cast<uint32_t>(FunctionDelta) >> (I * 8));
+    }
+    if (HasRebase) {
+      ASSERT_TRUE(
+          Graph.addRebase(Rebase{*Data, 0, llvm::ELF::R_X86_64_64, 0, 8}));
+    }
+    ASSERT_TRUE(applyRelocations(Graph));
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    EXPECT_EQ(static_cast<bool>(ELFWriter::write(Graph, Output)), HasRebase);
+    if (HasRebase) {
+      auto Object =
+          llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+              llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                              Bytes.size()),
+              "indirect.so"));
+      ASSERT_TRUE(static_cast<bool>(Object));
+      llvm::object::SectionRef Storage;
+      const auto *Relocations = findSection(**Object, ".rela.dyn", Storage);
+      ASSERT_NE(Relocations, nullptr);
+      EXPECT_EQ(Relocations->getSize(), 24U);
+    }
   }
 }
 

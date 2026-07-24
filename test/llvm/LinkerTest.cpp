@@ -2978,6 +2978,8 @@ target:
   ASSERT_NE(Exidx, Graph->sections().end());
   EXPECT_EQ(Exidx->Kind, SectionKind::Unwind);
   EXPECT_FALSE(Exidx->Content.empty());
+  ASSERT_TRUE(Exidx->LinkedSection);
+  EXPECT_EQ(Graph->sections()[*Exidx->LinkedSection].Name, ".text");
   const auto ExidxId =
       static_cast<SectionId>(Exidx - Graph->sections().begin());
   EXPECT_TRUE(std::any_of(Graph->relocations().begin(),

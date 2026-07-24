@@ -469,6 +469,25 @@ ObjectFormat objectFormat(const llvm::object::ObjectFile &Object) noexcept {
   return ObjectFormat::ELF;
 }
 
+std::optional<uint32_t>
+elfLinkedSection(const llvm::object::ObjectFile &Object,
+                 const llvm::object::SectionRef &Section) noexcept {
+  const auto Reference = Section.getRawDataRefImpl();
+  if (const auto *ELF =
+          llvm::dyn_cast<llvm::object::ELF32LEObjectFile>(&Object))
+    return ELF->getSection(Reference)->sh_link;
+  if (const auto *ELF =
+          llvm::dyn_cast<llvm::object::ELF32BEObjectFile>(&Object))
+    return ELF->getSection(Reference)->sh_link;
+  if (const auto *ELF =
+          llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(&Object))
+    return ELF->getSection(Reference)->sh_link;
+  if (const auto *ELF =
+          llvm::dyn_cast<llvm::object::ELF64BEObjectFile>(&Object))
+    return ELF->getSection(Reference)->sh_link;
+  return std::nullopt;
+}
+
 struct RelocationMetadata {
   uint8_t PatchSize = BytePatch;
   bool PCRelative = false;
@@ -686,6 +705,22 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       return fail<LinkGraph>(Added.error().Message);
     }
     SectionIds.emplace(InputSection.getIndex(), *Added);
+  }
+  for (const auto &InputSection : Object.sections()) {
+    const auto Section = SectionIds.find(InputSection.getIndex());
+    if (Section == SectionIds.end())
+      continue;
+    const auto &Value = Graph.sections()[Section->second];
+    if (Value.Purpose != SectionPurpose::ARMExidx)
+      continue;
+    const auto LinkedInput = elfLinkedSection(Object, InputSection);
+    if (!LinkedInput)
+      return fail<LinkGraph>("cannot read linked ARM exidx section");
+    const auto Linked = SectionIds.find(*LinkedInput);
+    if (Linked == SectionIds.end() ||
+        Graph.sections()[Linked->second].Kind != SectionKind::Text ||
+        !Graph.setLinkedSection(Section->second, Linked->second))
+      return fail<LinkGraph>("invalid linked ARM exidx section");
   }
 
   std::map<llvm::object::DataRefImpl, SymbolId> SymbolIds;

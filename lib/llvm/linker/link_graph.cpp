@@ -276,6 +276,11 @@ LinkExpect<SectionId> LinkGraph::addSection(Section Value) {
     Diag.SectionName = Value.Name;
     return fail<SectionId>(std::move(Diag));
   }
+  if (Value.LinkedSection && *Value.LinkedSection >= Sections.size()) {
+    Diagnostic Diag{"invalid linked section ID"};
+    Diag.SectionName = Value.Name;
+    return fail<SectionId>(std::move(Diag));
+  }
   if (Sections.size() >= InvalidSectionId) {
     return fail<SectionId>(Diagnostic{"too many sections"});
   }
@@ -468,6 +473,12 @@ LinkExpect<void> LinkGraph::validate() const {
       Diag.SectionName = Value.Name;
       return fail<void>(std::move(Diag));
     }
+    if (Value.LinkedSection && *Value.LinkedSection >= Sections.size()) {
+      Diagnostic Diag{"invalid linked section ID"};
+      Diag.Section = I;
+      Diag.SectionName = Value.Name;
+      return fail<void>(std::move(Diag));
+    }
   }
   for (size_t I = 0; I < Symbols.size(); ++I) {
     const auto &Value = Symbols[I];
@@ -613,6 +624,17 @@ LinkExpect<void> LinkGraph::setELFFlags(uint32_t Flags) {
     return fail<void>(Diagnostic{"ELF flags require an ELF link graph"});
   }
   ELFFlags = Flags;
+  return {};
+}
+
+LinkExpect<void> LinkGraph::setLinkedSection(SectionId Id, SectionId Linked) {
+  if (RelocationsApplied) {
+    return relocated();
+  }
+  if (Id >= Sections.size() || Linked >= Sections.size()) {
+    return fail<void>(Diagnostic{"invalid linked section ID"});
+  }
+  Sections[Id].LinkedSection = Linked;
   return {};
 }
 

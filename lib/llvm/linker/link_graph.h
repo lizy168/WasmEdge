@@ -49,6 +49,7 @@ struct Section {
   std::vector<Byte> Content{};
   SectionPurpose Purpose = SectionPurpose::Default;
   uint64_t InputAddress = 0;
+  std::optional<SectionId> LinkedSection = std::nullopt;
 };
 
 struct EHFrameReference {
@@ -126,6 +127,7 @@ public:
   LinkExpect<void> validate() const;
   LinkExpect<void> setSectionAddress(SectionId Id, uint64_t Address);
   LinkExpect<void> setSectionFileOffset(SectionId Id, uint64_t FileOffset);
+  LinkExpect<void> setLinkedSection(SectionId Id, SectionId Linked);
   LinkExpect<void> setELFFlags(uint32_t Flags);
   LinkExpect<Span<Byte>> sectionContent(SectionId Id);
 
