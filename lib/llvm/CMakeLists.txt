@@ -27,6 +27,7 @@ set(WASMEDGE_LLVM_SOURCES
   data.cpp
   jit.cpp
   lazyjit.cpp
+  linker/elf_writer.cpp
   linker/layout.cpp
   linker/eh_frame.cpp
   linker/link_graph.cpp
@@ -44,6 +45,7 @@ set(WASMEDGE_LLVM_SOURCES
 )
 
 set(WASMEDGE_LLVM_LINKER_SOURCES
+  linker/elf_writer.cpp
   linker/eh_frame.cpp
   linker/layout.cpp
   linker/link_graph.cpp

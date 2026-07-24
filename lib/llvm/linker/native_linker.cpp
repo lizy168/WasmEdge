@@ -6,6 +6,7 @@
 #include "common/configure.h"
 #include "common/defines.h"
 #include "linker/eh_frame.h"
+#include "linker/elf_writer.h"
 #include "linker/layout.h"
 #include "linker/object_reader.h"
 #include "linker/relocation.h"
@@ -113,9 +114,16 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
                                 const std::filesystem::path &Output,
                                 OutputKind Kind) noexcept {
   try {
-    if (Kind != OutputKind::UniversalWasm || Output.empty()) {
+    if (Output.empty()) {
       return linkError();
     }
+#if WASMEDGE_OS_LINUX
+    if (Kind != OutputKind::UniversalWasm && Kind != OutputKind::ELF)
+      return linkError();
+#else
+    if (Kind != OutputKind::UniversalWasm)
+      return linkError();
+#endif
     const auto TargetValue = hostTarget();
     if (!TargetValue) {
       return Unexpect(ErrCode::Value::AOTNotImpl);
@@ -125,8 +133,11 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     Loader::Loader WasmLoader(Conf);
     if (!WasmLoader.parseModule(Wasm))
       return linkError();
-    EXPECTED_TRY(auto Graph, ObjectReader::read(Object, *TargetValue,
-                                                ObjectReaderPolicy::Universal));
+    EXPECTED_TRY(auto Graph,
+                 ObjectReader::read(Object, *TargetValue,
+                                    Kind == OutputKind::UniversalWasm
+                                        ? ObjectReaderPolicy::Universal
+                                        : ObjectReaderPolicy::Default));
     if (Graph.format() != hostFormat())
       return linkError();
 #if WASMEDGE_OS_MACOS && defined(__aarch64__)
@@ -134,7 +145,10 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
 #else
     constexpr uint64_t HostPageSize = 4096;
 #endif
-    if (auto Result = layout(Graph, 0, HostPageSize); !Result) {
+    if (Kind == OutputKind::ELF && !ELFWriter::layout(Graph)) {
+      return linkError();
+    }
+    if (Kind != OutputKind::ELF && !layout(Graph, 0, HostPageSize)) {
       return linkError();
     }
     if (Graph.format() == ObjectFormat::MachO) {
@@ -152,7 +166,11 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
       return linkError();
 #endif
     Writer OutputWriter(Guard.release());
-    EXPECTED_TRY(UniversalWasmWriter::write(Graph, Wasm, OutputWriter));
+    if (Kind == OutputKind::ELF) {
+      EXPECTED_TRY(ELFWriter::write(Graph, OutputWriter));
+    } else {
+      EXPECTED_TRY(UniversalWasmWriter::write(Graph, Wasm, OutputWriter));
+    }
 #if WASMEDGE_OS_WINDOWS
     if (!winapi::MoveFileExW(Guard.path().c_str(), Output.c_str(),
                              winapi::MOVEFILE_REPLACE_EXISTING_)) {

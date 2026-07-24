@@ -12,6 +12,7 @@
 
 #include "aot/version.h"
 #include "loader/loader.h"
+#include "loader/shared_library.h"
 #include "validator/validator.h"
 #include "vm/vm.h"
 #include "llvm/codegen.h"
@@ -35,6 +36,7 @@
 #if LLVM_VERSION_MAJOR >= 19
 #include <llvm/MC/MCELFExtras.h>
 #endif
+#include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/MachO.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/CodeGen.h>
@@ -815,10 +817,12 @@ protected:
 
   std::vector<WasmEdge::Byte>
   compileTinyObject(WasmEdge::Span<const WasmEdge::Byte> Wasm,
-                    const std::filesystem::path &Output) const {
+                    const std::filesystem::path &Output,
+                    bool Native = false) const {
     WasmEdge::Configure Conf;
     Conf.getCompilerConfigure().setOutputFormat(
-        WasmEdge::CompilerConfigure::OutputFormat::Wasm);
+        Native ? WasmEdge::CompilerConfigure::OutputFormat::Native
+               : WasmEdge::CompilerConfigure::OutputFormat::Wasm);
     Conf.getCompilerConfigure().setDumpIR(true);
     WasmEdge::Loader::Loader Loader(Conf);
     WasmEdge::Validator::Validator Validator(Conf);
@@ -1267,11 +1271,56 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsUnsupportedOutputAtomically) {
   constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
                                                     0x01, 0x00, 0x00, 0x00};
 
+#if WASMEDGE_OS_LINUX
+  EXPECT_FALSE(
+      NativeLinker::link(Object, EmptyWasm, Output, OutputKind::MachO));
+#else
   EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output, OutputKind::ELF));
+#endif
   EXPECT_EQ(readFile(Output),
             (std::vector<WasmEdge::Byte>(Existing.begin(), Existing.end())));
   expectNoTemporaryFiles();
 }
+
+#if WASMEDGE_OS_LINUX
+TEST_F(LinkerOutputTest, NativeAOTWriterLoadsAndExecutesWithoutImports) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Output = Directory / "native.so";
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.so", true);
+
+  ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Output, OutputKind::ELF));
+  auto Image = llvm::object::ObjectFile::createObjectFile(Output.string());
+  ASSERT_TRUE(static_cast<bool>(Image));
+  const auto *ELF =
+      llvm::dyn_cast<llvm::object::ELFObjectFileBase>(Image->getBinary());
+  ASSERT_NE(ELF, nullptr);
+  std::set<std::string> DynamicSymbols;
+  for (const auto &Symbol : ELF->getDynamicSymbolIterators()) {
+    auto Name = Symbol.getName();
+    ASSERT_TRUE(static_cast<bool>(Name));
+    if (!Name->empty())
+      DynamicSymbols.emplace(Name->str());
+    auto Flags = Symbol.getFlags();
+    ASSERT_TRUE(static_cast<bool>(Flags));
+    EXPECT_EQ(*Flags & llvm::object::SymbolRef::SF_Undefined, 0U);
+  }
+  for (const char *Name :
+       {"f0", "version", "intrinsics", "wasm.code", "wasm.size"})
+    EXPECT_TRUE(DynamicSymbols.count(Name)) << Name;
+
+  auto Library = std::make_shared<WasmEdge::Loader::SharedLibrary>();
+  ASSERT_TRUE(Library->load(Output));
+  EXPECT_TRUE(Library->get<uint32_t>("version"));
+  EXPECT_TRUE(Library->get<const WasmEdge::Executable::IntrinsicsTable *>(
+      "intrinsics"));
+  EXPECT_TRUE(Library->get<uint8_t>("wasm.code"));
+  EXPECT_TRUE(Library->get<uint32_t>("wasm.size"));
+  EXPECT_EQ(execute(Output), 7U);
+}
+#endif
 
 TEST_F(LinkerOutputTest, NativeLinkerCreatesNoNativeTemporary) {
   constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
