@@ -76,6 +76,23 @@ struct ParsedFrame {
   std::set<size_t> FDEFields;
 };
 
+bool requiredSemanticFunction(const LinkGraph &Graph,
+                              const Symbol &Symbol) noexcept {
+  if (!Symbol.Global && !Symbol.Exported)
+    return false;
+  std::string_view Name = Symbol.ExportName ? *Symbol.ExportName : Symbol.Name;
+  if (Graph.format() == ObjectFormat::MachO && !Name.empty() &&
+      Name.front() == '_')
+    Name.remove_prefix(1);
+  if (Name.size() < 2 || (Name.front() != 't' && Name.front() != 'f'))
+    return false;
+  uint64_t Index = 0;
+  const auto Parsed =
+      std::from_chars(Name.data() + 1, Name.data() + Name.size(), Index);
+  return Parsed.ec == std::errc{} && Parsed.ptr == Name.data() + Name.size() &&
+         std::to_string(Index) == Name.substr(1);
+}
+
 Expect<ParsedFrame> parse(Span<const Byte> Bytes) {
   ParsedFrame Result;
   std::map<size_t, uint8_t> CIEs;
@@ -236,21 +253,32 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   if (!HasEHFrame)
     return fail();
   for (SymbolId I = 0; I < Graph.symbols().size(); ++I) {
-    std::string_view Name = Graph.symbols()[I].Name;
-    if (!Name.empty() && Name.front() == '_')
-      Name.remove_prefix(1);
-    if (Name.size() < 2 || Name.front() != 'f')
-      continue;
-    uint64_t Index = 0;
-    const auto Parsed =
-        std::from_chars(Name.data() + 1, Name.data() + Name.size(), Index);
-    if (Parsed.ec == std::errc{} && Parsed.ptr == Name.data() + Name.size() &&
+    if (requiredSemanticFunction(Graph, Graph.symbols()[I]) &&
         CoveredSymbols.count(I) == 0)
       return fail();
   }
   for (size_t I = 0; I < Sections.size(); ++I)
     Sections[I].Content = std::move(Content[I]);
   Graph.removeEHFrameRelocations(Remove);
+  return {};
+}
+
+Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph) {
+  if (Graph.format() != ObjectFormat::MachO)
+    return {};
+  EXPECTED_TRY(auto Starts, machOEHFrameStarts(Graph, 0));
+  for (const auto &Symbol : Graph.symbols()) {
+    if (!requiredSemanticFunction(Graph, Symbol))
+      continue;
+    if (Symbol.Section >= Graph.sections().size())
+      return fail();
+    const int128_t Address =
+        int128_t(Graph.sections()[Symbol.Section].Address) + Symbol.Offset;
+    if (Address < 0 || Address > UINT64_MAX ||
+        std::find(Starts.begin(), Starts.end(),
+                  static_cast<uint64_t>(Address)) == Starts.end())
+      return fail();
+  }
   return {};
 }
 

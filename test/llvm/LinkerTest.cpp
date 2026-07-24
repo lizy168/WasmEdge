@@ -184,14 +184,16 @@ bool expectedELFPCRelative(Target Architecture, uint32_t Type) {
   }
 }
 
-std::vector<WasmEdge::Byte> makeObject(
-    const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
-    std::string FunctionName = "f0", std::string Directives = {},
-    bool Hidden = false, bool HiddenData = false, std::string CPU = "generic",
-    std::string Features = {}, bool UnwindTable = false, bool Optimize = false,
-    bool Interruptible = false, bool Atomic = false,
-    bool Representative = false, bool Exceptions = false,
-    std::string ModuleAssembly = {}, bool SemanticSymbols = false) {
+std::vector<WasmEdge::Byte>
+makeObject(const llvm::Triple &Triple, bool Undefined = false,
+           bool DLLExport = false, std::string FunctionName = "f0",
+           std::string Directives = {}, bool Hidden = false,
+           bool HiddenData = false, std::string CPU = "generic",
+           std::string Features = {}, bool UnwindTable = false,
+           bool Optimize = false, bool Interruptible = false,
+           bool Atomic = false, bool Representative = false,
+           bool Exceptions = false, std::string ModuleAssembly = {},
+           bool SemanticSymbols = false, bool TypeWrapper = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -270,6 +272,19 @@ std::vector<WasmEdge::Byte> makeObject(
 #else
     F0->addFnAttr(llvm::Attribute::UWTable);
 #endif
+  }
+  if (TypeWrapper) {
+    auto *T0 = llvm::Function::Create(llvm::FunctionType::get(I32, false),
+                                      llvm::GlobalValue::ExternalLinkage, "t0",
+                                      Module);
+#if LLVM_VERSION_MAJOR >= 14
+    T0->setUWTableKind(llvm::UWTableKind::Sync);
+#else
+    T0->addFnAttr(llvm::Attribute::UWTable);
+#endif
+    llvm::IRBuilder<> WrapperBuilder(
+        llvm::BasicBlock::Create(Context, "entry", T0));
+    WrapperBuilder.CreateRet(llvm::ConstantInt::get(I32, 0));
   }
   F0->setVisibility(Hidden ? llvm::GlobalValue::HiddenVisibility
                            : llvm::GlobalValue::DefaultVisibility);
@@ -3940,6 +3955,80 @@ _wasmedge_unwind_anchor:
           << Triple << " " << Name;
     }
   }
+}
+
+TEST(EHFrameTest, RequiresTypeWrapperCoverage) {
+  constexpr std::string_view Anchor = R"(
+.private_extern _wasmedge_unwind_anchor
+_wasmedge_unwind_anchor:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  .cfi_escape 0x2e, 0x10
+  ret
+  .cfi_endproc
+)";
+  auto Graph = ObjectReader::read(
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true, false, false, false, false,
+                 false, std::string(Anchor), false, true),
+      Target::AArch64);
+  ASSERT_TRUE(Graph);
+  ASSERT_TRUE(layout(*Graph, 0, 0x4000));
+  ASSERT_TRUE(normalizeMachOEHFrame(*Graph));
+  ASSERT_TRUE(validateMachOEHFrameCoverage(*Graph));
+
+  const auto Starts = machOEHFrameStarts(*Graph, 0);
+  ASSERT_TRUE(Starts);
+  const auto T0 =
+      std::find_if(Graph->symbols().begin(), Graph->symbols().end(),
+                   [](const auto &Symbol) { return Symbol.Name == "_t0"; });
+  const auto F0 =
+      std::find_if(Graph->symbols().begin(), Graph->symbols().end(),
+                   [](const auto &Symbol) { return Symbol.Name == "_f0"; });
+  ASSERT_NE(T0, Graph->symbols().end());
+  ASSERT_NE(F0, Graph->symbols().end());
+  const uint64_t T0Address =
+      Graph->sections()[T0->Section].Address + T0->Offset;
+  const uint64_t F0Address =
+      Graph->sections()[F0->Section].Address + F0->Offset;
+  ASSERT_NE(std::find(Starts->begin(), Starts->end(), T0Address),
+            Starts->end());
+  ASSERT_NE(std::find(Starts->begin(), Starts->end(), F0Address),
+            Starts->end());
+
+  const auto EH =
+      std::find_if(Graph->sections().begin(), Graph->sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::EHFrame;
+                   });
+  ASSERT_NE(EH, Graph->sections().end());
+  const SectionId EHId = static_cast<SectionId>(EH - Graph->sections().begin());
+  auto Content = Graph->sectionContent(EHId);
+  ASSERT_TRUE(Content);
+  bool Mutated = false;
+  for (size_t Offset = 0; Offset + 16 <= Content->size();) {
+    uint32_t Length = 0;
+    std::memcpy(&Length, Content->data() + Offset, sizeof(Length));
+    if (Length == 0)
+      break;
+    uint32_t CIE = 0;
+    std::memcpy(&CIE, Content->data() + Offset + 4, sizeof(CIE));
+    if (CIE != 0) {
+      const size_t Field = Offset + 8;
+      int64_t Delta = 0;
+      std::memcpy(&Delta, Content->data() + Field, sizeof(Delta));
+      if (Graph->sections()[EHId].Address + Field + Delta == T0Address) {
+        Delta = static_cast<int64_t>(F0Address -
+                                     (Graph->sections()[EHId].Address + Field));
+        std::memcpy(Content->data() + Field, &Delta, sizeof(Delta));
+        Mutated = true;
+        break;
+      }
+    }
+    Offset += Length + 4;
+  }
+  ASSERT_TRUE(Mutated);
+  EXPECT_FALSE(validateMachOEHFrameCoverage(*Graph));
 }
 
 TEST(EHFrameTest, RejectsMalformedRecordsAtomically) {

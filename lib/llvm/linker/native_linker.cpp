@@ -139,6 +139,7 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     }
     if (Graph.format() == ObjectFormat::MachO) {
       EXPECTED_TRY(normalizeMachOEHFrame(Graph));
+      EXPECTED_TRY(validateMachOEHFrameCoverage(Graph));
     }
     EXPECTED_TRY(applyRelocations(Graph));
 

@@ -14,6 +14,7 @@ namespace LLVM {
 namespace Linker {
 
 Expect<void> normalizeMachOEHFrame(LinkGraph &Graph);
+Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph);
 Expect<std::vector<uint64_t>> machOEHFrameStarts(const LinkGraph &Graph,
                                                  uint64_t LoadBase);
 
