@@ -778,6 +778,99 @@ TEST(ELFWriterTest, AcceptsIndirectPersonalityWithRelativeSlot) {
   }
 }
 
+TEST(ELFWriterTest, RejectsCIEFieldsCrossingRecordBoundary) {
+  auto Bytes = makeEHFrame(Endianness::Little);
+  Bytes[12] = 0x80;
+  Bytes[13] = 0x80;
+  Bytes[14] = 0x80;
+  Bytes[15] = 0x80;
+  Bytes[16] = 0x80;
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("bounded-eh.o"));
+  ASSERT_TRUE(Graph.addSection(
+      Section{".text", SectionKind::Text, 16, 4, 0, 0, {0xC3, 0, 0, 0}}));
+  ASSERT_TRUE(Graph.addSection(Section{".eh_frame", SectionKind::Unwind, 8,
+                                       Bytes.size(), 0, 0, std::move(Bytes),
+                                       SectionPurpose::EHFrame}));
+  ASSERT_TRUE(ELFWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> OutputBytes;
+  Writer Output(OutputBytes);
+  EXPECT_FALSE(ELFWriter::write(Graph, Output));
+  EXPECT_TRUE(OutputBytes.empty());
+}
+
+TEST(ELFWriterTest, AggregatesMultipleEHFrameSections) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("multiple-eh.o"));
+  auto Text = Graph.addSection(Section{".text",
+                                       SectionKind::Text,
+                                       16,
+                                       8,
+                                       0,
+                                       0,
+                                       {0xC3, 0, 0xC3, 0, 0xC3, 0, 0xC3}});
+  ASSERT_TRUE(Text);
+  std::array<SectionId, 2> EHSections{};
+  for (size_t I = 0; I < EHSections.size(); ++I) {
+    auto EH = Graph.addSection(
+        Section{".eh_frame." + std::to_string(I), SectionKind::Unwind, 8,
+                makeEHFrame(Endianness::Little).size(), 0, 0,
+                makeEHFrame(Endianness::Little), SectionPurpose::EHFrame});
+    ASSERT_TRUE(EH);
+    EHSections[I] = *EH;
+  }
+  ASSERT_TRUE(ELFWriter::layout(Graph));
+  for (size_t SectionIndex = 0; SectionIndex < EHSections.size();
+       ++SectionIndex) {
+    auto Content = Graph.sectionContent(EHSections[SectionIndex]);
+    ASSERT_TRUE(Content);
+    for (size_t I = 0; I < 2; ++I) {
+      const size_t FieldOffset = 17 + I * 17 + 8;
+      const uint64_t FieldAddress =
+          Graph.sections()[EHSections[SectionIndex]].Address + FieldOffset;
+      const uint64_t FunctionAddress =
+          Graph.sections()[*Text].Address + (SectionIndex * 2 + I) * 2;
+      const int64_t Delta = static_cast<int64_t>(FunctionAddress) -
+                            static_cast<int64_t>(FieldAddress);
+      for (uint8_t Byte = 0; Byte < 4; ++Byte)
+        (*Content)[FieldOffset + Byte] = static_cast<WasmEdge::Byte>(
+            static_cast<uint32_t>(Delta) >> (Byte * 8));
+    }
+  }
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(ELFWriter::write(Graph, Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "multiple-eh.so"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  llvm::object::SectionRef Storage;
+  const auto *Header = findSection(**Object, ".eh_frame_hdr", Storage);
+  ASSERT_NE(Header, nullptr);
+  auto Content = Header->getContents();
+  ASSERT_TRUE(static_cast<bool>(Content));
+  const std::vector<WasmEdge::Byte> HeaderBytes(Content->bytes_begin(),
+                                                Content->bytes_end());
+  EXPECT_EQ(readInteger(HeaderBytes, 8, 4, Endianness::Little), 4U);
+  EXPECT_EQ(HeaderBytes.size(), 12U + 4U * 8U);
+}
+
+TEST(ELFWriterTest, RejectsELF32LayoutOverflowAtomically) {
+  LinkGraph Graph(Target::ARM, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("overflow.o"));
+  ASSERT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
+                                llvm::ELF::EF_ARM_ABI_FLOAT_HARD));
+  ASSERT_TRUE(Graph.addSection(
+      Section{".text", SectionKind::Text, 1, UINT64_C(1) << 32, 0, 0, {0}}));
+  EXPECT_FALSE(ELFWriter::layout(Graph));
+  EXPECT_EQ(Graph.sections()[0].Address, 0U);
+  EXPECT_EQ(Graph.sections()[0].FileOffset, 0U);
+}
+
 TEST(ELFWriterTest, RejectsUnsupportedRebasesAndInvalidState) {
   const ELFCase Test{Target::X86_64, Endianness::Little, llvm::ELF::EM_X86_64,
                      llvm::ELF::R_X86_64_RELATIVE, true};

@@ -639,8 +639,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
   }
   if (const auto *ELF =
           llvm::dyn_cast<llvm::object::ELFObjectFileBase>(&Object)) {
-    if (*ActualTarget == Target::ARM &&
-        !Graph.setELFFlags(ELF->getPlatformFlags()))
+    if (!Graph.setELFFlags(ELF->getPlatformFlags()))
       return fail<LinkGraph>("cannot preserve ELF flags");
   }
   std::map<uint64_t, SectionId> SectionIds;

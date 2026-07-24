@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
 #include "linker/eh_frame.h"
+#include "linker/elf_writer.h"
 #include "linker/layout.h"
 #include "linker/link_graph.h"
 #include "linker/native_linker.h"
@@ -4444,6 +4445,23 @@ TEST(ObjectReaderTest, PreservesARMHardFloatMetadata) {
             llvm::ELF::EF_ARM_EABI_VER5);
   EXPECT_EQ(Result->elfFlags() & llvm::ELF::EF_ARM_ABI_FLOAT_HARD,
             llvm::ELF::EF_ARM_ABI_FLOAT_HARD);
+}
+
+TEST(ObjectReaderTest, PreservesRISCVArchitectureFlags) {
+  const auto Bytes = makeAssemblyObject(
+      llvm::Triple("riscv64-unknown-linux-gnu"),
+      ".option rvc\n.text\n.globl f0\nf0:\n c.nop\n ret\n", "+c,+f,+d");
+  auto Graph = ObjectReader::read(Bytes, Target::RISCV64);
+  ASSERT_TRUE(Graph);
+  const uint32_t Expected =
+      llvm::ELF::EF_RISCV_RVC | llvm::ELF::EF_RISCV_FLOAT_ABI_DOUBLE;
+  EXPECT_EQ(Graph->elfFlags(), Expected);
+  ASSERT_TRUE(ELFWriter::layout(*Graph));
+  ASSERT_TRUE(applyRelocations(*Graph));
+  std::vector<WasmEdge::Byte> OutputBytes;
+  Writer Output(OutputBytes);
+  ASSERT_TRUE(ELFWriter::write(*Graph, Output));
+  EXPECT_EQ(read64le(OutputBytes, 48) & UINT32_MAX, Expected);
 }
 
 TEST(ObjectReaderTest, RejectsNonRelocatableELFObject) {
