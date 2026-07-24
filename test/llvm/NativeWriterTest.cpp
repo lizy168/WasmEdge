@@ -572,8 +572,9 @@ TEST(ELFWriterTest, PreservesARMExidxAssociationsAndUsesOneSegment) {
   std::array<SectionId, SectionCount> Texts{};
   std::array<SectionId, SectionCount> Exidxs{};
   for (size_t I = 0; I < SectionCount; ++I) {
+    const size_t NameOrdinal = SectionCount - I - 1;
     auto Text =
-        Graph.addSection(Section{".text." + std::to_string(I),
+        Graph.addSection(Section{".text." + std::to_string(NameOrdinal),
                                  SectionKind::Text,
                                  4,
                                  4,
@@ -612,6 +613,7 @@ TEST(ELFWriterTest, PreservesARMExidxAssociationsAndUsesOneSegment) {
       readInteger(Bytes, 32, 4, Endianness::Little);
   uint64_t FirstAddress = UINT64_MAX;
   uint64_t LastEnd = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> ExidxOrder;
   for (size_t I = 0; I < SectionCount; ++I) {
     llvm::object::SectionRef Storage;
     const auto *Exidx =
@@ -622,7 +624,12 @@ TEST(ELFWriterTest, PreservesARMExidxAssociationsAndUsesOneSegment) {
               Texts[I] + 1);
     FirstAddress = std::min(FirstAddress, Exidx->getAddress());
     LastEnd = std::max(LastEnd, Exidx->getAddress() + Exidx->getSize());
+    ExidxOrder.emplace_back(Exidx->getAddress(),
+                            Graph.sections()[Texts[I]].Address);
   }
+  std::sort(ExidxOrder.begin(), ExidxOrder.end());
+  for (size_t I = 1; I < ExidxOrder.size(); ++I)
+    EXPECT_LT(ExidxOrder[I - 1].second, ExidxOrder[I].second);
   const uint64_t ProgramHeaderOffset =
       readInteger(Bytes, 28, 4, Endianness::Little);
   const uint16_t ProgramHeaderSize =
@@ -869,6 +876,23 @@ TEST(ELFWriterTest, RejectsELF32LayoutOverflowAtomically) {
   EXPECT_FALSE(ELFWriter::layout(Graph));
   EXPECT_EQ(Graph.sections()[0].Address, 0U);
   EXPECT_EQ(Graph.sections()[0].FileOffset, 0U);
+}
+
+TEST(ELFWriterTest, RejectsELF32GeneratedMetadataOverflowAtomically) {
+  LinkGraph Graph(Target::ARM, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("metadata-overflow.o"));
+  ASSERT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
+                                llvm::ELF::EF_ARM_ABI_FLOAT_HARD));
+  auto Text =
+      Graph.addSection(Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}});
+  ASSERT_TRUE(Text);
+  ASSERT_TRUE(Graph.setSectionAddress(*Text, UINT32_MAX - 2047));
+  ASSERT_TRUE(Graph.setSectionFileOffset(*Text, UINT32_MAX - 2047));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_FALSE(ELFWriter::write(Graph, Output));
+  EXPECT_TRUE(Bytes.empty());
 }
 
 TEST(ELFWriterTest, RejectsUnsupportedRebasesAndInvalidState) {

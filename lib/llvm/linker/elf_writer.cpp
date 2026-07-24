@@ -56,6 +56,16 @@ bool align(uint64_t Value, uint64_t Alignment, uint64_t &Result) noexcept {
   return add(Value, Mask, Result) && ((Result &= ~Mask), true);
 }
 
+bool boundedAdd(uint64_t Value, uint64_t Increment, uint64_t Maximum,
+                uint64_t &Result) noexcept {
+  return add(Value, Increment, Result) && Result <= Maximum;
+}
+
+bool boundedAlign(uint64_t Value, uint64_t Alignment, uint64_t Maximum,
+                  uint64_t &Result) noexcept {
+  return align(Value, Alignment, Result) && Result <= Maximum;
+}
+
 bool is64(Target Value) noexcept { return Value != Target::ARM; }
 
 uint16_t machine(Target Value) noexcept {
@@ -438,7 +448,9 @@ uint64_t sectionFlags(SectionKind Kind) noexcept {
   return 0;
 }
 
-std::vector<SectionId> order(const LinkGraph &Graph, SectionKind Kind) {
+std::vector<SectionId>
+order(const LinkGraph &Graph, SectionKind Kind,
+      Span<const std::pair<uint64_t, uint64_t>> Placements = {}) {
   std::vector<SectionId> Result;
   for (SectionId I = 0; I < Graph.sections().size(); ++I)
     if (Graph.sections()[I].Kind == Kind)
@@ -453,11 +465,13 @@ std::vector<SectionId> order(const LinkGraph &Graph, SectionKind Kind) {
         return LExidx;
       if (LExidx) {
         const uint64_t LAddress =
-            L.LinkedSection ? Graph.sections()[*L.LinkedSection].Address
-                            : UINT64_MAX;
+            L.LinkedSection && *L.LinkedSection < Placements.size()
+                ? Placements[*L.LinkedSection].first
+                : UINT64_MAX;
         const uint64_t RAddress =
-            R.LinkedSection ? Graph.sections()[*R.LinkedSection].Address
-                            : UINT64_MAX;
+            R.LinkedSection && *R.LinkedSection < Placements.size()
+                ? Placements[*R.LinkedSection].first
+                : UINT64_MAX;
         return std::tie(LAddress, Left) < std::tie(RAddress, Right);
       }
     }
@@ -496,7 +510,7 @@ Expect<void> ELFWriter::layout(LinkGraph &Graph) noexcept {
     for (const auto Kind : Kinds) {
       if (Kind != SectionKind::Text && !align(Cursor, PageSize, Cursor))
         return fail();
-      for (const SectionId Id : order(Graph, Kind)) {
+      for (const SectionId Id : order(Graph, Kind, Placements)) {
         const auto &SectionValue = Graph.sections()[Id];
         if (!align(Cursor, SectionValue.Alignment, Cursor))
           return fail();
@@ -530,6 +544,7 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       if (!validRebase(Graph, RebaseValue))
         return fail();
     const bool Wide = is64(Graph.target());
+    const uint64_t ClassMaximum = Wide ? UINT64_MAX : UINT32_MAX;
     const uint8_t AddressSize = Wide ? 8 : 4;
     const uint64_t ELFHeaderSize = Wide ? 64 : 52;
     const uint64_t ProgramHeaderSize = Wide ? 56 : 32;
@@ -597,7 +612,7 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       if (!add(std::max(Cursor, SectionValue.Address), SectionValue.VirtualSize,
                Cursor))
         return fail();
-    if (!align(Cursor, PageSize, Cursor))
+    if (!boundedAlign(Cursor, PageSize, ClassMaximum, Cursor))
       return fail();
 
     std::vector<const Section *> EHSections;
@@ -665,7 +680,8 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       }
       EHHeaderIndex = static_cast<uint32_t>(Sections.size());
       Sections.push_back(std::move(Header));
-      Cursor += EHHeaderSize;
+      if (!boundedAdd(Cursor, EHHeaderSize, ClassMaximum, Cursor))
+        return fail();
     }
 
     std::vector<const Symbol *> Exports;
@@ -704,15 +720,16 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       DynStr.insert(DynStr.end(), Name.begin(), Name.end());
       DynStr.push_back(0);
     }
-    if (!align(Cursor, AddressSize, Cursor))
+    if (!boundedAlign(Cursor, AddressSize, ClassMaximum, Cursor))
       return fail();
     const uint32_t DynStrIndex = static_cast<uint32_t>(Sections.size());
     Sections.push_back(OutputSection{
         ".dynstr", llvm::ELF::SHT_STRTAB, llvm::ELF::SHF_ALLOC, Cursor, Cursor,
         DynStr.size(), 0, 0, 1, 0, std::move(DynStr)});
-    Cursor += Sections.back().Size;
+    if (!boundedAdd(Cursor, Sections.back().Size, ClassMaximum, Cursor))
+      return fail();
 
-    if (!align(Cursor, AddressSize, Cursor))
+    if (!boundedAlign(Cursor, AddressSize, ClassMaximum, Cursor))
       return fail();
     uint64_t SymbolCount = 0;
     uint64_t DynSymSize = 0;
@@ -755,9 +772,10 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
                                      llvm::ELF::SHF_ALLOC, Cursor, Cursor,
                                      DynSym.size(), DynStrIndex, 1, AddressSize,
                                      SymbolSize, std::move(DynSym)});
-    Cursor += Sections.back().Size;
+    if (!boundedAdd(Cursor, Sections.back().Size, ClassMaximum, Cursor))
+      return fail();
 
-    if (!align(Cursor, 4, Cursor))
+    if (!boundedAlign(Cursor, 4, ClassMaximum, Cursor))
       return fail();
     const uint32_t BucketCount =
         std::max<uint32_t>(1, static_cast<uint32_t>(Exports.size()));
@@ -786,9 +804,10 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     Sections.push_back(OutputSection{
         ".hash", llvm::ELF::SHT_HASH, llvm::ELF::SHF_ALLOC, Cursor, Cursor,
         Hash.size(), DynSymIndex, 0, 4, 4, std::move(Hash)});
-    Cursor += Sections.back().Size;
+    if (!boundedAdd(Cursor, Sections.back().Size, ClassMaximum, Cursor))
+      return fail();
 
-    if (!align(Cursor, AddressSize, Cursor))
+    if (!boundedAlign(Cursor, AddressSize, ClassMaximum, Cursor))
       return fail();
     uint64_t RelocationsSize = 0;
     if (!multiply(Graph.rebases().size(), RelocationSize, RelocationsSize) ||
@@ -818,10 +837,10 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
         Wide ? llvm::ELF::SHT_RELA : llvm::ELF::SHT_REL, llvm::ELF::SHF_ALLOC,
         Cursor, Cursor, Relocations.size(), DynSymIndex, 0, AddressSize,
         RelocationSize, std::move(Relocations)});
-    if (!add(Cursor, Sections.back().Size, Cursor))
+    if (!boundedAdd(Cursor, Sections.back().Size, ClassMaximum, Cursor))
       return fail();
 
-    if (!align(Cursor, PageSize, Cursor))
+    if (!boundedAlign(Cursor, PageSize, ClassMaximum, Cursor))
       return fail();
     const uint64_t DynamicAddress = Cursor;
     constexpr size_t DynamicTagCount = 10;
@@ -853,7 +872,8 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
         OutputSection{".dynamic", llvm::ELF::SHT_DYNAMIC, llvm::ELF::SHF_ALLOC,
                       Cursor, Cursor, Dynamic.size(), DynStrIndex, 0,
                       AddressSize, DynamicSize, std::move(Dynamic)});
-    Cursor += Sections.back().Size;
+    if (!boundedAdd(Cursor, Sections.back().Size, ClassMaximum, Cursor))
+      return fail();
 
     std::vector<Byte> SectionNames(1);
     std::vector<uint32_t> SectionNameOffsets(Sections.size());
@@ -879,19 +899,21 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     SectionNames.insert(SectionNames.end(), SectionName.begin(),
                         SectionName.end());
     SectionNames.push_back(0);
-    if (!align(Cursor, 1, Cursor))
+    if (!boundedAlign(Cursor, 1, ClassMaximum, Cursor))
       return fail();
     Sections.push_back(OutputSection{".shstrtab", llvm::ELF::SHT_STRTAB, 0, 0,
                                      Cursor, SectionNames.size(), 0, 0, 1, 0,
                                      std::move(SectionNames)});
-    Cursor += Sections.back().Size;
+    if (!boundedAdd(Cursor, Sections.back().Size, ClassMaximum, Cursor))
+      return fail();
     uint64_t SectionHeaderOffset = 0;
-    if (!align(Cursor, AddressSize, SectionHeaderOffset))
+    if (!boundedAlign(Cursor, AddressSize, ClassMaximum, SectionHeaderOffset))
       return fail();
     uint64_t FileSize = 0;
     uint64_t SectionHeadersSize = 0;
     if (!multiply(Sections.size(), SectionHeaderSize, SectionHeadersSize) ||
-        !add(SectionHeaderOffset, SectionHeadersSize, FileSize) ||
+        !boundedAdd(SectionHeaderOffset, SectionHeadersSize, ClassMaximum,
+                    FileSize) ||
         FileSize > std::numeric_limits<size_t>::max())
       return fail();
 
