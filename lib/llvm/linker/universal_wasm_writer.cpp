@@ -5,9 +5,11 @@
 
 #include "aot/version.h"
 #include "common/defines.h"
+#include "common/spdlog.h"
 #include "linker/writer.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <limits>
 #include <optional>
@@ -163,44 +165,90 @@ bool indexedSymbol(std::string_view Name, char Prefix,
   return Result.ec == std::errc{} && Result.ptr == Name.data() + Name.size();
 }
 
-Expect<void> writeAddresses(Writer &Output, const LinkGraph &Graph) noexcept {
+std::optional<std::string_view> semanticName(const LinkGraph &Graph,
+                                             const Symbol &Value) {
+  if (!Value.Exported && !Value.Global)
+    return std::nullopt;
+  std::string_view Name = Value.ExportName ? *Value.ExportName : Value.Name;
+  if (Graph.format() == ObjectFormat::MachO && !Name.empty() && Name[0] == '_')
+    Name.remove_prefix(1);
+  return Name;
+}
+
+Expect<void> writeAddresses(Writer &Output, const LinkGraph &Graph) {
   uint64_t Version = 0;
   uint64_t Intrinsics = 0;
   std::vector<uint64_t> Types;
   std::vector<uint64_t> Codes;
+  std::vector<bool> TypePresent;
+  std::vector<bool> CodePresent;
   uint64_t FirstCode = std::numeric_limits<uint64_t>::max();
+  bool HasVersion = false;
+  bool HasIntrinsics = false;
   for (const auto &SymbolValue : Graph.symbols()) {
     const auto Address = symbolAddress(Graph, SymbolValue);
     if (!Address) {
       return writeError();
     }
-    if (SymbolValue.Name == "version") {
+    const auto Name = semanticName(Graph, SymbolValue);
+    if (!Name)
+      continue;
+    if (*Name == "version") {
+      if (HasVersion)
+        return writeError();
+      HasVersion = true;
       Version = *Address;
-    } else if (SymbolValue.Name == "intrinsics") {
+    } else if (*Name == "intrinsics") {
+      if (HasIntrinsics)
+        return writeError();
+      HasIntrinsics = true;
       Intrinsics = *Address;
     } else {
       uint64_t Index = 0;
-      if (indexedSymbol(SymbolValue.Name, 't', Index)) {
+      if (indexedSymbol(*Name, 't', Index) &&
+          std::to_string(Index) == Name->substr(1)) {
         if (Index == std::numeric_limits<uint64_t>::max() ||
             Index >= std::numeric_limits<size_t>::max()) {
           return writeError();
         }
+        if (TypePresent.size() > Index && TypePresent[Index])
+          return writeError();
         Types.resize(std::max(Types.size(), static_cast<size_t>(Index + 1)));
+        TypePresent.resize(Types.size());
         Types[Index] = *Address;
-      } else if (indexedSymbol(SymbolValue.Name, 'f', Index)) {
+        TypePresent[Index] = true;
+      } else if (indexedSymbol(*Name, 'f', Index) &&
+                 std::to_string(Index) == Name->substr(1)) {
         if (Index == std::numeric_limits<uint64_t>::max() ||
             Index >= std::numeric_limits<size_t>::max()) {
           return writeError();
         }
+        if (CodePresent.size() > Index && CodePresent[Index])
+          return writeError();
         Codes.resize(std::max(Codes.size(), static_cast<size_t>(Index + 1)));
+        CodePresent.resize(Codes.size());
         Codes[Index] = *Address;
+        CodePresent[Index] = true;
         FirstCode = std::min(FirstCode, Index);
       }
     }
   }
+  if (!HasVersion || !HasIntrinsics ||
+      std::find(TypePresent.begin(), TypePresent.end(), false) !=
+          TypePresent.end()) {
+    spdlog::error(
+        "universal writer: invalid semantic symbols version={} intrinsics={} types={} codes={}"sv,
+        HasVersion, HasIntrinsics, Types.size(), Codes.size());
+    return writeError();
+  }
   if (FirstCode != std::numeric_limits<uint64_t>::max()) {
     Codes.erase(Codes.begin(), Codes.begin() + static_cast<size_t>(FirstCode));
+    CodePresent.erase(CodePresent.begin(),
+                      CodePresent.begin() + static_cast<size_t>(FirstCode));
   }
+  if (std::find(CodePresent.begin(), CodePresent.end(), false) !=
+      CodePresent.end())
+    return writeError();
   EXPECTED_TRY(Output.writeU64(Version));
   EXPECTED_TRY(Output.writeU64(Intrinsics));
   EXPECTED_TRY(Output.writeU64(Types.size()));
@@ -219,6 +267,43 @@ Expect<void> writeAddresses(Writer &Output, const LinkGraph &Graph) noexcept {
 Expect<void>
 UniversalWasmWriter::write(const LinkGraph &Graph, Span<const Byte> Wasm,
                            const std::filesystem::path &Output) noexcept {
+  try {
+    Writer Result(Output);
+    return write(Graph, Wasm, Result);
+  } catch (...) {
+    return writeError();
+  }
+}
+
+Expect<void> UniversalWasmWriter::write(const LinkGraph &Graph,
+                                        Span<const Byte> Wasm, Writer &Result) {
+  constexpr std::array<Byte, 8> WasmHeader{0x00, 0x61, 0x73, 0x6D,
+                                           0x01, 0x00, 0x00, 0x00};
+  if (Wasm.size() < WasmHeader.size() ||
+      !std::equal(WasmHeader.begin(), WasmHeader.end(), Wasm.begin()))
+    return writeError();
+  size_t Offset = WasmHeader.size();
+  while (Offset < Wasm.size()) {
+    const Byte SectionId = Wasm[Offset++];
+    constexpr Byte LastCoreSectionId = 13;
+    if (SectionId > LastCoreSectionId)
+      return writeError();
+    uint32_t Size = 0;
+    unsigned Shift = 0;
+    Byte Encoded = 0;
+    do {
+      if (Offset >= Wasm.size() || Shift >= 35)
+        return writeError();
+      Encoded = Wasm[Offset++];
+      if (Shift == 28 && (Encoded & 0xF0) != 0)
+        return writeError();
+      Size |= static_cast<uint32_t>(Encoded & 0x7F) << Shift;
+      Shift += 7;
+    } while ((Encoded & 0x80) != 0);
+    if (Offset > Wasm.size() || Size > Wasm.size() - Offset)
+      return writeError();
+    Offset += Size;
+  }
   const auto OS = hostOS();
   const auto Arch = architecture(Graph.target());
   if (!OS || !Arch || !Graph.relocationsApplied()) {
@@ -254,7 +339,6 @@ UniversalWasmWriter::write(const LinkGraph &Graph, Span<const Byte> Wasm,
     return writeError();
   }
 
-  Writer Result(Output);
   EXPECTED_TRY(Result.write(Wasm));
   EXPECTED_TRY(Result.writeByte(CustomSectionId));
   EXPECTED_TRY(Result.writeU32(static_cast<uint32_t>(Payload.size())));

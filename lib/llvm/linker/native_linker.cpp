@@ -16,6 +16,9 @@
 #include <llvm/Support/FileSystem.h>
 
 #include <optional>
+#if !WASMEDGE_OS_WINDOWS
+#include <sys/stat.h>
+#endif
 
 namespace WasmEdge {
 namespace LLVM {
@@ -43,13 +46,16 @@ std::optional<Target> hostTarget() noexcept {
 #endif
 }
 
-Expect<std::filesystem::path>
-createUniqueSibling(const std::filesystem::path &Output) noexcept {
+struct TempFile {
+  std::filesystem::path Path;
+  int File = -1;
+};
+
+Expect<TempFile> createUniqueSibling(const std::filesystem::path &Output) {
   llvm::SmallString<128> Path;
   int File = -1;
-  const auto Model = Output.string() + ".tmp-%%%%%%";
-  if (llvm::sys::fs::createUniqueFile(Model, File, Path) ||
-      llvm::sys::fs::closeFile(File)) {
+  const auto Model = Output.u8string() + ".tmp-%%%%%%";
+  if (llvm::sys::fs::createUniqueFile(Model, File, Path)) {
     if (File != -1) {
       llvm::sys::fs::closeFile(File);
     }
@@ -57,13 +63,16 @@ createUniqueSibling(const std::filesystem::path &Output) noexcept {
     std::filesystem::remove(std::filesystem::path(Path.str().str()), Error);
     return Unexpect(ErrCode::Value::IllegalPath);
   }
-  return std::filesystem::path(Path.str().str());
+  return TempFile{std::filesystem::u8path(Path.str().str()), File};
 }
 
-class TempFile {
+class TempGuard {
 public:
-  explicit TempFile(std::filesystem::path Value) : Path(std::move(Value)) {}
-  ~TempFile() {
+  TempGuard(std::filesystem::path Value, int File)
+      : Path(std::move(Value)), File(File) {}
+  ~TempGuard() {
+    if (File != -1)
+      llvm::sys::fs::closeFile(File);
     if (!Published) {
       std::error_code Error;
       std::filesystem::remove(Path, Error);
@@ -72,9 +81,15 @@ public:
 
   void publish() noexcept { Published = true; }
   const std::filesystem::path &path() const noexcept { return Path; }
+  int release() noexcept {
+    const int Result = File;
+    File = -1;
+    return Result;
+  }
 
 private:
   std::filesystem::path Path;
+  int File;
   bool Published = false;
 };
 
@@ -83,41 +98,52 @@ private:
 Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
                                 const std::filesystem::path &Output,
                                 OutputKind Kind) noexcept {
-  if (Kind != OutputKind::UniversalWasm || Output.empty()) {
-    return linkError();
-  }
-  const auto TargetValue = hostTarget();
-  if (!TargetValue) {
-    return Unexpect(ErrCode::Value::AOTNotImpl);
-  }
-  EXPECTED_TRY(auto Graph, ObjectReader::read(Object, *TargetValue));
+  try {
+    if (Kind != OutputKind::UniversalWasm || Output.empty()) {
+      return linkError();
+    }
+    const auto TargetValue = hostTarget();
+    if (!TargetValue) {
+      return Unexpect(ErrCode::Value::AOTNotImpl);
+    }
+    EXPECTED_TRY(auto Graph, ObjectReader::read(Object, *TargetValue));
 #if WASMEDGE_OS_MACOS && defined(__aarch64__)
-  constexpr uint64_t HostPageSize = 16384;
+    constexpr uint64_t HostPageSize = 16384;
 #else
-  constexpr uint64_t HostPageSize = 4096;
+    constexpr uint64_t HostPageSize = 4096;
 #endif
-  if (auto Result = layout(Graph, 0, HostPageSize); !Result) {
-    return linkError();
-  }
-  EXPECTED_TRY(applyRelocations(Graph));
+    if (auto Result = layout(Graph, 0, HostPageSize); !Result) {
+      return linkError();
+    }
+    EXPECTED_TRY(applyRelocations(Graph));
 
-  EXPECTED_TRY(auto TempPath, createUniqueSibling(Output));
-  TempFile Temp(std::move(TempPath));
-  EXPECTED_TRY(UniversalWasmWriter::write(Graph, Wasm, Temp.path()));
-#if WASMEDGE_OS_WINDOWS
-  if (!winapi::MoveFileExW(Temp.path().c_str(), Output.c_str(),
-                           winapi::MOVEFILE_REPLACE_EXISTING_)) {
-    return linkError();
-  }
-#else
-  std::error_code Error;
-  std::filesystem::rename(Temp.path(), Output, Error);
-  if (Error) {
-    return linkError();
-  }
+    EXPECTED_TRY(auto Temp, createUniqueSibling(Output));
+    TempGuard Guard(std::move(Temp.Path), Temp.File);
+#if !WASMEDGE_OS_WINDOWS
+    struct stat DestinationStat{};
+    if (::stat(Output.c_str(), &DestinationStat) == 0 &&
+        ::fchmod(Temp.File, DestinationStat.st_mode & 07777) != 0)
+      return linkError();
 #endif
-  Temp.publish();
-  return {};
+    Writer OutputWriter(Guard.release());
+    EXPECTED_TRY(UniversalWasmWriter::write(Graph, Wasm, OutputWriter));
+#if WASMEDGE_OS_WINDOWS
+    if (!winapi::MoveFileExW(Guard.path().c_str(), Output.c_str(),
+                             winapi::MOVEFILE_REPLACE_EXISTING_)) {
+      return linkError();
+    }
+#else
+    std::error_code Error;
+    std::filesystem::rename(Guard.path(), Output, Error);
+    if (Error) {
+      return linkError();
+    }
+#endif
+    Guard.publish();
+    return {};
+  } catch (...) {
+    return linkError();
+  }
 }
 
 } // namespace Linker

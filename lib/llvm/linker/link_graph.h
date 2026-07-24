@@ -56,6 +56,7 @@ struct Symbol {
   uint64_t Size;
   bool Exported;
   std::optional<std::string> ExportName = std::nullopt;
+  bool Global = false;
 };
 
 struct Relocation {
@@ -103,8 +104,10 @@ bool relocationIsPCRelative(ObjectFormat Format, Target TargetValue,
 
 class LinkGraph {
 public:
-  LinkGraph(Target TargetValue, Endianness EndianValue) noexcept
-      : TargetValue(TargetValue), EndianValue(EndianValue) {}
+  LinkGraph(Target TargetValue, Endianness EndianValue,
+            ObjectFormat FormatValue = ObjectFormat::ELF) noexcept
+      : TargetValue(TargetValue), EndianValue(EndianValue),
+        FormatValue(FormatValue) {}
 
   LinkExpect<void> beginInput(std::string_view Name);
   LinkExpect<SectionId> addSection(Section Value);
@@ -118,6 +121,7 @@ public:
 
   Target target() const noexcept { return TargetValue; }
   Endianness endianness() const noexcept { return EndianValue; }
+  ObjectFormat format() const noexcept { return FormatValue; }
   const std::vector<Section> &sections() const noexcept { return Sections; }
   const std::vector<Symbol> &symbols() const noexcept { return Symbols; }
   const std::vector<Relocation> &relocations() const noexcept {
@@ -129,6 +133,7 @@ public:
 private:
   Target TargetValue;
   Endianness EndianValue;
+  ObjectFormat FormatValue;
   std::optional<std::string> InputName;
   std::vector<Section> Sections;
   std::vector<Symbol> Symbols;
@@ -136,7 +141,7 @@ private:
   std::vector<Rebase> Rebases;
   bool RelocationsApplied = false;
 
-  friend Expect<void> applyRelocations(LinkGraph &) noexcept;
+  friend Expect<void> applyRelocations(LinkGraph &);
 };
 
 } // namespace Linker

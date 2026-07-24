@@ -79,7 +79,7 @@ LinkExpect<void> overflow(const Section &SectionValue, SectionId Id,
 } // namespace
 
 LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase,
-                        uint64_t SegmentAlignment) noexcept {
+                        uint64_t SegmentAlignment) {
   if (SegmentAlignment == 0 ||
       (SegmentAlignment & (SegmentAlignment - 1)) != 0) {
     return fail<void>(Diagnostic{"invalid segment alignment"});

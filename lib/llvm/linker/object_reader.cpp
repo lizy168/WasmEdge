@@ -401,7 +401,7 @@ bool isAllocatable(const llvm::object::ObjectFile &Object,
 
 SectionPurpose sectionPurpose(const llvm::object::ObjectFile &Object,
                               llvm::StringRef Name) noexcept {
-  if (Name.contains("eh_frame"))
+  if (Name.contains("eh_frame") || Name == ".ARM.exidx")
     return SectionPurpose::EHFrame;
 #if LLVM_VERSION_MAJOR >= 19
   if (Name.starts_with(".pdata"))
@@ -576,7 +576,7 @@ parseCOFFExports(std::string_view Input) {
 } // namespace Internal
 
 Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
-                                     Target ExpectedTarget) noexcept {
+                                     Target ExpectedTarget) {
   if (Buffer.empty()) {
     return fail<LinkGraph>("empty object buffer");
   }
@@ -607,8 +607,10 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     return fail<LinkGraph>("object target does not match expected host target");
   }
 
-  LinkGraph Graph(*ActualTarget, Object.isLittleEndian() ? Endianness::Little
-                                                         : Endianness::Big);
+  LinkGraph Graph(*ActualTarget,
+                  Object.isLittleEndian() ? Endianness::Little
+                                          : Endianness::Big,
+                  objectFormat(Object));
   if (!Graph.beginInput("object")) {
     return fail<LinkGraph>("cannot initialize link graph input");
   }
@@ -701,6 +703,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       return fail<LinkGraph>("symbol address precedes its section");
     }
     bool Exported = (Flags & llvm::object::SymbolRef::SF_Exported) != 0;
+    const bool Global = (Flags & llvm::object::SymbolRef::SF_Global) != 0;
     std::optional<std::string> ExportName;
     if (Object.isMachO()) {
       Exported = (Flags & llvm::object::SymbolRef::SF_Global) != 0 &&
@@ -725,9 +728,10 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       SymbolName += "." + std::to_string((*InputSection)->getIndex()) + "." +
                     std::to_string(SymbolIds.size());
     }
-    auto Added = Graph.addSymbol(Symbol{
-        std::move(SymbolName), Section->second, Address - Base,
-        SymbolSizes[InputSymbol.getRawDataRefImpl()], Exported, ExportName});
+    auto Added = Graph.addSymbol(
+        Symbol{std::move(SymbolName), Section->second, Address - Base,
+               SymbolSizes[InputSymbol.getRawDataRefImpl()], Exported,
+               ExportName, Global});
     if (!Added) {
       return fail<LinkGraph>(Added.error().Message);
     }

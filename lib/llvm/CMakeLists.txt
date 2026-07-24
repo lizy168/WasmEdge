@@ -42,6 +42,16 @@ set(WASMEDGE_LLVM_SOURCES
   llvm.cpp
 )
 
+if(MSVC)
+  set_source_files_properties(linker/native_linker.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
+  set_source_files_properties(linker/universal_wasm_writer.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
+  set_source_files_properties(linker/writer.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
+else()
+  set_source_files_properties(linker/native_linker.cpp PROPERTIES COMPILE_OPTIONS -fexceptions)
+  set_source_files_properties(linker/universal_wasm_writer.cpp PROPERTIES COMPILE_OPTIONS -fexceptions)
+  set_source_files_properties(linker/writer.cpp PROPERTIES COMPILE_OPTIONS -fexceptions)
+endif()
+
 if(WASMEDGE_LINK_LLVM_STATIC)
   wasmedge_add_library(wasmedgeLLVM
     ${WASMEDGE_LLVM_SOURCES}

@@ -1116,6 +1116,9 @@ TEST_F(LinkerOutputTest, UniversalWasmWriterMergesSameKindSectionsAndGaps) {
       Section{".data.a", SectionKind::Data, 1, 2, 0x1000, 4, {5, 6}}));
   ASSERT_TRUE(Graph.addSection(
       Section{".data.b", SectionKind::Data, 4, 1, 0x1004, 6, {7}}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"f0", 0, 0, 1, true}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"version", 2, 0, 1, true}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"intrinsics", 3, 0, 1, true}));
   ASSERT_TRUE(applyRelocations(Graph));
   const auto Output = Directory / "merged.wasm";
 
@@ -1127,6 +1130,68 @@ TEST_F(LinkerOutputTest, UniversalWasmWriterMergesSameKindSectionsAndGaps) {
                 1, 0x10, 0x0A, {1, 2, 0, 0, 0, 0, 0, 0, 3, 4}}));
   EXPECT_EQ(Metadata.Sections[1], (decltype(Metadata.Sections)::value_type{
                                       2, 0x1000, 5, {5, 6, 0, 0, 7}}));
+}
+
+TEST(LinkerWriterTest, RejectsInvalidSemanticSymbolTables) {
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                    0x01, 0x00, 0x00, 0x00};
+  auto MakeGraph = [] {
+    LinkGraph Graph(Target::X86_64, Endianness::Little);
+    EXPECT_TRUE(Graph.beginInput("symbols.o"));
+    EXPECT_TRUE(
+        Graph.addSection(Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}}));
+    EXPECT_TRUE(Graph.addSection(
+        Section{".data", SectionKind::Data, 1, 3, 1, 1, {1, 2, 3}}));
+    return Graph;
+  };
+  auto Write = [&](LinkGraph &Graph) {
+    EXPECT_TRUE(applyRelocations(Graph));
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    return UniversalWasmWriter::write(Graph, EmptyWasm, Output);
+  };
+
+  auto Missing = MakeGraph();
+  EXPECT_FALSE(Write(Missing));
+
+  auto LocalShadow = MakeGraph();
+  ASSERT_TRUE(LocalShadow.addSymbol(Symbol{"local_version", 1, 0, 1, false}));
+  ASSERT_TRUE(LocalShadow.addSymbol(Symbol{"version", 1, 1, 1, true}));
+  ASSERT_TRUE(LocalShadow.addSymbol(Symbol{"intrinsics", 1, 2, 1, true}));
+  ASSERT_TRUE(LocalShadow.addSymbol(Symbol{"f0", 0, 0, 1, true}));
+  EXPECT_TRUE(Write(LocalShadow));
+
+  auto Duplicate = MakeGraph();
+  ASSERT_TRUE(Duplicate.addSymbol(Symbol{"version", 1, 0, 1, true}));
+  ASSERT_TRUE(Duplicate.addSymbol(Symbol{"intrinsics", 1, 1, 1, true}));
+  ASSERT_TRUE(Duplicate.addSymbol(Symbol{"f0", 0, 0, 1, true}));
+  ASSERT_TRUE(Duplicate.addSymbol(Symbol{"other", 0, 0, 1, true, "f0"}));
+  EXPECT_FALSE(Write(Duplicate));
+
+  auto Sparse = MakeGraph();
+  ASSERT_TRUE(Sparse.addSymbol(Symbol{"version", 1, 0, 1, true}));
+  ASSERT_TRUE(Sparse.addSymbol(Symbol{"intrinsics", 1, 1, 1, true}));
+  ASSERT_TRUE(Sparse.addSymbol(Symbol{"f0", 0, 0, 1, true}));
+  ASSERT_TRUE(Sparse.addSymbol(Symbol{"f2", 0, 0, 1, true}));
+  EXPECT_FALSE(Write(Sparse));
+
+  auto NonCanonical = MakeGraph();
+  ASSERT_TRUE(NonCanonical.addSymbol(Symbol{"version", 1, 0, 1, true}));
+  ASSERT_TRUE(NonCanonical.addSymbol(Symbol{"intrinsics", 1, 1, 1, true}));
+  ASSERT_TRUE(NonCanonical.addSymbol(Symbol{"f0", 0, 0, 1, true}));
+  ASSERT_TRUE(NonCanonical.addSymbol(Symbol{"f01", 0, 0, 1, true}));
+  EXPECT_TRUE(Write(NonCanonical));
+
+  LinkGraph Darwin(Target::X86_64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Darwin.beginInput("symbols.o"));
+  ASSERT_TRUE(
+      Darwin.addSection(Section{"__text", SectionKind::Text, 1, 1, 0, 0, {0}}));
+  ASSERT_TRUE(Darwin.addSection(
+      Section{"__data", SectionKind::Data, 1, 2, 1, 1, {1, 2}}));
+  ASSERT_TRUE(Darwin.addSymbol(Symbol{"_version", 1, 0, 1, true}));
+  ASSERT_TRUE(Darwin.addSymbol(Symbol{"_intrinsics", 1, 1, 1, true}));
+  ASSERT_TRUE(Darwin.addSymbol(Symbol{"_f0", 0, 0, 1, true}));
+  EXPECT_TRUE(Write(Darwin));
 }
 
 TEST_F(LinkerOutputTest, UniversalCodegenExecutesTinyFixture) {
@@ -1179,12 +1244,15 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsUnsupportedOutputAtomically) {
 }
 
 TEST_F(LinkerOutputTest, NativeLinkerCreatesNoNativeTemporary) {
-  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
-                                                    0x01, 0x00, 0x00, 0x00};
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
   const auto Output = Directory / "output.wasm";
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
 
-  ASSERT_TRUE(NativeLinker::link(makeNativeObject(), EmptyWasm, Output,
-                                 OutputKind::UniversalWasm));
+  ASSERT_TRUE(
+      NativeLinker::link(Object, TinyWasm, Output, OutputKind::UniversalWasm));
   ASSERT_TRUE(std::filesystem::is_regular_file(Output));
   expectNoTemporaryFiles();
 }
@@ -1203,12 +1271,24 @@ TEST_F(LinkerOutputTest, NativeLinkerReplacesExistingOutputAtomically) {
                Sentinel.size());
     ASSERT_TRUE(File);
   }
+#if !WASMEDGE_OS_WINDOWS
+  constexpr std::filesystem::perms SentinelMode =
+      std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+      std::filesystem::perms::group_read;
+  std::filesystem::permissions(Output, SentinelMode,
+                               std::filesystem::perm_options::replace);
+#endif
 
   ASSERT_TRUE(
       NativeLinker::link(Object, TinyWasm, Output, OutputKind::UniversalWasm));
   EXPECT_NE(readFile(Output),
             (std::vector<WasmEdge::Byte>(Sentinel.begin(), Sentinel.end())));
   EXPECT_EQ(execute(Output), 7U);
+#if !WASMEDGE_OS_WINDOWS
+  EXPECT_EQ(std::filesystem::status(Output).permissions() &
+                std::filesystem::perms::mask,
+            SentinelMode);
+#endif
   expectNoTemporaryFiles();
 }
 
@@ -1232,13 +1312,35 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsBadObjectsAtomically) {
   }
 }
 
+TEST_F(LinkerOutputTest, NativeLinkerRejectsMalformedWasmAtomically) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Output = Directory / "malformed.wasm";
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  const std::array<std::vector<WasmEdge::Byte>, 4> Invalid{{
+      {0x01, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00},
+      {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00},
+      {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00},
+      {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x80, 0x80, 0x80,
+       0x80, 0x10},
+  }};
+  for (const auto &Wasm : Invalid) {
+    EXPECT_FALSE(
+        NativeLinker::link(Object, Wasm, Output, OutputKind::UniversalWasm));
+    EXPECT_FALSE(std::filesystem::exists(Output));
+    expectNoTemporaryFiles();
+  }
+}
+
 TEST_F(LinkerOutputTest,
        NativeLinkerPublishesConcurrentlyWithoutTempSurvivors) {
   constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
       0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
       0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
       0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
-  const auto Object = makeNativeObject();
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
   std::promise<void> Start;
   const auto Ready = Start.get_future().share();
   auto Link = [&](const char *Name) {
@@ -1571,7 +1673,7 @@ TEST(LinkGraphTest, ClassifiesCanonicalELFPCRelativeRelocations) {
         relocationIsPCRelative(ObjectFormat::ELF, Test.Architecture, Test.Type),
         Test.PCRelative);
   }
-  EXPECT_FALSE(relocationIsPCRelative(ObjectFormat::COFF, Target::X86_64, 4));
+  EXPECT_TRUE(relocationIsPCRelative(ObjectFormat::COFF, Target::X86_64, 4));
 }
 
 TEST(LinkGraphTest, EnforcesCanonicalX86RelocationPatchSizes) {

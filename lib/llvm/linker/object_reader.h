@@ -27,8 +27,7 @@ parseCOFFExports(std::string_view Directives);
 
 class ObjectReader {
 public:
-  static Expect<LinkGraph> read(Span<const Byte> Buffer,
-                                Target ExpectedTarget) noexcept;
+  static Expect<LinkGraph> read(Span<const Byte> Buffer, Target ExpectedTarget);
 };
 
 } // namespace Linker

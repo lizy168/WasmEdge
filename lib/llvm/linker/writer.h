@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <llvm/Support/raw_ostream.h>
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -20,17 +22,21 @@ namespace Linker {
 class Writer {
 public:
   explicit Writer(const std::filesystem::path &Path) noexcept;
+  explicit Writer(int FileDescriptor);
   explicit Writer(std::vector<Byte> &Buffer) noexcept : Buffer(&Buffer) {}
+  ~Writer();
 
-  Expect<void> writeByte(uint8_t Data) noexcept;
-  Expect<void> writeU32(uint32_t Data) noexcept;
-  Expect<void> writeU64(uint64_t Data) noexcept;
-  Expect<void> writeName(std::string_view Data) noexcept;
-  Expect<void> write(Span<const Byte> Data) noexcept;
-  Expect<void> close() noexcept;
+  Expect<void> writeByte(uint8_t Data);
+  Expect<void> writeU32(uint32_t Data);
+  Expect<void> writeU64(uint64_t Data);
+  Expect<void> writeName(std::string_view Data);
+  Expect<void> write(Span<const Byte> Data);
+  Expect<void> close();
 
 private:
   std::ofstream Stream;
+  std::unique_ptr<llvm::raw_fd_ostream> DescriptorStream;
+  int FileDescriptor = -1;
   std::vector<Byte> *Buffer = nullptr;
 };
 

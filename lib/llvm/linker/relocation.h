@@ -12,7 +12,7 @@ namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
 
-Expect<void> applyRelocations(LinkGraph &Graph) noexcept;
+Expect<void> applyRelocations(LinkGraph &Graph);
 
 namespace Internal {
 

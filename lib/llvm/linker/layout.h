@@ -12,7 +12,7 @@ namespace LLVM {
 namespace Linker {
 
 LinkExpect<void> layout(LinkGraph &Graph, uint64_t ImageBase = 0,
-                        uint64_t SegmentAlignment = 1) noexcept;
+                        uint64_t SegmentAlignment = 1);
 
 } // namespace Linker
 } // namespace LLVM

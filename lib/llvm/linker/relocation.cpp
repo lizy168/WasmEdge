@@ -129,7 +129,7 @@ Expect<void> writeSigned(Span<Byte> Bytes, uint64_t Offset, uint8_t Width,
 
 } // namespace Internal
 
-Expect<void> applyRelocations(LinkGraph &Graph) noexcept {
+Expect<void> applyRelocations(LinkGraph &Graph) {
   if (Graph.RelocationsApplied) {
     spdlog::error("native linker: relocations already applied"sv);
     return Unexpect(ErrCode::Value::IllegalPath);
