@@ -401,7 +401,9 @@ bool isAllocatable(const llvm::object::ObjectFile &Object,
 
 SectionPurpose sectionPurpose(const llvm::object::ObjectFile &Object,
                               llvm::StringRef Name) noexcept {
-  if (Name.contains("eh_frame") || Name == ".ARM.exidx")
+  if (Name == ".ARM.exidx" || Name.starts_with(".ARM.exidx."))
+    return SectionPurpose::ARMExidx;
+  if (Name.contains("eh_frame"))
     return SectionPurpose::EHFrame;
 #if LLVM_VERSION_MAJOR >= 19
   if (Name.starts_with(".pdata"))
@@ -427,7 +429,8 @@ SectionKind sectionKind(const llvm::object::SectionRef &Section,
   if (Section.isBSS() || Section.isVirtual()) {
     return SectionKind::BSS;
   }
-  if (Purpose == SectionPurpose::EHFrame || Purpose == SectionPurpose::PData) {
+  if (Purpose == SectionPurpose::EHFrame ||
+      Purpose == SectionPurpose::ARMExidx || Purpose == SectionPurpose::PData) {
     return SectionKind::Unwind;
   }
   if (Purpose == SectionPurpose::XData ||
@@ -614,6 +617,12 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
                   objectFormat(Object));
   if (!Graph.beginInput("object")) {
     return fail<LinkGraph>("cannot initialize link graph input");
+  }
+  if (const auto *ELF =
+          llvm::dyn_cast<llvm::object::ELFObjectFileBase>(&Object)) {
+    if (*ActualTarget == Target::ARM &&
+        !Graph.setELFFlags(ELF->getPlatformFlags()))
+      return fail<LinkGraph>("cannot preserve ELF flags");
   }
   std::map<uint64_t, SectionId> SectionIds;
   std::map<std::string, std::string> COFFExports;

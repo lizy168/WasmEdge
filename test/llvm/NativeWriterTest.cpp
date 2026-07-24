@@ -12,7 +12,9 @@
 #include <llvm/Support/MemoryBufferRef.h>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -62,9 +64,37 @@ std::vector<WasmEdge::Byte> makeEHFrame(Endianness Endian) {
   return Bytes;
 }
 
+std::vector<WasmEdge::Byte> makePersonalityEHFrame(Endianness Endian,
+                                                   uint8_t Encoding) {
+  constexpr size_t CIERecordSize = 23;
+  constexpr size_t FDERecordSize = 17;
+  constexpr size_t TerminatorSize = 4;
+  std::vector<WasmEdge::Byte> Bytes(CIERecordSize + FDERecordSize +
+                                    TerminatorSize);
+  writeInteger(Bytes, 0, 19, 4, Endian);
+  Bytes[8] = 1;
+  Bytes[9] = 'z';
+  Bytes[10] = 'P';
+  Bytes[11] = 'R';
+  Bytes[13] = 1;
+  Bytes[14] = 0x78;
+  Bytes[15] = 16;
+  Bytes[16] = 6;
+  Bytes[17] = Encoding;
+  Bytes[22] = 0x1B;
+  writeInteger(Bytes, CIERecordSize, 13, 4, Endian);
+  writeInteger(Bytes, CIERecordSize + 4, CIERecordSize + 4, 4, Endian);
+  writeInteger(Bytes, CIERecordSize + 12, 2, 4, Endian);
+  return Bytes;
+}
+
 LinkGraph makeELFGraph(const ELFCase &Test) {
   LinkGraph Graph(Test.Architecture, Test.Endian);
   EXPECT_TRUE(Graph.beginInput("writer.o"));
+  if (Test.Architecture == Target::ARM) {
+    EXPECT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
+                                  llvm::ELF::EF_ARM_ABI_FLOAT_HARD));
+  }
   const uint8_t PointerSize = Test.Is64 ? 8 : 4;
   auto Text = Graph.addSection(
       Section{".text", SectionKind::Text, 16, 4, 0, 0, {0xC3, 0, 0, 0}});
@@ -453,6 +483,156 @@ TEST(ELFWriterTest, OmitsEHFrameHeaderWithoutEHFrame) {
     EXPECT_NE(readInteger(Bytes, ProgramHeaderOffset + I * ProgramHeaderSize, 4,
                           Endianness::Little),
               llvm::ELF::PT_GNU_EH_FRAME);
+}
+
+TEST(ELFWriterTest, WritesARMExidxAndHardFloatABI) {
+  LinkGraph Graph(Target::ARM, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("arm.o"));
+  ASSERT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
+                                llvm::ELF::EF_ARM_ABI_FLOAT_HARD));
+  auto Text = Graph.addSection(
+      Section{".text", SectionKind::Text, 4, 4, 0, 0, {0, 0, 0, 0}});
+  auto Exidx = Graph.addSection(Section{".ARM.exidx",
+                                        SectionKind::Unwind,
+                                        4,
+                                        8,
+                                        0,
+                                        0,
+                                        {0, 0, 0, 0, 1, 0, 0, 0},
+                                        SectionPurpose::ARMExidx});
+  ASSERT_TRUE(Text && Exidx);
+  ASSERT_TRUE(ELFWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  const auto ExidxContent = Graph.sections()[*Exidx].Content;
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(ELFWriter::write(Graph, Output));
+  if (const char *Fixture = std::getenv("WASMEDGE_ARM_ELF_FIXTURE")) {
+    std::ofstream File(Fixture, std::ios_base::binary);
+    File.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+    ASSERT_TRUE(File);
+  }
+  EXPECT_EQ(readInteger(Bytes, 36, 4, Endianness::Little),
+            llvm::ELF::EF_ARM_EABI_VER5 | llvm::ELF::EF_ARM_ABI_FLOAT_HARD);
+
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "arm.so"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  llvm::object::SectionRef ExidxStorage;
+  const auto *ExidxSection = findSection(**Object, ".ARM.exidx", ExidxStorage);
+  ASSERT_NE(ExidxSection, nullptr);
+  const llvm::object::ELFSectionRef ELFExidx(*ExidxSection);
+  EXPECT_EQ(ELFExidx.getType(), llvm::ELF::SHT_ARM_EXIDX);
+  EXPECT_EQ(ELFExidx.getFlags(),
+            llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_LINK_ORDER);
+  const uint64_t SectionHeaderOffset =
+      readInteger(Bytes, 32, 4, Endianness::Little);
+  const uint64_t ExidxHeader =
+      SectionHeaderOffset + ExidxSection->getIndex() * 40;
+  EXPECT_EQ(readInteger(Bytes, ExidxHeader + 24, 4, Endianness::Little), 1U);
+  auto Content = ExidxSection->getContents();
+  ASSERT_TRUE(static_cast<bool>(Content));
+  EXPECT_EQ(
+      std::vector<WasmEdge::Byte>(Content->bytes_begin(), Content->bytes_end()),
+      ExidxContent);
+  const uint64_t ProgramHeaderOffset =
+      readInteger(Bytes, 28, 4, Endianness::Little);
+  const uint16_t ProgramHeaderSize =
+      static_cast<uint16_t>(readInteger(Bytes, 42, 2, Endianness::Little));
+  const uint16_t ProgramHeaderCount =
+      static_cast<uint16_t>(readInteger(Bytes, 44, 2, Endianness::Little));
+  bool HasExidx = false;
+  for (uint16_t I = 0; I < ProgramHeaderCount; ++I) {
+    const uint64_t Offset = ProgramHeaderOffset + I * ProgramHeaderSize;
+    if (readInteger(Bytes, Offset, 4, Endianness::Little) ==
+        llvm::ELF::PT_ARM_EXIDX) {
+      HasExidx = true;
+      EXPECT_EQ(readInteger(Bytes, Offset + 8, 4, Endianness::Little),
+                ExidxSection->getAddress());
+      EXPECT_EQ(readInteger(Bytes, Offset + 16, 4, Endianness::Little),
+                ExidxSection->getSize());
+    }
+  }
+  EXPECT_TRUE(HasExidx);
+  llvm::object::SectionRef HeaderStorage;
+  EXPECT_EQ(findSection(**Object, ".eh_frame_hdr", HeaderStorage), nullptr);
+}
+
+TEST(ELFWriterTest, RejectsConflictingARMABIFlags) {
+  LinkGraph Graph(Target::ARM, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("arm.o"));
+  ASSERT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
+                                llvm::ELF::EF_ARM_ABI_FLOAT_HARD |
+                                llvm::ELF::EF_ARM_ABI_FLOAT_SOFT));
+  ASSERT_TRUE(Graph.addSection(
+      Section{".text", SectionKind::Text, 4, 4, 0, 0, {0, 0, 0, 0}}));
+  ASSERT_TRUE(ELFWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_FALSE(ELFWriter::write(Graph, Output));
+  EXPECT_TRUE(Bytes.empty());
+}
+
+TEST(ELFWriterTest, AcceptsDefinedPCRelativePersonality) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("personality.o"));
+  auto Text = Graph.addSection(
+      Section{".text", SectionKind::Text, 16, 4, 0, 0, {0xC3, 0, 0xC3, 0}});
+  auto EH = Graph.addSection(
+      Section{".eh_frame", SectionKind::Unwind, 8,
+              makePersonalityEHFrame(Endianness::Little, 0x1B).size(), 0, 0,
+              makePersonalityEHFrame(Endianness::Little, 0x1B),
+              SectionPurpose::EHFrame});
+  ASSERT_TRUE(Text && EH);
+  ASSERT_TRUE(
+      Graph.addSymbol(Symbol{"f0", *Text, 0, 1, true, std::nullopt, true}));
+  ASSERT_TRUE(Graph.addSymbol(
+      Symbol{"personality", *Text, 2, 1, false, std::nullopt, false}));
+  ASSERT_TRUE(ELFWriter::layout(Graph));
+  auto Content = Graph.sectionContent(*EH);
+  ASSERT_TRUE(Content);
+  const uint64_t PersonalityField = Graph.sections()[*EH].Address + 18;
+  const int64_t PersonalityDelta =
+      static_cast<int64_t>(Graph.sections()[*Text].Address + 2) -
+      static_cast<int64_t>(PersonalityField);
+  const uint64_t FunctionField = Graph.sections()[*EH].Address + 31;
+  const int64_t FunctionDelta =
+      static_cast<int64_t>(Graph.sections()[*Text].Address) -
+      static_cast<int64_t>(FunctionField);
+  for (uint8_t I = 0; I < 4; ++I) {
+    (*Content)[18 + I] = static_cast<WasmEdge::Byte>(
+        static_cast<uint32_t>(PersonalityDelta) >> (I * 8));
+    (*Content)[31 + I] = static_cast<WasmEdge::Byte>(
+        static_cast<uint32_t>(FunctionDelta) >> (I * 8));
+  }
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_TRUE(ELFWriter::write(Graph, Output));
+}
+
+TEST(ELFWriterTest, RejectsUnsupportedPersonalityEncodings) {
+  for (const uint8_t Encoding : {uint8_t{0x9B}, uint8_t{0x03}}) {
+    LinkGraph Graph(Target::X86_64, Endianness::Little);
+    ASSERT_TRUE(Graph.beginInput("personality.o"));
+    ASSERT_TRUE(Graph.addSection(
+        Section{".text", SectionKind::Text, 16, 4, 0, 0, {0xC3, 0, 0xC3, 0}}));
+    ASSERT_TRUE(Graph.addSection(
+        Section{".eh_frame", SectionKind::Unwind, 8,
+                makePersonalityEHFrame(Endianness::Little, Encoding).size(), 0,
+                0, makePersonalityEHFrame(Endianness::Little, Encoding),
+                SectionPurpose::EHFrame}));
+    ASSERT_TRUE(ELFWriter::layout(Graph));
+    ASSERT_TRUE(applyRelocations(Graph));
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    EXPECT_FALSE(ELFWriter::write(Graph, Output));
+    EXPECT_TRUE(Bytes.empty());
+  }
 }
 
 TEST(ELFWriterTest, RejectsUnsupportedRebasesAndInvalidState) {

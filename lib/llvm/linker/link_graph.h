@@ -28,6 +28,7 @@ enum class SectionPurpose : uint8_t {
   PData,
   XData,
   CompactUnwind,
+  ARMExidx,
 };
 enum class ObjectFormat : uint8_t { ELF, MachO, COFF };
 
@@ -125,11 +126,13 @@ public:
   LinkExpect<void> validate() const;
   LinkExpect<void> setSectionAddress(SectionId Id, uint64_t Address);
   LinkExpect<void> setSectionFileOffset(SectionId Id, uint64_t FileOffset);
+  LinkExpect<void> setELFFlags(uint32_t Flags);
   LinkExpect<Span<Byte>> sectionContent(SectionId Id);
 
   Target target() const noexcept { return TargetValue; }
   Endianness endianness() const noexcept { return EndianValue; }
   ObjectFormat format() const noexcept { return FormatValue; }
+  uint32_t elfFlags() const noexcept { return ELFFlags; }
   const std::vector<Section> &sections() const noexcept { return Sections; }
   const std::vector<Symbol> &symbols() const noexcept { return Symbols; }
   const std::vector<Relocation> &relocations() const noexcept {
@@ -145,6 +148,7 @@ private:
   Target TargetValue;
   Endianness EndianValue;
   ObjectFormat FormatValue;
+  uint32_t ELFFlags = 0;
   std::optional<std::string> InputName;
   std::vector<Section> Sections;
   std::vector<Symbol> Symbols;

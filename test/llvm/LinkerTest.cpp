@@ -489,7 +489,8 @@ std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
 
 std::vector<WasmEdge::Byte> makeAssemblyObject(const llvm::Triple &Triple,
                                                std::string Assembly,
-                                               std::string Features = {}) {
+                                               std::string Features = {},
+                                               bool HardFloat = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -506,6 +507,10 @@ std::vector<WasmEdge::Byte> makeAssemblyObject(const llvm::Triple &Triple,
     return {};
   }
   llvm::TargetOptions Options;
+  if (HardFloat) {
+    Options.FloatABIType = llvm::FloatABI::Hard;
+    Options.MCOptions.ABIName = "aapcs-vfp";
+  }
   std::unique_ptr<llvm::TargetMachine> Machine(Target->createTargetMachine(
 #if LLVM_VERSION_MAJOR >= 21
       Triple,
@@ -4421,6 +4426,22 @@ TEST(ObjectReaderTest, MarksELFRelAddendsImplicit) {
   ASSERT_FALSE(Result->relocations().empty());
   EXPECT_TRUE(Result->relocations()[0].AddendIsImplicit);
   EXPECT_EQ(Result->relocations()[0].Addend, 0);
+}
+
+TEST(ObjectReaderTest, PreservesARMHardFloatMetadata) {
+  auto Bytes = makeAssemblyObject(
+      llvm::Triple("armv7-unknown-linux-gnueabihf"),
+      ".syntax unified\n.text\n.globl f0\nf0:\n bx lr\n", "", true);
+  ASSERT_GE(Bytes.size(), 40U);
+  const uint32_t HardFloatFlags =
+      llvm::ELF::EF_ARM_EABI_VER5 | llvm::ELF::EF_ARM_ABI_FLOAT_HARD;
+  std::memcpy(Bytes.data() + 36, &HardFloatFlags, sizeof(HardFloatFlags));
+  auto Result = ObjectReader::read(Bytes, Target::ARM);
+  ASSERT_TRUE(Result);
+  EXPECT_EQ(Result->elfFlags() & llvm::ELF::EF_ARM_EABIMASK,
+            llvm::ELF::EF_ARM_EABI_VER5);
+  EXPECT_EQ(Result->elfFlags() & llvm::ELF::EF_ARM_ABI_FLOAT_HARD,
+            llvm::ELF::EF_ARM_ABI_FLOAT_HARD);
 }
 
 TEST(ObjectReaderTest, RejectsNonRelocatableELFObject) {

@@ -103,6 +103,19 @@ bool validRebase(const LinkGraph &Graph, const Rebase &Value) noexcept {
   return false;
 }
 
+bool validELFFlags(const LinkGraph &Graph) noexcept {
+  if (Graph.target() != Target::ARM)
+    return Graph.elfFlags() == 0;
+  constexpr uint32_t Required =
+      llvm::ELF::EF_ARM_EABI_VER5 | llvm::ELF::EF_ARM_ABI_FLOAT_HARD;
+  constexpr uint32_t Supported = llvm::ELF::EF_ARM_EABIMASK |
+                                 llvm::ELF::EF_ARM_ABI_FLOAT_SOFT |
+                                 llvm::ELF::EF_ARM_ABI_FLOAT_HARD;
+  return (Graph.elfFlags() & Required) == Required &&
+         (Graph.elfFlags() & llvm::ELF::EF_ARM_ABI_FLOAT_SOFT) == 0 &&
+         (Graph.elfFlags() & ~Supported) == 0;
+}
+
 void put(std::vector<Byte> &Bytes, uint64_t Offset, uint64_t Value,
          uint8_t Width, Endianness Endian) {
   for (uint8_t I = 0; I < Width; ++I) {
@@ -230,7 +243,32 @@ bool decodeFDEAddress(Span<const Byte> Bytes, size_t Offset, uint8_t Encoding,
   return true;
 }
 
-bool parseEHFrame(const Section &EH, Endianness Endian,
+uint8_t encodingWidth(uint8_t Encoding) noexcept {
+  switch (Encoding & EncodingFormatMask) {
+  case llvm::dwarf::DW_EH_PE_sdata2:
+  case llvm::dwarf::DW_EH_PE_udata2:
+    return 2;
+  case llvm::dwarf::DW_EH_PE_sdata4:
+  case llvm::dwarf::DW_EH_PE_udata4:
+    return 4;
+  case llvm::dwarf::DW_EH_PE_sdata8:
+  case llvm::dwarf::DW_EH_PE_udata8:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
+bool graphContainsAddress(const LinkGraph &Graph, uint64_t Address) noexcept {
+  return std::any_of(Graph.sections().begin(), Graph.sections().end(),
+                     [&](const auto &SectionValue) {
+                       return Address >= SectionValue.Address &&
+                              Address - SectionValue.Address <
+                                  SectionValue.VirtualSize;
+                     });
+}
+
+bool parseEHFrame(const LinkGraph &Graph, const Section &EH, Endianness Endian,
                   std::vector<FDEInfo> &FDEs) noexcept {
   const Span<const Byte> Bytes(EH.Content.data(), EH.Content.size());
   std::map<size_t, CIEInfo> CIEs;
@@ -272,7 +310,23 @@ bool parseEHFrame(const Section &EH, Endianness Endian,
             return false;
           Encoding = Bytes[Cursor++];
         } else if (Character == 'P') {
-          return false;
+          if (Cursor >= AugmentationEnd)
+            return false;
+          const uint8_t PersonalityEncoding = Bytes[Cursor++];
+          const uint8_t Width = encodingWidth(PersonalityEncoding);
+          if ((PersonalityEncoding & llvm::dwarf::DW_EH_PE_indirect) != 0 ||
+              (PersonalityEncoding & EncodingApplicationMask) !=
+                  llvm::dwarf::DW_EH_PE_pcrel ||
+              (PersonalityEncoding & EncodingFormatMask) <
+                  llvm::dwarf::DW_EH_PE_sdata2 ||
+              Width == 0 || Width > AugmentationEnd - Cursor)
+            return false;
+          uint64_t Personality = 0;
+          if (!decodeFDEAddress(Bytes, Cursor, PersonalityEncoding,
+                                EH.Address + Cursor, Endian, Personality) ||
+              !graphContainsAddress(Graph, Personality))
+            return false;
+          Cursor += Width;
         } else if (Character == 'L') {
           if (Cursor >= AugmentationEnd)
             return false;
@@ -385,7 +439,7 @@ Expect<void> ELFWriter::layout(LinkGraph &Graph) noexcept {
 Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
   try {
     if (!Graph.relocationsApplied() || Graph.format() != ObjectFormat::ELF ||
-        !Graph.validate())
+        !Graph.validate() || !validELFFlags(Graph))
       return fail();
     for (const auto &RebaseValue : Graph.rebases())
       if (!validRebase(Graph, RebaseValue))
@@ -405,12 +459,26 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     for (SectionId I = 0; I < Graph.sections().size(); ++I) {
       const auto &Input = Graph.sections()[I];
       GraphSectionIndices[I] = static_cast<uint32_t>(Sections.size());
+      const bool ARMExidx = Input.Purpose == SectionPurpose::ARMExidx;
       Sections.push_back(OutputSection{
           Input.Name,
-          Input.Kind == SectionKind::BSS ? llvm::ELF::SHT_NOBITS
-                                         : llvm::ELF::SHT_PROGBITS,
-          sectionFlags(Input.Kind), Input.Address, Input.FileOffset,
-          Input.VirtualSize, 0, 0, Input.Alignment, 0, Input.Content});
+          ARMExidx                         ? llvm::ELF::SHT_ARM_EXIDX
+          : Input.Kind == SectionKind::BSS ? llvm::ELF::SHT_NOBITS
+                                           : llvm::ELF::SHT_PROGBITS,
+          ARMExidx ? llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_LINK_ORDER
+                   : sectionFlags(Input.Kind),
+          Input.Address, Input.FileOffset, Input.VirtualSize, 0, 0,
+          Input.Alignment, 0, Input.Content});
+    }
+    const auto TextSectionIndex = std::find_if(
+        Graph.sections().begin(), Graph.sections().end(),
+        [](const auto &Section) { return Section.Kind == SectionKind::Text; });
+    if (TextSectionIndex != Graph.sections().end()) {
+      const uint32_t TextIndex = GraphSectionIndices[static_cast<SectionId>(
+          TextSectionIndex - Graph.sections().begin())];
+      for (size_t I = 0; I < Graph.sections().size(); ++I)
+        if (Graph.sections()[I].Purpose == SectionPurpose::ARMExidx)
+          Sections[GraphSectionIndices[I]].Link = TextIndex;
     }
 
     uint64_t Cursor = 0;
@@ -429,7 +497,7 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     uint32_t EHHeaderIndex = 0;
     if (EH != Graph.sections().end()) {
       std::vector<FDEInfo> FDEs;
-      if (!parseEHFrame(*EH, Endian, FDEs) || FDEs.empty())
+      if (!parseEHFrame(Graph, *EH, Endian, FDEs) || FDEs.empty())
         return fail();
       std::sort(FDEs.begin(), FDEs.end(),
                 [](const auto &Left, const auto &Right) {
@@ -724,6 +792,12 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
           {llvm::ELF::PT_GNU_EH_FRAME, llvm::ELF::PF_R,
            Sections[EHHeaderIndex].Offset, Sections[EHHeaderIndex].Address,
            Sections[EHHeaderIndex].Size, Sections[EHHeaderIndex].Size, 4});
+    for (const auto &SectionValue : Sections)
+      if (SectionValue.Type == llvm::ELF::SHT_ARM_EXIDX)
+        Segments.push_back({llvm::ELF::PT_ARM_EXIDX, llvm::ELF::PF_R,
+                            SectionValue.Offset, SectionValue.Address,
+                            SectionValue.Size, SectionValue.Size,
+                            SectionValue.Alignment});
     Segments.push_back({llvm::ELF::PT_GNU_STACK,
                         llvm::ELF::PF_R | llvm::ELF::PF_W, 0, 0, 0, 0,
                         AddressSize});
@@ -757,6 +831,7 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     } else {
       put(Bytes, 28, ELFHeaderSize, 4, Endian);
       put(Bytes, 32, SectionHeaderOffset, 4, Endian);
+      put(Bytes, 36, Graph.elfFlags(), 4, Endian);
       put(Bytes, 40, ELFHeaderSize, 2, Endian);
       put(Bytes, 42, ProgramHeaderSize, 2, Endian);
       put(Bytes, 44, Segments.size(), 2, Endian);

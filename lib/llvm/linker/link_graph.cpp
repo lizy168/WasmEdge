@@ -605,6 +605,17 @@ LinkExpect<void> LinkGraph::setSectionFileOffset(SectionId Id,
   return {};
 }
 
+LinkExpect<void> LinkGraph::setELFFlags(uint32_t Flags) {
+  if (RelocationsApplied) {
+    return relocated();
+  }
+  if (FormatValue != ObjectFormat::ELF) {
+    return fail<void>(Diagnostic{"ELF flags require an ELF link graph"});
+  }
+  ELFFlags = Flags;
+  return {};
+}
+
 LinkExpect<Span<Byte>> LinkGraph::sectionContent(SectionId Id) {
   if (RelocationsApplied) {
     return fail<Span<Byte>>(
