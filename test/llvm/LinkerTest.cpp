@@ -4031,6 +4031,70 @@ _wasmedge_unwind_anchor:
   EXPECT_FALSE(validateMachOEHFrameCoverage(*Graph));
 }
 
+TEST(EHFrameTest, CollapsesAliasedSemanticFunctionAddresses) {
+  auto Covered = ObjectReader::read(
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true, false, false, false, false,
+                 false, R"(
+.private_extern _wasmedge_unwind_anchor
+_wasmedge_unwind_anchor:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  .cfi_escape 0x2e, 0x10
+  ret
+  .cfi_endproc
+)",
+                 false, true),
+      Target::AArch64);
+  ASSERT_TRUE(Covered);
+  ASSERT_TRUE(layout(*Covered, 0, 0x4000));
+  auto &Symbols = const_cast<std::vector<Symbol> &>(Covered->symbols());
+  const auto T0 =
+      std::find_if(Symbols.begin(), Symbols.end(),
+                   [](const auto &Symbol) { return Symbol.Name == "_t0"; });
+  ASSERT_NE(T0, Symbols.end());
+  const SectionId T0Section = T0->Section;
+  const uint64_t T0Offset = T0->Offset;
+  const uint64_t T0Size = T0->Size;
+  Symbols.push_back(
+      Symbol{"_t1", T0Section, T0Offset, T0Size, true, std::nullopt, true});
+  ASSERT_TRUE(normalizeMachOEHFrame(*Covered));
+  EXPECT_TRUE(validateMachOEHFrameCoverage(*Covered));
+  Symbols.back().Offset = T0Offset + 1;
+  EXPECT_FALSE(validateMachOEHFrameCoverage(*Covered));
+}
+
+TEST(EHFrameTest, DecodesStrictInt64SLEB128) {
+  const std::array<WasmEdge::Byte, 10> Max{0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                           0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+  const std::array<WasmEdge::Byte, 10> Min{0x80, 0x80, 0x80, 0x80, 0x80,
+                                           0x80, 0x80, 0x80, 0x80, 0x7F};
+  auto MaxValue = Internal::decodeSLEB128(Max);
+  auto MinValue = Internal::decodeSLEB128(Min);
+  ASSERT_TRUE(MaxValue);
+  ASSERT_TRUE(MinValue);
+  EXPECT_EQ(*MaxValue, INT64_MAX);
+  EXPECT_EQ(*MinValue, INT64_MIN);
+  EXPECT_FALSE(Internal::decodeSLEB128(std::array<WasmEdge::Byte, 10>{
+      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}));
+  EXPECT_FALSE(Internal::decodeSLEB128(std::array<WasmEdge::Byte, 10>{
+      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7E}));
+  EXPECT_FALSE(Internal::decodeSLEB128(std::array<WasmEdge::Byte, 11>{
+      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00}));
+  EXPECT_FALSE(Internal::decodeSLEB128(std::array<WasmEdge::Byte, 10>{
+      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00}));
+  EXPECT_FALSE(Internal::decodeSLEB128(std::array<WasmEdge::Byte, 10>{
+      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F}));
+}
+
+TEST(EHFrameTest, ChecksResolvedAddressArithmetic) {
+  EXPECT_EQ(Internal::resolveMachOFDEAddress(UINT64_MAX - 10, 4, 3, 2),
+            UINT64_MAX - 1);
+  EXPECT_FALSE(Internal::resolveMachOFDEAddress(UINT64_MAX - 10, 8, 3, 1));
+  EXPECT_EQ(Internal::resolveMachOFDEAddress(5, 4, 3, -2), 10U);
+  EXPECT_FALSE(Internal::resolveMachOFDEAddress(0, 0, 1, -2));
+}
+
 TEST(EHFrameTest, RejectsMalformedRecordsAtomically) {
   LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
   ASSERT_TRUE(Graph.beginInput("malformed.o"));

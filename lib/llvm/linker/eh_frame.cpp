@@ -55,20 +55,35 @@ bool readULEB(Span<const Byte> Bytes, size_t &Offset,
 }
 
 bool readSLEB(Span<const Byte> Bytes, size_t &Offset, int64_t &Value) noexcept {
+  constexpr size_t MaxBytes = 10;
   uint64_t Raw = 0;
-  unsigned Shift = 0;
-  uint8_t Byte = 0;
-  do {
-    if (Offset >= Bytes.size() || Shift >= 64)
+  for (size_t I = 0; I < MaxBytes; ++I) {
+    if (Offset >= Bytes.size())
       return false;
-    Byte = Bytes[Offset++];
-    Raw |= static_cast<uint64_t>(Byte & 0x7F) << Shift;
-    Shift += 7;
-  } while ((Byte & 0x80) != 0);
-  if (Shift < 64 && (Byte & 0x40) != 0)
-    Raw |= UINT64_MAX << Shift;
-  Value = static_cast<int64_t>(Raw);
-  return true;
+    const uint8_t Byte = Bytes[Offset++];
+    const uint8_t Payload = Byte & 0x7F;
+    if (I == MaxBytes - 1) {
+      if ((Byte & 0x80) != 0 || (Payload != 0x00 && Payload != 0x7F))
+        return false;
+      const bool Bit62 = (Raw & (UINT64_C(1) << 62)) != 0;
+      if ((Payload == 0x00) != Bit62)
+        return false;
+      if (Payload == 0x7F)
+        Raw |= UINT64_C(1) << 63;
+      Value = static_cast<int64_t>(Raw);
+      return true;
+    }
+    const unsigned Shift = static_cast<unsigned>(I * 7);
+    Raw |= static_cast<uint64_t>(Payload) << Shift;
+    if ((Byte & 0x80) == 0) {
+      const unsigned UsedBits = Shift + 7;
+      if ((Byte & 0x40) != 0)
+        Raw |= UINT64_MAX << UsedBits;
+      Value = static_cast<int64_t>(Raw);
+      return true;
+    }
+  }
+  return false;
 }
 
 struct ParsedFrame {
@@ -165,6 +180,27 @@ Expect<ParsedFrame> parse(Span<const Byte> Bytes) {
 
 } // namespace
 
+namespace Internal {
+
+Expect<int64_t> decodeSLEB128(Span<const Byte> Bytes) {
+  size_t Offset = 0;
+  int64_t Value = 0;
+  if (!readSLEB(Bytes, Offset, Value) || Offset != Bytes.size())
+    return Unexpect(ErrCode::Value::IllegalPath);
+  return Value;
+}
+
+Expect<uint64_t> resolveMachOFDEAddress(uint64_t LoadBase,
+                                        uint64_t SectionAddress, uint64_t Field,
+                                        int64_t Delta) {
+  const int128_t Value = int128_t(LoadBase) + SectionAddress + Field + Delta;
+  if (Value < 0 || Value > UINT64_MAX)
+    return Unexpect(ErrCode::Value::IllegalPath);
+  return static_cast<uint64_t>(Value);
+}
+
+} // namespace Internal
+
 Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   if (Graph.format() != ObjectFormat::MachO)
     return {};
@@ -175,7 +211,6 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   for (const auto &Section : Sections)
     Content.push_back(Section.Content);
   std::vector<uint8_t> Remove(Relocations.size());
-  std::set<SymbolId> CoveredSymbols;
   bool HasEHFrame = false;
   for (size_t I = 0; I < Sections.size(); ++I) {
     if (Sections[I].Purpose != SectionPurpose::EHFrame)
@@ -234,7 +269,6 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
       Remove[J] = true;
     }
     for (const auto &[Field, SymbolId] : References) {
-      CoveredSymbols.insert(SymbolId);
       const auto &Symbol = Graph.symbols()[SymbolId];
       const int128_t S =
           int128_t(Sections[Symbol.Section].Address) + Symbol.Offset;
@@ -252,11 +286,6 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   }
   if (!HasEHFrame)
     return fail();
-  for (SymbolId I = 0; I < Graph.symbols().size(); ++I) {
-    if (requiredSemanticFunction(Graph, Graph.symbols()[I]) &&
-        CoveredSymbols.count(I) == 0)
-      return fail();
-  }
   for (size_t I = 0; I < Sections.size(); ++I)
     Sections[I].Content = std::move(Content[I]);
   Graph.removeEHFrameRelocations(Remove);
@@ -267,6 +296,8 @@ Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph) {
   if (Graph.format() != ObjectFormat::MachO)
     return {};
   EXPECTED_TRY(auto Starts, machOEHFrameStarts(Graph, 0));
+  const std::set<uint64_t> FDEAddresses(Starts.begin(), Starts.end());
+  std::set<uint64_t> RequiredAddresses;
   for (const auto &Symbol : Graph.symbols()) {
     if (!requiredSemanticFunction(Graph, Symbol))
       continue;
@@ -274,11 +305,13 @@ Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph) {
       return fail();
     const int128_t Address =
         int128_t(Graph.sections()[Symbol.Section].Address) + Symbol.Offset;
-    if (Address < 0 || Address > UINT64_MAX ||
-        std::find(Starts.begin(), Starts.end(),
-                  static_cast<uint64_t>(Address)) == Starts.end())
+    if (Address < 0 || Address > UINT64_MAX)
       return fail();
+    RequiredAddresses.insert(static_cast<uint64_t>(Address));
   }
+  if (!std::includes(FDEAddresses.begin(), FDEAddresses.end(),
+                     RequiredAddresses.begin(), RequiredAddresses.end()))
+    return fail();
   return {};
 }
 
@@ -294,7 +327,9 @@ Expect<std::vector<uint64_t>> machOEHFrameStarts(const LinkGraph &Graph,
       if (!readU64(Section.Content, Field, Raw))
         return Unexpect(ErrCode::Value::IllegalPath);
       const int64_t Delta = static_cast<int64_t>(Raw);
-      Result.push_back(LoadBase + Section.Address + Field + Delta);
+      EXPECTED_TRY(auto Address, Internal::resolveMachOFDEAddress(
+                                     LoadBase, Section.Address, Field, Delta));
+      Result.push_back(Address);
     }
   }
   if (Result.empty())
