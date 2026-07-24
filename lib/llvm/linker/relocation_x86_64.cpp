@@ -128,6 +128,7 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
   for (const auto &RelocationValue : Graph.relocations()) {
     uint8_t Width = 0;
     bool Absolute = false;
+    bool ImageRelative = false;
     bool Relax = false;
     int64_t FormatAdjustment = 0;
     if (RelocationValue.Format == ObjectFormat::ELF) {
@@ -149,12 +150,37 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
         return fail(RelocationValue, "unsupported x86_64 relocation type");
       }
     } else if (RelocationValue.Format == ObjectFormat::MachO &&
-               RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED) {
+               (RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED ||
+                RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED_1 ||
+                RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED_2 ||
+                RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED_4 ||
+                RelocationValue.Type == llvm::MachO::X86_64_RELOC_BRANCH)) {
       Width = WordWidth;
+      switch (RelocationValue.Type) {
+      case llvm::MachO::X86_64_RELOC_SIGNED_1:
+        FormatAdjustment = -1;
+        break;
+      case llvm::MachO::X86_64_RELOC_SIGNED_2:
+        FormatAdjustment = -2;
+        break;
+      case llvm::MachO::X86_64_RELOC_SIGNED_4:
+        FormatAdjustment = -4;
+        break;
+      default:
+        break;
+      }
     } else if (RelocationValue.Format == ObjectFormat::COFF &&
-               RelocationValue.Type == llvm::COFF::IMAGE_REL_AMD64_REL32) {
+               RelocationValue.Type >= llvm::COFF::IMAGE_REL_AMD64_REL32 &&
+               RelocationValue.Type <= llvm::COFF::IMAGE_REL_AMD64_REL32_5) {
       Width = WordWidth;
-      FormatAdjustment = PCRelativeAddendBias;
+      FormatAdjustment =
+          PCRelativeAddendBias -
+          static_cast<int64_t>(RelocationValue.Type -
+                               llvm::COFF::IMAGE_REL_AMD64_REL32);
+    } else if (RelocationValue.Format == ObjectFormat::COFF &&
+               RelocationValue.Type == llvm::COFF::IMAGE_REL_AMD64_ADDR32NB) {
+      Width = WordWidth;
+      ImageRelative = true;
     } else {
       return fail(RelocationValue, "unsupported x86_64 relocation type");
     }
@@ -190,12 +216,15 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
       return fail(RelocationValue, "relocation addend overflows");
     }
     Addend += FormatAdjustment;
-    if (Absolute) {
+    if (Absolute || ImageRelative) {
       uint64_t Value = 0;
       if (!addUnsigned(S, Addend, Value) ||
           !writeUnsigned(Bytes, RelocationValue.Offset, Width,
                          Graph.endianness(), Value)) {
         return fail(RelocationValue, "absolute relocation overflows");
+      }
+      if (ImageRelative) {
+        continue;
       }
       const auto Overlap = std::find_if(
           Result.Rebases.begin(), Result.Rebases.end(), [&](const auto &Old) {

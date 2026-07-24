@@ -98,7 +98,8 @@ struct OutputSection {
 Expect<std::vector<OutputSection>> outputSections(const LinkGraph &Graph) {
   std::vector<const Section *> Ordered;
   for (const auto &Value : Graph.sections()) {
-    if (Value.VirtualSize != 0) {
+    if (Value.VirtualSize != 0 &&
+        Value.Purpose != SectionPurpose::CompactUnwind) {
       Ordered.push_back(&Value);
     }
   }

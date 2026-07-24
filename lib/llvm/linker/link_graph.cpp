@@ -78,19 +78,51 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
         return std::nullopt;
       }
     }
-    if (Format == ObjectFormat::MachO &&
-        Type == llvm::MachO::X86_64_RELOC_SIGNED) {
-      return WordPatch;
+    if (Format == ObjectFormat::MachO) {
+      switch (Type) {
+      case llvm::MachO::X86_64_RELOC_SIGNED:
+      case llvm::MachO::X86_64_RELOC_SIGNED_1:
+      case llvm::MachO::X86_64_RELOC_SIGNED_2:
+      case llvm::MachO::X86_64_RELOC_SIGNED_4:
+      case llvm::MachO::X86_64_RELOC_BRANCH:
+        return WordPatch;
+      default:
+        return std::nullopt;
+      }
     }
-    if (Format == ObjectFormat::COFF &&
-        Type == llvm::COFF::IMAGE_REL_AMD64_REL32) {
-      return WordPatch;
+    if (Format == ObjectFormat::COFF) {
+      if ((Type >= llvm::COFF::IMAGE_REL_AMD64_REL32 &&
+           Type <= llvm::COFF::IMAGE_REL_AMD64_REL32_5) ||
+          Type == llvm::COFF::IMAGE_REL_AMD64_ADDR32NB) {
+        return WordPatch;
+      }
     }
     return std::nullopt;
   }
-  if (Format != ObjectFormat::ELF) {
-    return std::nullopt;
+  if (TargetValue == Target::AArch64 && Format == ObjectFormat::MachO) {
+    switch (Type) {
+    case llvm::MachO::ARM64_RELOC_BRANCH26:
+    case llvm::MachO::ARM64_RELOC_PAGE21:
+    case llvm::MachO::ARM64_RELOC_PAGEOFF12:
+      return WordPatch;
+    default:
+      return std::nullopt;
+    }
   }
+  if (TargetValue == Target::AArch64 && Format == ObjectFormat::COFF) {
+    switch (Type) {
+    case llvm::COFF::IMAGE_REL_ARM64_BRANCH26:
+    case llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21:
+    case llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A:
+    case llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L:
+    case llvm::COFF::IMAGE_REL_ARM64_ADDR32NB:
+      return WordPatch;
+    default:
+      return std::nullopt;
+    }
+  }
+  if (Format != ObjectFormat::ELF)
+    return std::nullopt;
   if (TargetValue == Target::ARM) {
     switch (Type) {
     case llvm::ELF::R_ARM_NONE:
@@ -166,8 +198,26 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
 
 bool relocationIsPCRelative(ObjectFormat Format, Target TargetValue,
                             uint32_t Type) noexcept {
-  if (Format != ObjectFormat::ELF) {
-    return false;
+  if (Format == ObjectFormat::MachO) {
+    if (TargetValue == Target::X86_64) {
+      return Type == llvm::MachO::X86_64_RELOC_SIGNED ||
+             Type == llvm::MachO::X86_64_RELOC_SIGNED_1 ||
+             Type == llvm::MachO::X86_64_RELOC_SIGNED_2 ||
+             Type == llvm::MachO::X86_64_RELOC_SIGNED_4 ||
+             Type == llvm::MachO::X86_64_RELOC_BRANCH;
+    }
+    return TargetValue == Target::AArch64 &&
+           (Type == llvm::MachO::ARM64_RELOC_BRANCH26 ||
+            Type == llvm::MachO::ARM64_RELOC_PAGE21);
+  }
+  if (Format == ObjectFormat::COFF) {
+    if (TargetValue == Target::X86_64) {
+      return Type >= llvm::COFF::IMAGE_REL_AMD64_REL32 &&
+             Type <= llvm::COFF::IMAGE_REL_AMD64_REL32_5;
+    }
+    return TargetValue == Target::AArch64 &&
+           (Type == llvm::COFF::IMAGE_REL_ARM64_BRANCH26 ||
+            Type == llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21);
   }
   switch (TargetValue) {
   case Target::X86_64:

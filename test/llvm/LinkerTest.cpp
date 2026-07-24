@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <lld/Common/Driver.h>
+#include <llvm/BinaryFormat/COFF.h>
 #include <llvm/Config/llvm-config.h>
 #if LLVM_VERSION_MAJOR >= 14
 #include <lld/Common/CommonLinkerContext.h>
@@ -3647,6 +3648,116 @@ TEST(RelocationTest, ReadsLayoutsAndRelocatesCurrentMachOAndCOFFForms) {
     EXPECT_EQ(*After,
               S + *Before - P + (Test.Format == ObjectFormat::COFF ? -4 : 0));
   }
+}
+
+TEST(RelocationTest, RecognizesObservedPortablePatchWidthsAndPCRelativeForms) {
+  struct Case {
+    ObjectFormat Format;
+    Target Architecture;
+    uint32_t Type;
+    uint8_t Width;
+    bool PCRelative;
+  };
+  const std::array<Case, 13> Cases{{
+      {ObjectFormat::MachO, Target::X86_64, llvm::MachO::X86_64_RELOC_SIGNED, 4,
+       true},
+      {ObjectFormat::MachO, Target::X86_64, llvm::MachO::X86_64_RELOC_SIGNED_4,
+       4, true},
+      {ObjectFormat::MachO, Target::X86_64, llvm::MachO::X86_64_RELOC_BRANCH, 4,
+       true},
+      {ObjectFormat::MachO, Target::AArch64, llvm::MachO::ARM64_RELOC_BRANCH26,
+       4, true},
+      {ObjectFormat::MachO, Target::AArch64, llvm::MachO::ARM64_RELOC_PAGE21, 4,
+       true},
+      {ObjectFormat::MachO, Target::AArch64, llvm::MachO::ARM64_RELOC_PAGEOFF12,
+       4, false},
+      {ObjectFormat::COFF, Target::X86_64, llvm::COFF::IMAGE_REL_AMD64_REL32, 4,
+       true},
+      {ObjectFormat::COFF, Target::X86_64, llvm::COFF::IMAGE_REL_AMD64_ADDR32NB,
+       4, false},
+      {ObjectFormat::COFF, Target::AArch64,
+       llvm::COFF::IMAGE_REL_ARM64_BRANCH26, 4, true},
+      {ObjectFormat::COFF, Target::AArch64,
+       llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21, 4, true},
+      {ObjectFormat::COFF, Target::AArch64,
+       llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A, 4, false},
+      {ObjectFormat::COFF, Target::AArch64,
+       llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L, 4, false},
+      {ObjectFormat::COFF, Target::AArch64,
+       llvm::COFF::IMAGE_REL_ARM64_ADDR32NB, 4, false},
+  }};
+  for (const auto &Test : Cases) {
+    EXPECT_EQ(relocationPatchSize(Test.Format, Test.Architecture, Test.Type, 4),
+              Test.Width);
+    EXPECT_EQ(relocationIsPCRelative(Test.Format, Test.Architecture, Test.Type),
+              Test.PCRelative);
+  }
+}
+
+TEST(RelocationTest, RejectsUnsafePortableAbsoluteAndGOTForms) {
+  EXPECT_FALSE(relocationPatchSize(ObjectFormat::MachO, Target::X86_64,
+                                   llvm::MachO::X86_64_RELOC_UNSIGNED, 8));
+  EXPECT_FALSE(relocationPatchSize(ObjectFormat::MachO, Target::X86_64,
+                                   llvm::MachO::X86_64_RELOC_GOT, 4));
+  EXPECT_FALSE(relocationPatchSize(ObjectFormat::MachO, Target::AArch64,
+                                   llvm::MachO::ARM64_RELOC_POINTER_TO_GOT, 8));
+  EXPECT_FALSE(relocationPatchSize(ObjectFormat::COFF, Target::X86_64,
+                                   llvm::COFF::IMAGE_REL_AMD64_ADDR64, 8));
+  EXPECT_FALSE(relocationPatchSize(ObjectFormat::COFF, Target::AArch64,
+                                   llvm::COFF::IMAGE_REL_ARM64_ADDR64, 8));
+}
+
+TEST(RelocationTest, ReadsRealisticPortableObjectsWithoutPersonality) {
+  struct Case {
+    const char *Triple;
+    Target Architecture;
+    std::set<uint32_t> Types;
+  };
+  const std::array<Case, 4> Cases{{
+      {"x86_64-apple-macosx",
+       Target::X86_64,
+       {llvm::MachO::X86_64_RELOC_SIGNED}},
+      {"arm64-apple-macosx",
+       Target::AArch64,
+       {llvm::MachO::ARM64_RELOC_PAGE21, llvm::MachO::ARM64_RELOC_PAGEOFF12}},
+      {"x86_64-pc-windows-msvc",
+       Target::X86_64,
+       {llvm::COFF::IMAGE_REL_AMD64_REL32}},
+      {"aarch64-pc-windows-msvc",
+       Target::AArch64,
+       {llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21,
+        llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A}},
+  }};
+  for (const auto &Test : Cases) {
+    const auto Bytes = makeObject(llvm::Triple(Test.Triple));
+    auto Graph = ObjectReader::read(Bytes, Test.Architecture);
+    ASSERT_TRUE(Graph) << Test.Triple;
+    std::set<uint32_t> Types;
+    for (const auto &Relocation : Graph->relocations()) {
+      Types.insert(Relocation.Type);
+    }
+    EXPECT_EQ(Types, Test.Types) << Test.Triple;
+    EXPECT_TRUE(std::none_of(Graph->sections().begin(), Graph->sections().end(),
+                             [](const auto &Section) {
+                               return Section.Purpose ==
+                                      SectionPurpose::CompactUnwind;
+                             }));
+    ASSERT_TRUE(layout(*Graph, 0x4000, 0x4000));
+    EXPECT_TRUE(applyRelocations(*Graph)) << Test.Triple;
+  }
+}
+
+TEST(RelocationTest, RejectsPortablePersonalityObjects) {
+  EXPECT_FALSE(
+      ObjectReader::read(makeObject(llvm::Triple("x86_64-apple-macosx"), false,
+                                    false, "f0", {}, false, false, "generic",
+                                    {}, true, false, false, false, false, true),
+                         Target::X86_64));
+  EXPECT_FALSE(ObjectReader::read(
+      makeObject(llvm::Triple("aarch64-pc-windows-msvc"), false, false, "f0",
+                 {}, false, false, "generic", {}, true, false, false, false,
+                 false, true),
+      Target::AArch64));
 }
 
 TEST(ObjectReaderTest, RejectsMalformedBytes) {

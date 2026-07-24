@@ -5,7 +5,9 @@
 
 #include "common/spdlog.h"
 
+#include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/ELF.h>
+#include <llvm/BinaryFormat/MachO.h>
 
 #include <string_view>
 
@@ -58,16 +60,23 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
   }
   Result.Rebases = Graph.rebases();
   for (const auto &Rel : Graph.relocations()) {
-    if (Rel.Format != ObjectFormat::ELF) {
-      return fail(Rel, "invalid relocation field");
-    }
     auto &Bytes = Result.Content[Rel.Section];
     const auto &Symbol = Graph.symbols()[Rel.Symbol];
     const int128_t S = int128_t(Graph.sections()[Symbol.Section].Address) +
                        Symbol.Offset + Rel.Addend;
     const int128_t P =
         int128_t(Graph.sections()[Rel.Section].Address) + Rel.Offset;
-    if (Rel.Type == llvm::ELF::R_AARCH64_ABS64) {
+    if (Rel.Format == ObjectFormat::COFF &&
+        Rel.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR32NB) {
+      if (S < 0 || S > UINT32_MAX ||
+          !writeUnsigned(Bytes, Rel.Offset, InstructionWidth,
+                         Endianness::Little, static_cast<uint64_t>(S))) {
+        return fail(Rel, "ADDR32NB relocation overflows");
+      }
+      continue;
+    }
+    if (Rel.Format == ObjectFormat::ELF &&
+        Rel.Type == llvm::ELF::R_AARCH64_ABS64) {
       constexpr uint8_t DoubleWordWidth = 8;
       if (S < 0 || S > UINT64_MAX ||
           !writeUnsigned(Bytes, Rel.Offset, DoubleWordWidth, Endianness::Little,
@@ -82,7 +91,8 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
                                       Rel.Addend, DoubleWordWidth});
       continue;
     }
-    if (Rel.Type == llvm::ELF::R_AARCH64_PREL64) {
+    if (Rel.Format == ObjectFormat::ELF &&
+        Rel.Type == llvm::ELF::R_AARCH64_PREL64) {
       constexpr uint8_t DoubleWordWidth = 8;
       constexpr unsigned DoubleWordBits = 64;
       const int128_t Value = S - P;
@@ -93,7 +103,8 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       }
       continue;
     }
-    if (Rel.Type == llvm::ELF::R_AARCH64_PREL32) {
+    if (Rel.Format == ObjectFormat::ELF &&
+        Rel.Type == llvm::ELF::R_AARCH64_PREL32) {
       constexpr unsigned WordBits = 32;
       const int128_t Value = S - P;
       if (!signedBits(Value, WordBits) ||
@@ -112,16 +123,23 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       return fail(Rel, "relocation field exceeds section content");
     }
     uint32_t Instruction = static_cast<uint32_t>(*Word);
-    if (Rel.Type == llvm::ELF::R_AARCH64_JUMP26 ||
-        Rel.Type == llvm::ELF::R_AARCH64_CALL26) {
+    const bool Branch26 = (Rel.Format == ObjectFormat::ELF &&
+                           (Rel.Type == llvm::ELF::R_AARCH64_JUMP26 ||
+                            Rel.Type == llvm::ELF::R_AARCH64_CALL26)) ||
+                          (Rel.Format == ObjectFormat::MachO &&
+                           Rel.Type == llvm::MachO::ARM64_RELOC_BRANCH26) ||
+                          (Rel.Format == ObjectFormat::COFF &&
+                           Rel.Type == llvm::COFF::IMAGE_REL_ARM64_BRANCH26);
+    if (Branch26) {
       constexpr unsigned BranchDisplacementBits = 28;
       constexpr unsigned BranchImmediateShift = 2;
       constexpr uint32_t BranchOpcodeMask = UINT32_C(0xFC000000);
       constexpr uint32_t BranchImmediateMask = UINT32_C(0x03FFFFFF);
       constexpr uint32_t JumpOpcode = UINT32_C(0x14000000);
       constexpr uint32_t CallOpcode = UINT32_C(0x94000000);
-      const uint32_t Opcode =
-          Rel.Type == llvm::ELF::R_AARCH64_CALL26 ? CallOpcode : JumpOpcode;
+      const uint32_t Opcode = (Instruction & BranchOpcodeMask) == CallOpcode
+                                  ? CallOpcode
+                                  : JumpOpcode;
       if ((Instruction & BranchOpcodeMask) != Opcode) {
         return fail(Rel, "invalid branch instruction");
       }
@@ -133,7 +151,12 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       Instruction =
           Opcode | (static_cast<uint32_t>(Value >> BranchImmediateShift) &
                     BranchImmediateMask);
-    } else if (Rel.Type == llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21) {
+    } else if ((Rel.Format == ObjectFormat::ELF &&
+                Rel.Type == llvm::ELF::R_AARCH64_ADR_PREL_PG_HI21) ||
+               (Rel.Format == ObjectFormat::MachO &&
+                Rel.Type == llvm::MachO::ARM64_RELOC_PAGE21) ||
+               (Rel.Format == ObjectFormat::COFF &&
+                Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21)) {
       constexpr unsigned PageShift = 12;
       constexpr unsigned PageDisplacementBits = 21;
       constexpr uint32_t AdrpOpcodeMask = UINT32_C(0x9F000000);
@@ -160,35 +183,50 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       constexpr uint32_t Low12ImmediateMask = UINT32_C(0x003FFC00);
       constexpr unsigned Low12ImmediateShift = 10;
       Low12Encoding Encoding{};
-      switch (Rel.Type) {
-      case llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC:
-        Encoding = {Low12Scale::Byte, UINT32_C(0x7FC00000),
-                    UINT32_C(0x11000000)};
-        break;
-      case llvm::ELF::R_AARCH64_LDST8_ABS_LO12_NC:
-        Encoding = {Low12Scale::Byte, UINT32_C(0x3B000000),
-                    UINT32_C(0x39000000)};
-        break;
-      case llvm::ELF::R_AARCH64_LDST16_ABS_LO12_NC:
-        Encoding = {Low12Scale::Half, UINT32_C(0x3F000000),
-                    UINT32_C(0x39000000)};
-        break;
-      case llvm::ELF::R_AARCH64_LDST32_ABS_LO12_NC:
-        Encoding = {Low12Scale::Word, UINT32_C(0x3F000000),
-                    UINT32_C(0x39000000)};
-        break;
-      case llvm::ELF::R_AARCH64_LDST64_ABS_LO12_NC:
-        Encoding = {Low12Scale::DoubleWord, UINT32_C(0x3F000000),
-                    UINT32_C(0x39000000)};
-        break;
-      case llvm::ELF::R_AARCH64_LDST128_ABS_LO12_NC:
-        Encoding = {Low12Scale::QuadWord, UINT32_C(0x3F800000),
-                    UINT32_C(0x3D800000)};
-        break;
-      default:
-        return fail(Rel, "unsupported AArch64 relocation type");
-      }
-      if ((Instruction & Encoding.OpcodeMask) != Encoding.Opcode) {
+      if (Rel.Format == ObjectFormat::MachO &&
+          Rel.Type == llvm::MachO::ARM64_RELOC_PAGEOFF12) {
+        Encoding = {(Instruction & UINT32_C(0x3B000000)) == UINT32_C(0x39000000)
+                        ? static_cast<Low12Scale>((Instruction >> 30) & 3)
+                        : Low12Scale::Byte,
+                    0, 0};
+      } else if (Rel.Format == ObjectFormat::COFF &&
+                 (Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A ||
+                  Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L)) {
+        Encoding = {Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L
+                        ? static_cast<Low12Scale>((Instruction >> 30) & 3)
+                        : Low12Scale::Byte,
+                    0, 0};
+      } else
+        switch (Rel.Type) {
+        case llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC:
+          Encoding = {Low12Scale::Byte, UINT32_C(0x7FC00000),
+                      UINT32_C(0x11000000)};
+          break;
+        case llvm::ELF::R_AARCH64_LDST8_ABS_LO12_NC:
+          Encoding = {Low12Scale::Byte, UINT32_C(0x3B000000),
+                      UINT32_C(0x39000000)};
+          break;
+        case llvm::ELF::R_AARCH64_LDST16_ABS_LO12_NC:
+          Encoding = {Low12Scale::Half, UINT32_C(0x3F000000),
+                      UINT32_C(0x39000000)};
+          break;
+        case llvm::ELF::R_AARCH64_LDST32_ABS_LO12_NC:
+          Encoding = {Low12Scale::Word, UINT32_C(0x3F000000),
+                      UINT32_C(0x39000000)};
+          break;
+        case llvm::ELF::R_AARCH64_LDST64_ABS_LO12_NC:
+          Encoding = {Low12Scale::DoubleWord, UINT32_C(0x3F000000),
+                      UINT32_C(0x39000000)};
+          break;
+        case llvm::ELF::R_AARCH64_LDST128_ABS_LO12_NC:
+          Encoding = {Low12Scale::QuadWord, UINT32_C(0x3F800000),
+                      UINT32_C(0x3D800000)};
+          break;
+        default:
+          return fail(Rel, "unsupported AArch64 relocation type");
+        }
+      if (Encoding.OpcodeMask != 0 &&
+          (Instruction & Encoding.OpcodeMask) != Encoding.Opcode) {
         return fail(Rel, "invalid low12 instruction");
       }
       const uint64_t Low = static_cast<uint64_t>(S) & PageOffsetMask;

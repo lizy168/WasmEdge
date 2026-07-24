@@ -22,6 +22,13 @@ namespace Linker {
 enum class Target : uint8_t { X86_64, ARM, AArch64, RISCV64, S390X };
 enum class Endianness : uint8_t { Little, Big };
 enum class SectionKind : uint8_t { Text, ReadOnly, Data, BSS, Unwind };
+enum class SectionPurpose : uint8_t {
+  Default,
+  EHFrame,
+  PData,
+  XData,
+  CompactUnwind,
+};
 enum class ObjectFormat : uint8_t { ELF, MachO, COFF };
 
 using SectionId = uint32_t;
@@ -39,6 +46,7 @@ struct Section {
   uint64_t Address = 0;
   uint64_t FileOffset = 0;
   std::vector<Byte> Content{};
+  SectionPurpose Purpose = SectionPurpose::Default;
 };
 
 struct Symbol {

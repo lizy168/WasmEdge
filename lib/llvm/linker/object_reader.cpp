@@ -399,23 +399,40 @@ bool isAllocatable(const llvm::object::ObjectFile &Object,
          Section.isBSS();
 }
 
+SectionPurpose sectionPurpose(const llvm::object::ObjectFile &Object,
+                              llvm::StringRef Name) noexcept {
+  if (Name.contains("eh_frame"))
+    return SectionPurpose::EHFrame;
+#if LLVM_VERSION_MAJOR >= 19
+  if (Name.starts_with(".pdata"))
+    return SectionPurpose::PData;
+  if (Name.starts_with(".xdata"))
+    return SectionPurpose::XData;
+#else
+  if (Name.startswith(".pdata"))
+    return SectionPurpose::PData;
+  if (Name.startswith(".xdata"))
+    return SectionPurpose::XData;
+#endif
+  if (Object.isMachO() && Name.contains("compact_unwind"))
+    return SectionPurpose::CompactUnwind;
+  return SectionPurpose::Default;
+}
+
 SectionKind sectionKind(const llvm::object::SectionRef &Section,
-                        llvm::StringRef Name) noexcept {
+                        SectionPurpose Purpose) noexcept {
   if (Section.isText()) {
     return SectionKind::Text;
   }
   if (Section.isBSS() || Section.isVirtual()) {
     return SectionKind::BSS;
   }
-  if (Name == ".ARM.exidx" || Name.contains("eh_frame") ||
-      Name.contains("unwind") ||
-#if LLVM_VERSION_MAJOR >= 19
-      Name.starts_with(".pdata") || Name.starts_with(".xdata")) {
-#else
-      Name.startswith(".pdata") || Name.startswith(".xdata")) {
-#endif
+  if (Purpose == SectionPurpose::EHFrame || Purpose == SectionPurpose::PData) {
     return SectionKind::Unwind;
   }
+  if (Purpose == SectionPurpose::XData ||
+      Purpose == SectionPurpose::CompactUnwind)
+    return SectionKind::ReadOnly;
   if (Section.isBerkeleyText()) {
     return SectionKind::ReadOnly;
   }
@@ -502,10 +519,8 @@ relocationMetadata(const llvm::object::ObjectFile &Object,
     Metadata.PatchSize = WordPatch;
     Metadata.PCRelative = true;
   }
-  if (Object.isELF()) {
-    Metadata.PCRelative =
-        relocationIsPCRelative(ObjectFormat::ELF, TargetValue, Type);
-  }
+  Metadata.PCRelative =
+      relocationIsPCRelative(objectFormat(Object), TargetValue, Type);
   return Metadata;
 }
 
@@ -624,10 +639,13 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       return Unexpect(ErrCode::Value::IllegalPath);
     }
     std::vector<Byte> Bytes(Contents.bytes_begin(), Contents.bytes_end());
+    const auto Purpose = sectionPurpose(Object, Name);
+    if (Purpose == SectionPurpose::CompactUnwind)
+      continue;
     auto Added = Graph.addSection(
-        Section{Name.str(), sectionKind(InputSection, Name),
+        Section{Name.str(), sectionKind(InputSection, Purpose),
                 sectionAlignment(InputSection), InputSection.getSize(), 0, 0,
-                std::move(Bytes)});
+                std::move(Bytes), Purpose});
     if (!Added) {
       return fail<LinkGraph>(Added.error().Message);
     }
@@ -729,6 +747,10 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     const auto Section = SectionIds.find(SectionIndex);
     if (Section == SectionIds.end()) {
       continue;
+    }
+    if (Graph.sections()[Section->second].Purpose == SectionPurpose::XData &&
+        InputSection.relocation_begin() != InputSection.relocation_end()) {
+      return fail<LinkGraph>("personality relocation in .xdata is unsupported");
     }
     for (const auto &InputRelocation : InputSection.relocations()) {
       const auto InputSymbol = InputRelocation.getSymbol();
