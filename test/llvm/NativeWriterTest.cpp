@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -29,6 +30,38 @@ struct ELFCase {
   bool Is64;
 };
 
+void writeInteger(std::vector<WasmEdge::Byte> &Bytes, size_t Offset,
+                  uint64_t Value, uint8_t Width, Endianness Endian) {
+  for (uint8_t I = 0; I < Width; ++I) {
+    const uint8_t Shift = Endian == Endianness::Little ? I : Width - I - 1;
+    Bytes[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (Shift * 8));
+  }
+}
+
+std::vector<WasmEdge::Byte> makeEHFrame(Endianness Endian) {
+  constexpr size_t CIERecordSize = 17;
+  constexpr size_t FDERecordSize = 17;
+  constexpr size_t TerminatorSize = 4;
+  std::vector<WasmEdge::Byte> Bytes(CIERecordSize + FDERecordSize * 2 +
+                                    TerminatorSize);
+  writeInteger(Bytes, 0, 13, 4, Endian);
+  Bytes[8] = 1;
+  Bytes[9] = 'z';
+  Bytes[10] = 'R';
+  Bytes[12] = 1;
+  Bytes[13] = 0x78;
+  Bytes[14] = 16;
+  Bytes[15] = 1;
+  Bytes[16] = 0x1B;
+  for (size_t I = 0; I < 2; ++I) {
+    const size_t Offset = CIERecordSize + I * FDERecordSize;
+    writeInteger(Bytes, Offset, 13, 4, Endian);
+    writeInteger(Bytes, Offset + 4, Offset + 4, 4, Endian);
+    writeInteger(Bytes, Offset + 12, 2, 4, Endian);
+  }
+  return Bytes;
+}
+
 LinkGraph makeELFGraph(const ELFCase &Test) {
   LinkGraph Graph(Test.Architecture, Test.Endian);
   EXPECT_TRUE(Graph.beginInput("writer.o"));
@@ -37,14 +70,9 @@ LinkGraph makeELFGraph(const ELFCase &Test) {
       Section{".text", SectionKind::Text, 16, 4, 0, 0, {0xC3, 0, 0, 0}});
   auto Rodata = Graph.addSection(
       Section{".rodata", SectionKind::ReadOnly, 8, 4, 0, 0, {1, 2, 3, 4}});
-  auto EHFrame = Graph.addSection(Section{".eh_frame",
-                                          SectionKind::Unwind,
-                                          8,
-                                          8,
-                                          0,
-                                          0,
-                                          {0, 0, 0, 0, 0, 0, 0, 0},
-                                          SectionPurpose::EHFrame});
+  auto EHFrame = Graph.addSection(Section{
+      ".eh_frame", SectionKind::Unwind, 8, makeEHFrame(Test.Endian).size(), 0,
+      0, makeEHFrame(Test.Endian), SectionPurpose::EHFrame});
   auto Data = Graph.addSection(
       Section{".data", SectionKind::Data, PointerSize, PointerSize, 0, 0,
               std::vector<WasmEdge::Byte>(PointerSize)});
@@ -53,6 +81,8 @@ LinkGraph makeELFGraph(const ELFCase &Test) {
   EXPECT_TRUE(Text && Rodata && EHFrame && Data && BSS);
   EXPECT_TRUE(
       Graph.addSymbol(Symbol{"f0", *Text, 0, 4, true, std::nullopt, true}));
+  EXPECT_TRUE(
+      Graph.addSymbol(Symbol{"f1", *Text, 2, 2, true, std::nullopt, true}));
   EXPECT_TRUE(Graph.addSymbol(
       Symbol{"value", *Data, 0, PointerSize, true, std::nullopt, true}));
   EXPECT_TRUE(Graph.addRebase(
@@ -66,6 +96,32 @@ uint64_t readInteger(const std::vector<WasmEdge::Byte> &Bytes, size_t Offset,
   for (uint8_t I = 0; I < Width; ++I) {
     const uint8_t Shift = Endian == Endianness::Little ? I : Width - I - 1;
     Result |= static_cast<uint64_t>(Bytes[Offset + I]) << (Shift * 8);
+  }
+  return Result;
+}
+
+const llvm::object::SectionRef *
+findSection(const llvm::object::ObjectFile &Object, std::string_view Wanted,
+            llvm::object::SectionRef &Storage) {
+  for (const auto &Section : Object.sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (Name && *Name == llvm::StringRef(Wanted.data(), Wanted.size())) {
+      Storage = Section;
+      return &Storage;
+    }
+  }
+  return nullptr;
+}
+
+uint32_t elfHash(std::string_view Name) {
+  uint32_t Result = 0;
+  for (const unsigned char Character : Name) {
+    Result = (Result << 4) + Character;
+    const uint32_t High = Result & UINT32_C(0xF0000000);
+    if (High != 0)
+      Result ^= High >> 24;
+    Result &= ~High;
   }
   return Result;
 }
@@ -86,17 +142,37 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
   for (const auto &Test : Cases) {
     auto Graph = makeELFGraph(Test);
     ASSERT_TRUE(ELFWriter::layout(Graph));
-    if (!Test.Is64) {
-      auto Data = Graph.sectionContent(3);
-      ASSERT_TRUE(Data);
-      for (uint8_t I = 0; I < 4; ++I)
-        (*Data)[I] =
-            static_cast<WasmEdge::Byte>(Graph.sections()[3].Address >> (I * 8));
+    auto EHContent = Graph.sectionContent(2);
+    ASSERT_TRUE(EHContent);
+    for (size_t I = 0; I < 2; ++I) {
+      const size_t FieldOffset = 17 + I * 17 + 8;
+      const uint64_t FieldAddress = Graph.sections()[2].Address + FieldOffset;
+      const uint64_t FunctionAddress = Graph.sections()[0].Address + I * 2;
+      const int64_t Delta = static_cast<int64_t>(FunctionAddress) -
+                            static_cast<int64_t>(FieldAddress);
+      for (uint8_t Byte = 0; Byte < 4; ++Byte) {
+        const uint8_t Shift =
+            Test.Endian == Endianness::Little ? Byte : 3 - Byte;
+        (*EHContent)[FieldOffset + Byte] = static_cast<WasmEdge::Byte>(
+            static_cast<uint32_t>(Delta) >> (Shift * 8));
+      }
+    }
+    auto Data = Graph.sectionContent(3);
+    ASSERT_TRUE(Data);
+    for (uint8_t I = 0; I < (Test.Is64 ? 8 : 4); ++I) {
+      const uint8_t Shift =
+          Test.Endian == Endianness::Little ? I : (Test.Is64 ? 7 - I : 3 - I);
+      (*Data)[I] = static_cast<WasmEdge::Byte>(Graph.sections()[3].Address >>
+                                               (Shift * 8));
     }
     ASSERT_TRUE(applyRelocations(Graph));
     std::vector<WasmEdge::Byte> Bytes;
     Writer Output(Bytes);
     ASSERT_TRUE(ELFWriter::write(Graph, Output));
+    std::vector<WasmEdge::Byte> SecondBytes;
+    Writer SecondOutput(SecondBytes);
+    ASSERT_TRUE(ELFWriter::write(Graph, SecondOutput));
+    EXPECT_EQ(Bytes, SecondBytes);
 
     auto Object =
         llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
@@ -106,6 +182,7 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
     ASSERT_TRUE(static_cast<bool>(Object))
         << llvm::toString(Object.takeError());
     EXPECT_TRUE((*Object)->isELF());
+    EXPECT_EQ(readInteger(Bytes, 16, 2, Test.Endian), llvm::ELF::ET_DYN);
     EXPECT_EQ((*Object)->getArch(),
               Test.Architecture == Target::ARM       ? llvm::Triple::arm
               : Test.Architecture == Target::X86_64  ? llvm::Triple::x86_64
@@ -134,7 +211,7 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
       if (!Name->empty())
         Symbols.emplace(Name->str());
     }
-    EXPECT_EQ(Symbols, (std::set<std::string>{"f0", "value"}));
+    EXPECT_EQ(Symbols, (std::set<std::string>{"f0", "f1", "value"}));
 
     const uint64_t ProgramHeaderOffset =
         readInteger(Bytes, Test.Is64 ? 32 : 28, Test.Is64 ? 8 : 4, Test.Endian);
@@ -146,6 +223,9 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
     bool HasEHFrame = false;
     bool HasNonExecutableStack = false;
     bool HasInterpreter = false;
+    bool HasRXLoad = false;
+    bool HasReadOnlyLoad = false;
+    bool HasRWLoad = false;
     for (uint16_t I = 0; I < ProgramHeaderCount; ++I) {
       const uint64_t Offset = ProgramHeaderOffset + I * ProgramHeaderSize;
       const uint32_t Type =
@@ -168,12 +248,106 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
         EXPECT_NE(Flags & llvm::ELF::PF_R, 0U);
         EXPECT_FALSE((Flags & llvm::ELF::PF_X) != 0 &&
                      (Flags & llvm::ELF::PF_W) != 0);
+        HasRXLoad |= Flags == (llvm::ELF::PF_R | llvm::ELF::PF_X);
+        HasReadOnlyLoad |= Flags == llvm::ELF::PF_R;
+        HasRWLoad |= Flags == (llvm::ELF::PF_R | llvm::ELF::PF_W);
       }
     }
     EXPECT_TRUE(HasDynamic);
     EXPECT_TRUE(HasEHFrame);
     EXPECT_TRUE(HasNonExecutableStack);
     EXPECT_FALSE(HasInterpreter);
+    EXPECT_TRUE(HasRXLoad);
+    EXPECT_TRUE(HasReadOnlyLoad);
+    EXPECT_TRUE(HasRWLoad);
+
+    llvm::object::SectionRef DynamicStorage;
+    const auto *DynamicSection =
+        findSection(**Object, ".dynamic", DynamicStorage);
+    ASSERT_NE(DynamicSection, nullptr);
+    auto DynamicContent = DynamicSection->getContents();
+    ASSERT_TRUE(static_cast<bool>(DynamicContent));
+    std::map<uint64_t, uint64_t> DynamicTags;
+    const uint8_t AddressSize = Test.Is64 ? 8 : 4;
+    const uint8_t DynamicEntrySize = AddressSize * 2;
+    const std::vector<WasmEdge::Byte> DynamicBytes(
+        DynamicContent->bytes_begin(), DynamicContent->bytes_end());
+    for (size_t Offset = 0; Offset < DynamicBytes.size();
+         Offset += DynamicEntrySize) {
+      const uint64_t Tag =
+          readInteger(DynamicBytes, Offset, AddressSize, Test.Endian);
+      const uint64_t Value = readInteger(DynamicBytes, Offset + AddressSize,
+                                         AddressSize, Test.Endian);
+      if (Tag == llvm::ELF::DT_NULL)
+        break;
+      EXPECT_NE(Tag, llvm::ELF::DT_NEEDED);
+      DynamicTags.emplace(Tag, Value);
+    }
+    struct DynamicSectionCase {
+      uint64_t AddressTag;
+      uint64_t SizeTag;
+      uint64_t EntryTag;
+      const char *Name;
+      uint64_t EntrySize;
+    };
+    const std::array<DynamicSectionCase, 4> DynamicSections{{
+        {llvm::ELF::DT_HASH, 0, 0, ".hash", 4},
+        {llvm::ELF::DT_STRTAB, llvm::ELF::DT_STRSZ, 0, ".dynstr", 1},
+        {llvm::ELF::DT_SYMTAB, 0, llvm::ELF::DT_SYMENT, ".dynsym",
+         Test.Is64 ? 24U : 16U},
+        {Test.Is64 ? llvm::ELF::DT_RELA : llvm::ELF::DT_REL,
+         Test.Is64 ? llvm::ELF::DT_RELASZ : llvm::ELF::DT_RELSZ,
+         Test.Is64 ? llvm::ELF::DT_RELAENT : llvm::ELF::DT_RELENT,
+         Test.Is64 ? ".rela.dyn" : ".rel.dyn", Test.Is64 ? 24U : 8U},
+    }};
+    for (const auto &Expected : DynamicSections) {
+      llvm::object::SectionRef Storage;
+      const auto *Section = findSection(**Object, Expected.Name, Storage);
+      ASSERT_NE(Section, nullptr);
+      EXPECT_EQ(DynamicTags[Expected.AddressTag], Section->getAddress());
+      if (Expected.SizeTag != 0) {
+        EXPECT_EQ(DynamicTags[Expected.SizeTag], Section->getSize());
+      }
+      if (Expected.EntryTag != 0) {
+        EXPECT_EQ(DynamicTags[Expected.EntryTag], Expected.EntrySize);
+      }
+    }
+
+    llvm::object::SectionRef HashStorage;
+    const auto *HashSection = findSection(**Object, ".hash", HashStorage);
+    ASSERT_NE(HashSection, nullptr);
+    auto HashContent = HashSection->getContents();
+    ASSERT_TRUE(static_cast<bool>(HashContent));
+    const std::vector<WasmEdge::Byte> HashBytes(HashContent->bytes_begin(),
+                                                HashContent->bytes_end());
+    const uint32_t BucketCount =
+        static_cast<uint32_t>(readInteger(HashBytes, 0, 4, Test.Endian));
+    const uint32_t ChainCount =
+        static_cast<uint32_t>(readInteger(HashBytes, 4, 4, Test.Endian));
+    ASSERT_EQ(ChainCount, Symbols.size() + 1);
+    std::vector<std::string> SymbolNames(ChainCount);
+    uint32_t SymbolIndex = 1;
+    for (const auto &Symbol : ELF->getDynamicSymbolIterators()) {
+      auto Name = Symbol.getName();
+      ASSERT_TRUE(static_cast<bool>(Name));
+      if (!Name->empty())
+        SymbolNames[SymbolIndex] = Name->str();
+      ++SymbolIndex;
+    }
+    ASSERT_EQ(SymbolIndex, ChainCount);
+    for (uint32_t Wanted = 1; Wanted < ChainCount; ++Wanted) {
+      uint32_t Index = static_cast<uint32_t>(readInteger(
+          HashBytes, (2 + elfHash(SymbolNames[Wanted]) % BucketCount) * 4, 4,
+          Test.Endian));
+      std::set<uint32_t> Visited;
+      while (Index != 0 && Index != Wanted) {
+        ASSERT_LT(Index, ChainCount);
+        ASSERT_TRUE(Visited.insert(Index).second);
+        Index = static_cast<uint32_t>(readInteger(
+            HashBytes, (2 + BucketCount + Index) * 4, 4, Test.Endian));
+      }
+      EXPECT_EQ(Index, Wanted) << SymbolNames[Wanted];
+    }
 
     bool CheckedRelocation = false;
     for (const auto &Section : (*Object)->sections()) {
@@ -193,6 +367,19 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
       EXPECT_EQ(Test.Is64 ? static_cast<uint32_t>(Info)
                           : static_cast<uint32_t>(Info & 0xFF),
                 Test.RelativeType);
+      EXPECT_EQ(Test.Is64 ? Info >> 32 : Info >> 8, 0U);
+      EXPECT_EQ(
+          readInteger(std::vector<WasmEdge::Byte>(
+                          RelocationBytes, RelocationBytes + Content->size()),
+                      0, AddressSize, Test.Endian),
+          Graph.sections()[3].Address);
+      if (Test.Is64) {
+        EXPECT_EQ(
+            readInteger(std::vector<WasmEdge::Byte>(
+                            RelocationBytes, RelocationBytes + Content->size()),
+                        16, 8, Test.Endian),
+            Graph.sections()[3].Address);
+      }
       if (!Test.Is64) {
         EXPECT_EQ(
             readInteger(Bytes, Graph.sections()[3].FileOffset, 4, Test.Endian),
@@ -201,7 +388,71 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
       CheckedRelocation = true;
     }
     EXPECT_TRUE(CheckedRelocation);
+
+    llvm::object::SectionRef HeaderStorage;
+    const auto *HeaderSection =
+        findSection(**Object, ".eh_frame_hdr", HeaderStorage);
+    ASSERT_NE(HeaderSection, nullptr);
+    EXPECT_EQ(llvm::object::ELFSectionRef(*HeaderSection).getFlags() &
+                  llvm::ELF::SHF_WRITE,
+              0U);
+    auto HeaderContent = HeaderSection->getContents();
+    ASSERT_TRUE(static_cast<bool>(HeaderContent));
+    const std::vector<WasmEdge::Byte> HeaderBytes(HeaderContent->bytes_begin(),
+                                                  HeaderContent->bytes_end());
+    ASSERT_EQ(HeaderBytes.size(), 12U + 2U * 8U);
+    EXPECT_EQ(HeaderBytes[0], 1);
+    EXPECT_EQ(HeaderBytes[1], 0x1B);
+    EXPECT_EQ(HeaderBytes[2], 0x03);
+    EXPECT_EQ(HeaderBytes[3], 0x3B);
+    EXPECT_EQ(readInteger(HeaderBytes, 8, 4, Test.Endian), 2U);
+    uint64_t Previous = 0;
+    for (size_t I = 0; I < 2; ++I) {
+      const uint64_t FunctionAddress =
+          HeaderSection->getAddress() +
+          static_cast<int32_t>(
+              readInteger(HeaderBytes, 12 + I * 8, 4, Test.Endian));
+      const uint64_t FDEAddress = HeaderSection->getAddress() +
+                                  static_cast<int32_t>(readInteger(
+                                      HeaderBytes, 16 + I * 8, 4, Test.Endian));
+      EXPECT_EQ(FunctionAddress, Graph.sections()[0].Address + I * 2);
+      EXPECT_EQ(FDEAddress, Graph.sections()[2].Address + 17 + I * 17);
+      if (I != 0) {
+        EXPECT_LT(Previous, FunctionAddress);
+      }
+      Previous = FunctionAddress;
+    }
   }
+}
+
+TEST(ELFWriterTest, OmitsEHFrameHeaderWithoutEHFrame) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little);
+  ASSERT_TRUE(Graph.beginInput("no-eh.o"));
+  ASSERT_TRUE(Graph.addSection(
+      Section{".text", SectionKind::Text, 16, 1, 0, 0, {0xC3}}));
+  ASSERT_TRUE(ELFWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(ELFWriter::write(Graph, Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "no-eh.so"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  llvm::object::SectionRef Storage;
+  EXPECT_EQ(findSection(**Object, ".eh_frame_hdr", Storage), nullptr);
+  const uint64_t ProgramHeaderOffset =
+      readInteger(Bytes, 32, 8, Endianness::Little);
+  const uint16_t ProgramHeaderSize =
+      static_cast<uint16_t>(readInteger(Bytes, 54, 2, Endianness::Little));
+  const uint16_t ProgramHeaderCount =
+      static_cast<uint16_t>(readInteger(Bytes, 56, 2, Endianness::Little));
+  for (uint16_t I = 0; I < ProgramHeaderCount; ++I)
+    EXPECT_NE(readInteger(Bytes, ProgramHeaderOffset + I * ProgramHeaderSize, 4,
+                          Endianness::Little),
+              llvm::ELF::PT_GNU_EH_FRAME);
 }
 
 TEST(ELFWriterTest, RejectsUnsupportedRebasesAndInvalidState) {

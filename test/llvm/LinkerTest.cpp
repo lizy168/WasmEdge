@@ -795,7 +795,10 @@ protected:
     ASSERT_TRUE(std::filesystem::create_directory(Directory));
   }
 
-  void TearDown() override { std::filesystem::remove_all(Directory); }
+  void TearDown() override {
+    if (std::getenv("WASMEDGE_KEEP_LINKER_FIXTURE") == nullptr)
+      std::filesystem::remove_all(Directory);
+  }
 
   std::vector<WasmEdge::Byte>
   readFile(const std::filesystem::path &Path) const {
@@ -848,6 +851,8 @@ protected:
     std::filesystem::remove(Directory / "wasm.o");
     std::filesystem::remove(Directory / "wasm.ll");
     std::filesystem::remove(Directory / "wasm-opt.ll");
+    if (Native)
+      std::filesystem::remove(Output);
     return Object;
   }
 
@@ -1289,9 +1294,14 @@ TEST_F(LinkerOutputTest, NativeAOTWriterLoadsAndExecutesWithoutImports) {
       0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
       0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
   const auto Output = Directory / "native.so";
+  const auto SecondOutput = Directory / "native-second.so";
   const auto Object = compileTinyObject(TinyWasm, Directory / "seed.so", true);
+  ASSERT_FALSE(std::filesystem::exists(Directory / "seed.so"));
 
   ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Output, OutputKind::ELF));
+  ASSERT_TRUE(
+      NativeLinker::link(Object, TinyWasm, SecondOutput, OutputKind::ELF));
+  EXPECT_EQ(readFile(Output), readFile(SecondOutput));
   auto Image = llvm::object::ObjectFile::createObjectFile(Output.string());
   ASSERT_TRUE(static_cast<bool>(Image));
   const auto *ELF =

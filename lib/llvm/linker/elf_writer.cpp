@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <string>
 #include <tuple>
@@ -26,6 +27,9 @@ constexpr uint8_t ELFMagic0 = 0x7F;
 constexpr uint8_t ELFMagic1 = 'E';
 constexpr uint8_t ELFMagic2 = 'L';
 constexpr uint8_t ELFMagic3 = 'F';
+constexpr uint8_t EncodingFormatMask = 0x0F;
+constexpr uint8_t EncodingApplicationMask = 0x70;
+constexpr uint32_t ExtendedRecordLength = UINT32_MAX;
 
 Expect<void> fail() noexcept { return Unexpect(ErrCode::Value::IllegalPath); }
 
@@ -127,6 +131,176 @@ uint32_t hash(std::string_view Name) noexcept {
     Result &= ~High;
   }
   return Result;
+}
+
+bool readULEB(Span<const Byte> Bytes, size_t &Offset,
+              uint64_t &Result) noexcept {
+  Result = 0;
+  for (uint8_t Shift = 0; Shift < 64 && Offset < Bytes.size(); Shift += 7) {
+    const uint8_t Value = Bytes[Offset++];
+    if (Shift == 63 && (Value & 0x7E) != 0)
+      return false;
+    Result |= static_cast<uint64_t>(Value & 0x7F) << Shift;
+    if ((Value & 0x80) == 0)
+      return true;
+  }
+  return false;
+}
+
+bool skipSLEB(Span<const Byte> Bytes, size_t &Offset) noexcept {
+  for (uint8_t Count = 0; Count < 10 && Offset < Bytes.size(); ++Count)
+    if ((Bytes[Offset++] & 0x80) == 0)
+      return true;
+  return false;
+}
+
+struct CIEInfo {
+  uint8_t Encoding;
+};
+
+struct FDEInfo {
+  uint64_t Function;
+  uint64_t Address;
+};
+
+bool signedDelta(uint64_t Target, uint64_t Base, int32_t &Result) noexcept {
+  const uint64_t Magnitude = Target >= Base ? Target - Base : Base - Target;
+  if ((Target >= Base && Magnitude > static_cast<uint64_t>(INT32_MAX)) ||
+      (Target < Base && Magnitude > UINT64_C(1) << 31))
+    return false;
+  Result = Target >= Base
+               ? static_cast<int32_t>(Magnitude)
+               : static_cast<int32_t>(-static_cast<int64_t>(Magnitude));
+  return true;
+}
+
+bool decodeFDEAddress(Span<const Byte> Bytes, size_t Offset, uint8_t Encoding,
+                      uint64_t FieldAddress, Endianness Endian,
+                      uint64_t &Result) noexcept {
+  const uint8_t Format = Encoding & EncodingFormatMask;
+  uint8_t Width = 0;
+  bool Signed = false;
+  switch (Format) {
+  case llvm::dwarf::DW_EH_PE_sdata2:
+    Width = 2;
+    Signed = true;
+    break;
+  case llvm::dwarf::DW_EH_PE_sdata4:
+    Width = 4;
+    Signed = true;
+    break;
+  case llvm::dwarf::DW_EH_PE_sdata8:
+    Width = 8;
+    Signed = true;
+    break;
+  case llvm::dwarf::DW_EH_PE_udata2:
+    Width = 2;
+    break;
+  case llvm::dwarf::DW_EH_PE_udata4:
+    Width = 4;
+    break;
+  case llvm::dwarf::DW_EH_PE_udata8:
+    Width = 8;
+    break;
+  default:
+    return false;
+  }
+  if (Offset > Bytes.size() || Width > Bytes.size() - Offset)
+    return false;
+  const uint64_t Raw = get(Bytes, Offset, Width, Endian);
+  int64_t Value = static_cast<int64_t>(Raw);
+  if (Signed && Width < 8 && (Raw & (UINT64_C(1) << (Width * 8 - 1))) != 0)
+    Value = static_cast<int64_t>(Raw | (~UINT64_C(0) << (Width * 8)));
+  if ((Encoding & EncodingApplicationMask) == llvm::dwarf::DW_EH_PE_pcrel) {
+    if (Value < 0) {
+      const uint64_t Magnitude = static_cast<uint64_t>(-(Value + 1)) + 1;
+      if (Magnitude > FieldAddress)
+        return false;
+      Result = FieldAddress - Magnitude;
+    } else {
+      if (!add(FieldAddress, static_cast<uint64_t>(Value), Result))
+        return false;
+    }
+    return true;
+  }
+  if ((Encoding & EncodingApplicationMask) != llvm::dwarf::DW_EH_PE_absptr ||
+      Value < 0)
+    return false;
+  Result = static_cast<uint64_t>(Value);
+  return true;
+}
+
+bool parseEHFrame(const Section &EH, Endianness Endian,
+                  std::vector<FDEInfo> &FDEs) noexcept {
+  const Span<const Byte> Bytes(EH.Content.data(), EH.Content.size());
+  std::map<size_t, CIEInfo> CIEs;
+  size_t Offset = 0;
+  while (Offset < Bytes.size()) {
+    if (Bytes.size() - Offset < 4)
+      return false;
+    const uint64_t Length = get(Bytes, Offset, 4, Endian);
+    if (Length == 0)
+      return Offset + 4 == Bytes.size();
+    if (Length == ExtendedRecordLength || Length > Bytes.size() - Offset - 4 ||
+        Length < 4)
+      return false;
+    const size_t End = Offset + 4 + static_cast<size_t>(Length);
+    const uint64_t Id = get(Bytes, Offset + 4, 4, Endian);
+    if (Id == 0) {
+      size_t Cursor = Offset + 8;
+      if (Cursor >= End || Bytes[Cursor++] != 1)
+        return false;
+      std::string Augmentation;
+      while (Cursor < End && Bytes[Cursor] != 0)
+        Augmentation.push_back(static_cast<char>(Bytes[Cursor++]));
+      if (Cursor >= End || Augmentation.empty() || Augmentation.front() != 'z')
+        return false;
+      ++Cursor;
+      uint64_t Ignored = 0;
+      if (!readULEB(Bytes, Cursor, Ignored) || !skipSLEB(Bytes, Cursor) ||
+          !readULEB(Bytes, Cursor, Ignored))
+        return false;
+      uint64_t AugmentationSize = 0;
+      if (!readULEB(Bytes, Cursor, AugmentationSize) ||
+          AugmentationSize > End - Cursor)
+        return false;
+      const size_t AugmentationEnd = Cursor + AugmentationSize;
+      uint8_t Encoding = llvm::dwarf::DW_EH_PE_omit;
+      for (const char Character : Augmentation.substr(1)) {
+        if (Character == 'R') {
+          if (Cursor >= AugmentationEnd)
+            return false;
+          Encoding = Bytes[Cursor++];
+        } else if (Character == 'P') {
+          return false;
+        } else if (Character == 'L') {
+          if (Cursor >= AugmentationEnd)
+            return false;
+          ++Cursor;
+        } else {
+          return false;
+        }
+      }
+      if (Cursor != AugmentationEnd || Encoding == llvm::dwarf::DW_EH_PE_omit)
+        return false;
+      CIEs.emplace(Offset, CIEInfo{Encoding});
+    } else {
+      const size_t PointerField = Offset + 4;
+      if (Id > PointerField)
+        return false;
+      const auto CIE = CIEs.find(PointerField - static_cast<size_t>(Id));
+      if (CIE == CIEs.end())
+        return false;
+      const size_t InitialLocation = Offset + 8;
+      uint64_t Function = 0;
+      if (!decodeFDEAddress(Bytes, InitialLocation, CIE->second.Encoding,
+                            EH.Address + InitialLocation, Endian, Function))
+        return false;
+      FDEs.push_back(FDEInfo{Function, EH.Address + Offset});
+    }
+    Offset = End;
+  }
+  return true;
 }
 
 struct OutputSection {
@@ -254,10 +428,23 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
                      });
     uint32_t EHHeaderIndex = 0;
     if (EH != Graph.sections().end()) {
-      constexpr uint64_t EHHeaderSize = 12;
+      std::vector<FDEInfo> FDEs;
+      if (!parseEHFrame(*EH, Endian, FDEs) || FDEs.empty())
+        return fail();
+      std::sort(FDEs.begin(), FDEs.end(),
+                [](const auto &Left, const auto &Right) {
+                  return std::tie(Left.Function, Left.Address) <
+                         std::tie(Right.Function, Right.Address);
+                });
+      constexpr uint64_t EHHeaderPrefixSize = 12;
+      constexpr uint64_t EHHeaderEntrySize = 8;
+      uint64_t EHHeaderSize = 0;
+      if (!add(EHHeaderPrefixSize, FDEs.size() * EHHeaderEntrySize,
+               EHHeaderSize))
+        return fail();
       OutputSection Header{".eh_frame_hdr",
                            llvm::ELF::SHT_PROGBITS,
-                           llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_WRITE,
+                           llvm::ELF::SHF_ALLOC,
                            Cursor,
                            Cursor,
                            EHHeaderSize,
@@ -270,11 +457,23 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       Header.Content[1] =
           llvm::dwarf::DW_EH_PE_pcrel | llvm::dwarf::DW_EH_PE_sdata4;
       Header.Content[2] = llvm::dwarf::DW_EH_PE_udata4;
-      Header.Content[3] = llvm::dwarf::DW_EH_PE_omit;
-      const int64_t Delta = static_cast<int64_t>(EH->Address) -
-                            static_cast<int64_t>(Header.Address + 4);
+      Header.Content[3] =
+          llvm::dwarf::DW_EH_PE_datarel | llvm::dwarf::DW_EH_PE_sdata4;
+      int32_t Delta = 0;
+      if (!signedDelta(EH->Address, Header.Address + 4, Delta))
+        return fail();
       put(Header.Content, 4, static_cast<uint32_t>(Delta), 4, Endian);
-      put(Header.Content, 8, 0, 4, Endian);
+      put(Header.Content, 8, FDEs.size(), 4, Endian);
+      for (size_t I = 0; I < FDEs.size(); ++I) {
+        if (!signedDelta(FDEs[I].Function, Header.Address, Delta))
+          return fail();
+        put(Header.Content, EHHeaderPrefixSize + I * EHHeaderEntrySize,
+            static_cast<uint32_t>(Delta), 4, Endian);
+        if (!signedDelta(FDEs[I].Address, Header.Address, Delta))
+          return fail();
+        put(Header.Content, EHHeaderPrefixSize + I * EHHeaderEntrySize + 4,
+            static_cast<uint32_t>(Delta), 4, Endian);
+      }
       EHHeaderIndex = static_cast<uint32_t>(Sections.size());
       Sections.push_back(std::move(Header));
       Cursor += EHHeaderSize;
@@ -314,10 +513,9 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     if (!align(Cursor, AddressSize, Cursor))
       return fail();
     const uint32_t DynStrIndex = static_cast<uint32_t>(Sections.size());
-    Sections.push_back(
-        OutputSection{".dynstr", llvm::ELF::SHT_STRTAB,
-                      llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_WRITE, Cursor,
-                      Cursor, DynStr.size(), 0, 0, 1, 0, std::move(DynStr)});
+    Sections.push_back(OutputSection{
+        ".dynstr", llvm::ELF::SHT_STRTAB, llvm::ELF::SHF_ALLOC, Cursor, Cursor,
+        DynStr.size(), 0, 0, 1, 0, std::move(DynStr)});
     Cursor += Sections.back().Size;
 
     if (!align(Cursor, AddressSize, Cursor))
@@ -353,11 +551,10 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       }
     }
     const uint32_t DynSymIndex = static_cast<uint32_t>(Sections.size());
-    Sections.push_back(
-        OutputSection{".dynsym", llvm::ELF::SHT_DYNSYM,
-                      llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_WRITE, Cursor,
-                      Cursor, DynSym.size(), DynStrIndex, 1, AddressSize,
-                      SymbolSize, std::move(DynSym)});
+    Sections.push_back(OutputSection{".dynsym", llvm::ELF::SHT_DYNSYM,
+                                     llvm::ELF::SHF_ALLOC, Cursor, Cursor,
+                                     DynSym.size(), DynStrIndex, 1, AddressSize,
+                                     SymbolSize, std::move(DynSym)});
     Cursor += Sections.back().Size;
 
     if (!align(Cursor, 4, Cursor))
@@ -381,8 +578,7 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     }
     const uint32_t HashIndex = static_cast<uint32_t>(Sections.size());
     Sections.push_back(OutputSection{
-        ".hash", llvm::ELF::SHT_HASH,
-        llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_WRITE, Cursor, Cursor,
+        ".hash", llvm::ELF::SHT_HASH, llvm::ELF::SHF_ALLOC, Cursor, Cursor,
         Hash.size(), DynSymIndex, 0, 4, 4, std::move(Hash)});
     Cursor += Sections.back().Size;
 
@@ -407,12 +603,11 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       }
     }
     const uint32_t RelocationIndex = static_cast<uint32_t>(Sections.size());
-    Sections.push_back(
-        OutputSection{Wide ? ".rela.dyn" : ".rel.dyn",
-                      Wide ? llvm::ELF::SHT_RELA : llvm::ELF::SHT_REL,
-                      llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_WRITE, Cursor,
-                      Cursor, Relocations.size(), DynSymIndex, 0, AddressSize,
-                      RelocationSize, std::move(Relocations)});
+    Sections.push_back(OutputSection{
+        Wide ? ".rela.dyn" : ".rel.dyn",
+        Wide ? llvm::ELF::SHT_RELA : llvm::ELF::SHT_REL, llvm::ELF::SHF_ALLOC,
+        Cursor, Cursor, Relocations.size(), DynSymIndex, 0, AddressSize,
+        RelocationSize, std::move(Relocations)});
     Cursor += Sections.back().Size;
 
     if (!align(Cursor, PageSize, Cursor))
@@ -440,10 +635,9 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     AddDynamic(llvm::ELF::DT_NULL, 0);
     const uint32_t DynamicSectionIndex = static_cast<uint32_t>(Sections.size());
     Sections.push_back(
-        OutputSection{".dynamic", llvm::ELF::SHT_DYNAMIC,
-                      llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_WRITE, Cursor,
-                      Cursor, Dynamic.size(), DynStrIndex, 0, AddressSize,
-                      DynamicSize, std::move(Dynamic)});
+        OutputSection{".dynamic", llvm::ELF::SHT_DYNAMIC, llvm::ELF::SHF_ALLOC,
+                      Cursor, Cursor, Dynamic.size(), DynStrIndex, 0,
+                      AddressSize, DynamicSize, std::move(Dynamic)});
     Cursor += Sections.back().Size;
 
     std::vector<Byte> SectionNames(1);
@@ -488,39 +682,41 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     Segments.push_back({llvm::ELF::PT_LOAD, llvm::ELF::PF_R, 0, 0,
                         ELFHeaderSize + ProgramHeaderSize * 8,
                         ELFHeaderSize + ProgramHeaderSize * 8, PageSize});
-    auto AddLoad = [&](uint32_t Flags, auto Predicate) {
-      uint64_t First = UINT64_MAX;
-      uint64_t FileEnd = 0;
-      uint64_t MemoryEnd = 0;
-      for (const auto &SectionValue : Sections) {
-        if (!Predicate(SectionValue) || SectionValue.Size == 0)
-          continue;
-        First = std::min(First, SectionValue.Address);
-        MemoryEnd =
-            std::max(MemoryEnd, SectionValue.Address + SectionValue.Size);
-        if (SectionValue.Type != llvm::ELF::SHT_NOBITS)
-          FileEnd = std::max(FileEnd, SectionValue.Offset + SectionValue.Size);
-      }
-      if (First != UINT64_MAX) {
-        const uint64_t Start = First & ~(PageSize - 1);
-        Segments.push_back({llvm::ELF::PT_LOAD, Flags, Start, Start,
-                            FileEnd > Start ? FileEnd - Start : 0,
-                            MemoryEnd - Start, PageSize});
-      }
+    std::vector<const OutputSection *> Allocated;
+    for (const auto &SectionValue : Sections)
+      if ((SectionValue.Flags & llvm::ELF::SHF_ALLOC) != 0 &&
+          SectionValue.Size != 0)
+        Allocated.push_back(&SectionValue);
+    std::sort(Allocated.begin(), Allocated.end(),
+              [](const auto *Left, const auto *Right) {
+                return std::tie(Left->Address, Left->Name) <
+                       std::tie(Right->Address, Right->Name);
+              });
+    auto SegmentFlags = [](const OutputSection &Value) {
+      return llvm::ELF::PF_R |
+             ((Value.Flags & llvm::ELF::SHF_EXECINSTR) != 0 ? llvm::ELF::PF_X
+                                                            : uint32_t{0}) |
+             ((Value.Flags & llvm::ELF::SHF_WRITE) != 0 ? llvm::ELF::PF_W
+                                                        : uint32_t{0});
     };
-    AddLoad(llvm::ELF::PF_R | llvm::ELF::PF_X, [](const auto &Value) {
-      return (Value.Flags & llvm::ELF::SHF_EXECINSTR) != 0;
-    });
-    AddLoad(llvm::ELF::PF_R, [](const auto &Value) {
-      return (Value.Flags & llvm::ELF::SHF_ALLOC) != 0 &&
-             (Value.Flags &
-              (llvm::ELF::SHF_EXECINSTR | llvm::ELF::SHF_WRITE)) == 0;
-    });
-    AddLoad(llvm::ELF::PF_R | llvm::ELF::PF_W, [](const auto &Value) {
-      return (Value.Flags & llvm::ELF::SHF_WRITE) != 0;
-    });
-    Segments.push_back({llvm::ELF::PT_DYNAMIC,
-                        llvm::ELF::PF_R | llvm::ELF::PF_W, DynamicAddress,
+    for (const auto *SectionValue : Allocated) {
+      const uint32_t Flags = SegmentFlags(*SectionValue);
+      const uint64_t Start = SectionValue->Address & ~(PageSize - 1);
+      const uint64_t MemoryEnd = SectionValue->Address + SectionValue->Size;
+      const uint64_t FileEnd = SectionValue->Type == llvm::ELF::SHT_NOBITS
+                                   ? Start
+                                   : SectionValue->Offset + SectionValue->Size;
+      if (Segments.size() == 1 || Segments.back().Flags != Flags) {
+        Segments.push_back({llvm::ELF::PT_LOAD, Flags, Start, Start,
+                            FileEnd - Start, MemoryEnd - Start, PageSize});
+      } else {
+        Segments.back().FileSize = std::max(Segments.back().FileSize,
+                                            FileEnd - Segments.back().Offset);
+        Segments.back().MemorySize = std::max(
+            Segments.back().MemorySize, MemoryEnd - Segments.back().Address);
+      }
+    }
+    Segments.push_back({llvm::ELF::PT_DYNAMIC, llvm::ELF::PF_R, DynamicAddress,
                         DynamicAddress, Sections[DynamicSectionIndex].Size,
                         Sections[DynamicSectionIndex].Size, AddressSize});
     if (EHHeaderIndex != 0)
