@@ -3,12 +3,14 @@
 
 #include "linker/native_linker.h"
 
+#include "common/configure.h"
 #include "common/defines.h"
 #include "linker/eh_frame.h"
 #include "linker/layout.h"
 #include "linker/object_reader.h"
 #include "linker/relocation.h"
 #include "linker/universal_wasm_writer.h"
+#include "loader/loader.h"
 #if WASMEDGE_OS_WINDOWS
 #include "system/winapi.h"
 #endif
@@ -17,6 +19,7 @@
 #include <llvm/Support/FileSystem.h>
 
 #include <optional>
+#include <stdexcept>
 #if !WASMEDGE_OS_WINDOWS
 #include <sys/stat.h>
 #endif
@@ -44,6 +47,16 @@ std::optional<Target> hostTarget() noexcept {
   return Target::S390X;
 #else
   return std::nullopt;
+#endif
+}
+
+ObjectFormat hostFormat() noexcept {
+#if WASMEDGE_OS_LINUX
+  return ObjectFormat::ELF;
+#elif WASMEDGE_OS_MACOS
+  return ObjectFormat::MachO;
+#elif WASMEDGE_OS_WINDOWS
+  return ObjectFormat::COFF;
 #endif
 }
 
@@ -107,8 +120,14 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     if (!TargetValue) {
       return Unexpect(ErrCode::Value::AOTNotImpl);
     }
+    Configure Conf;
+    Loader::Loader WasmLoader(Conf);
+    if (!WasmLoader.parseModule(Wasm))
+      return linkError();
     EXPECTED_TRY(auto Graph, ObjectReader::read(Object, *TargetValue,
                                                 ObjectReaderPolicy::Universal));
+    if (Graph.format() != hostFormat())
+      return linkError();
 #if WASMEDGE_OS_MACOS && defined(__aarch64__)
     constexpr uint64_t HostPageSize = 16384;
 #else
@@ -146,7 +165,11 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
 #endif
     Guard.publish();
     return {};
-  } catch (...) {
+  } catch (const std::bad_alloc &) {
+    return linkError();
+  } catch (const std::length_error &) {
+    return linkError();
+  } catch (const std::filesystem::filesystem_error &) {
     return linkError();
   }
 }

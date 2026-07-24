@@ -43,14 +43,27 @@ set(WASMEDGE_LLVM_SOURCES
   llvm.cpp
 )
 
+set(WASMEDGE_LLVM_LINKER_SOURCES
+  linker/eh_frame.cpp
+  linker/layout.cpp
+  linker/link_graph.cpp
+  linker/native_linker.cpp
+  linker/object_reader.cpp
+  linker/relocation.cpp
+  linker/relocation_aarch64.cpp
+  linker/relocation_arm.cpp
+  linker/relocation_riscv.cpp
+  linker/relocation_s390x.cpp
+  linker/relocation_x86_64.cpp
+  linker/universal_wasm_writer.cpp
+  linker/writer.cpp
+)
 if(MSVC)
-  set_source_files_properties(linker/native_linker.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
-  set_source_files_properties(linker/universal_wasm_writer.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
-  set_source_files_properties(linker/writer.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
+  set_source_files_properties(${WASMEDGE_LLVM_LINKER_SOURCES}
+    PROPERTIES COMPILE_OPTIONS /EHsc)
 else()
-  set_source_files_properties(linker/native_linker.cpp PROPERTIES COMPILE_OPTIONS -fexceptions)
-  set_source_files_properties(linker/universal_wasm_writer.cpp PROPERTIES COMPILE_OPTIONS -fexceptions)
-  set_source_files_properties(linker/writer.cpp PROPERTIES COMPILE_OPTIONS -fexceptions)
+  set_source_files_properties(${WASMEDGE_LLVM_LINKER_SOURCES}
+    PROPERTIES COMPILE_OPTIONS -fexceptions)
 endif()
 
 if(WASMEDGE_LINK_LLVM_STATIC)
@@ -62,6 +75,7 @@ if(WASMEDGE_LINK_LLVM_STATIC)
     PUBLIC
     wasmedgeCommon
     wasmedgeSystem
+    wasmedgeLoader
     std::filesystem
     ${WASMEDGE_LLVM_LINK_STATIC_COMPONENTS}
     ${WASMEDGE_LLVM_LINK_SHARED_COMPONENTS}
@@ -92,6 +106,7 @@ else()
     LINK_LIBS
     wasmedgeCommon
     wasmedgeSystem
+    wasmedgeLoader
     ${LLD_LIBS}
     std::filesystem
     ${CMAKE_THREAD_LIBS_INIT}

@@ -184,15 +184,14 @@ bool expectedELFPCRelative(Target Architecture, uint32_t Type) {
   }
 }
 
-std::vector<WasmEdge::Byte>
-makeObject(const llvm::Triple &Triple, bool Undefined = false,
-           bool DLLExport = false, std::string FunctionName = "f0",
-           std::string Directives = {}, bool Hidden = false,
-           bool HiddenData = false, std::string CPU = "generic",
-           std::string Features = {}, bool UnwindTable = false,
-           bool Optimize = false, bool Interruptible = false,
-           bool Atomic = false, bool Representative = false,
-           bool Exceptions = false, std::string ModuleAssembly = {}) {
+std::vector<WasmEdge::Byte> makeObject(
+    const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
+    std::string FunctionName = "f0", std::string Directives = {},
+    bool Hidden = false, bool HiddenData = false, std::string CPU = "generic",
+    std::string Features = {}, bool UnwindTable = false, bool Optimize = false,
+    bool Interruptible = false, bool Atomic = false,
+    bool Representative = false, bool Exceptions = false,
+    std::string ModuleAssembly = {}, bool SemanticSymbols = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -246,6 +245,14 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
   auto *Value = new llvm::GlobalVariable(
       Module, I32, false, llvm::GlobalValue::ExternalLinkage,
       Undefined ? nullptr : llvm::ConstantInt::get(I32, 7), "value");
+  if (SemanticSymbols) {
+    new llvm::GlobalVariable(Module, I32, true,
+                             llvm::GlobalValue::ExternalLinkage,
+                             llvm::ConstantInt::get(I32, 1), "version");
+    new llvm::GlobalVariable(Module, I32, true,
+                             llvm::GlobalValue::ExternalLinkage,
+                             llvm::ConstantInt::get(I32, 2), "intrinsics");
+  }
   if (HiddenData) {
     Value->setVisibility(llvm::GlobalValue::HiddenVisibility);
   }
@@ -1327,12 +1334,17 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsMalformedWasmAtomically) {
       0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
   const auto Output = Directory / "malformed.wasm";
   const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
-  const std::array<std::vector<WasmEdge::Byte>, 4> Invalid{{
+  const std::array<std::vector<WasmEdge::Byte>, 7> Invalid{{
       {0x01, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00},
       {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00},
       {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00},
       {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x80, 0x80, 0x80,
        0x80, 0x10},
+      {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01,
+       0x01, 0x00},
+      {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x00, 0x01,
+       0x01, 0x00},
+      {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01},
   }};
   for (const auto &Wasm : Invalid) {
     EXPECT_FALSE(
@@ -1340,6 +1352,33 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsMalformedWasmAtomically) {
     EXPECT_FALSE(std::filesystem::exists(Output));
     expectNoTemporaryFiles();
   }
+}
+
+TEST_F(LinkerOutputTest, NativeLinkerRejectsNonHostObjectFormatsAtomically) {
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                    0x01, 0x00, 0x00, 0x00};
+#if defined(__x86_64__) || defined(_M_X64)
+#if WASMEDGE_OS_LINUX
+  const std::array<const char *, 2> Triples{"x86_64-apple-macosx",
+                                            "x86_64-pc-windows-msvc"};
+#elif WASMEDGE_OS_MACOS
+  const std::array<const char *, 2> Triples{"x86_64-unknown-linux-gnu",
+                                            "x86_64-pc-windows-msvc"};
+#elif WASMEDGE_OS_WINDOWS
+  const std::array<const char *, 2> Triples{"x86_64-unknown-linux-gnu",
+                                            "x86_64-apple-macosx"};
+#endif
+  for (const char *Triple : Triples) {
+    const auto Object = makeObject(llvm::Triple(Triple), false, false, "f0", {},
+                                   false, false, "generic", {}, false, false,
+                                   false, false, false, false, {}, true);
+    const auto Output = Directory / (std::string(Triple) + ".wasm");
+    EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output,
+                                    OutputKind::UniversalWasm));
+    EXPECT_FALSE(std::filesystem::exists(Output));
+    expectNoTemporaryFiles();
+  }
+#endif
 }
 
 TEST_F(LinkerOutputTest,
