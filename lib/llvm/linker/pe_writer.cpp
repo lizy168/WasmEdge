@@ -57,6 +57,13 @@ void put(std::vector<Byte> &Bytes, uint64_t Offset, uint64_t Value,
     Bytes[Offset + I] = static_cast<Byte>(Value >> (I * 8));
 }
 
+uint32_t get32(Span<const Byte> Bytes, size_t Offset) noexcept {
+  uint32_t Result = 0;
+  for (uint8_t I = 0; I < 4; ++I)
+    Result |= static_cast<uint32_t>(Bytes[Offset + I]) << (I * 8);
+  return Result;
+}
+
 std::string outputName(const Section &Value) {
   if (Value.Purpose == SectionPurpose::PData)
     return ".pdata";
@@ -100,6 +107,136 @@ struct OutputSection {
   uint32_t Characteristics = 0;
   std::vector<Byte> Content;
 };
+
+bool containsRVA(const LinkGraph &Graph, SectionKind Kind, uint32_t RVA,
+                 bool AllowEnd = false) noexcept {
+  for (const auto &Section : Graph.sections()) {
+    if (Section.Kind != Kind || Section.Address < ImageBase)
+      continue;
+    const uint64_t Start = Section.Address - ImageBase;
+    const uint64_t End = Start + Section.VirtualSize;
+    if (RVA >= Start && (AllowEnd ? RVA <= End : RVA < End))
+      return true;
+  }
+  return false;
+}
+
+bool containsXDataRVA(const LinkGraph &Graph, uint32_t RVA) noexcept {
+  for (const auto &Section : Graph.sections()) {
+    if (Section.Purpose != SectionPurpose::XData || Section.Address < ImageBase)
+      continue;
+    const uint64_t Start = Section.Address - ImageBase;
+    if (RVA >= Start && RVA - Start < Section.VirtualSize)
+      return true;
+  }
+  return false;
+}
+
+std::optional<uint32_t> arm64UnwindLength(const LinkGraph &Graph,
+                                          uint32_t RVA) noexcept {
+  for (const auto &Section : Graph.sections()) {
+    if (Section.Purpose != SectionPurpose::XData || Section.Address < ImageBase)
+      continue;
+    const uint64_t Start = Section.Address - ImageBase;
+    if (RVA < Start || RVA - Start > Section.Content.size() ||
+        4 > Section.Content.size() - (RVA - Start))
+      continue;
+    const Span<const Byte> Header(Section.Content.data() + (RVA - Start), 4);
+    return get32(Header, 0) & UINT32_C(0x3FFFF);
+  }
+  return std::nullopt;
+}
+
+bool normalizePData(const LinkGraph &Graph, OutputSection &PData) {
+  const size_t EntrySize = Graph.target() == Target::X86_64 ? 12 : 8;
+  std::vector<SectionId> PDataSections;
+  for (SectionId I = 0; I < Graph.sections().size(); ++I)
+    if (Graph.sections()[I].Purpose == SectionPurpose::PData) {
+      if (Graph.sections()[I].VirtualSize % EntrySize != 0)
+        return false;
+      if (Graph.sections()[I].Content.size() != Graph.sections()[I].VirtualSize)
+        return false;
+      PDataSections.push_back(I);
+    }
+  for (const auto &Symbol : Graph.symbols())
+    if (std::find(PDataSections.begin(), PDataSections.end(), Symbol.Section) !=
+            PDataSections.end() &&
+        (Symbol.Exported || Symbol.Size != 0))
+      return false;
+  for (const auto &Relocation : Graph.relocations())
+    if (std::find(PDataSections.begin(), PDataSections.end(),
+                  Graph.symbols()[Relocation.Symbol].Section) !=
+        PDataSections.end())
+      return false;
+  struct Entry {
+    uint32_t Begin;
+    uint32_t End;
+    bool HasEnd;
+    std::vector<Byte> Bytes;
+  };
+  std::vector<Entry> Entries;
+  for (const SectionId Id : PDataSections) {
+    const auto &Section = Graph.sections()[Id];
+    for (size_t Offset = 0; Offset < Section.Content.size();
+         Offset += EntrySize) {
+      const Span<const Byte> Bytes(Section.Content.data() + Offset, EntrySize);
+      const uint32_t Begin = get32(Bytes, 0);
+      uint32_t End = Begin;
+      bool HasEnd = false;
+      if (!containsRVA(Graph, SectionKind::Text, Begin))
+        return false;
+      if (Graph.target() == Target::X86_64) {
+        End = get32(Bytes, 4);
+        const uint32_t Unwind = get32(Bytes, 8);
+        if (End <= Begin || !containsRVA(Graph, SectionKind::Text, End, true) ||
+            !containsXDataRVA(Graph, Unwind))
+          return false;
+        HasEnd = true;
+      } else {
+        const uint32_t Unwind = get32(Bytes, 4);
+        if ((Unwind & 3) == 0) {
+          const auto FunctionLength = arm64UnwindLength(Graph, Unwind);
+          if (!FunctionLength || *FunctionLength == 0 ||
+              Begin > UINT32_MAX - *FunctionLength * 4)
+            return false;
+          End = Begin + *FunctionLength * 4;
+          if (!containsRVA(Graph, SectionKind::Text, End, true))
+            return false;
+          HasEnd = true;
+        } else {
+          if ((Unwind & 3) == 3)
+            return false;
+          const uint32_t FunctionLength = (Unwind >> 2) & 0x7FF;
+          if (FunctionLength == 0 || Begin > UINT32_MAX - FunctionLength * 4)
+            return false;
+          End = Begin + FunctionLength * 4;
+          if (!containsRVA(Graph, SectionKind::Text, End, true))
+            return false;
+          HasEnd = true;
+        }
+      }
+      Entries.push_back(Entry{Begin, End, HasEnd,
+                              std::vector<Byte>(Bytes.begin(), Bytes.end())});
+    }
+  }
+  std::sort(Entries.begin(), Entries.end(),
+            [](const auto &Left, const auto &Right) {
+              return Left.Begin < Right.Begin;
+            });
+  for (size_t I = 1; I < Entries.size(); ++I)
+    if (Entries[I - 1].Begin == Entries[I].Begin ||
+        (Entries[I - 1].HasEnd && Entries[I - 1].End > Entries[I].Begin))
+      return false;
+  PData.Content.resize(Entries.size() * EntrySize);
+  PData.VirtualSize = static_cast<uint32_t>(PData.Content.size());
+  size_t Offset = 0;
+  for (const auto &Entry : Entries) {
+    std::copy(Entry.Bytes.begin(), Entry.Bytes.end(),
+              PData.Content.begin() + Offset);
+    Offset += EntrySize;
+  }
+  return true;
+}
 
 bool appendSection(std::vector<OutputSection> &Sections, std::string Name,
                    uint64_t &RVA, uint64_t &FileOffset,
@@ -233,6 +370,9 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
       }
       Section.Characteristics = characteristics(Name);
     }
+    if (auto PData = Inputs.find(".pdata");
+        PData != Inputs.end() && !normalizePData(Graph, PData->second))
+      return fail();
     constexpr std::array<std::string_view, 6> Order{
         ".text", ".rdata", ".data", ".bss", ".pdata", ".xdata"};
     std::vector<OutputSection> Sections;

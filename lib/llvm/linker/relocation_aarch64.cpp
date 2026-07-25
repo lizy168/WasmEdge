@@ -51,6 +51,11 @@ bool signedBits(int128_t Value, unsigned Bits) {
   return Value >= -Limit && Value < Limit;
 }
 
+int64_t signExtend(uint64_t Value, unsigned Bits) noexcept {
+  const uint64_t Sign = UINT64_C(1) << (Bits - 1);
+  return static_cast<int64_t>((Value ^ Sign) - Sign);
+}
+
 } // namespace
 
 Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
@@ -74,6 +79,14 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       if (!Value)
         return fail(Rel, "cannot decode implicit addend");
       Addend = *Value;
+    }
+    if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF &&
+        Rel.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR32NB) {
+      auto Value = readUnsigned(Bytes, Rel.Offset, 4, Endianness::Little);
+      if (!Value || *Value > INT64_MAX ||
+          Addend > INT64_MAX - static_cast<int64_t>(*Value))
+        return fail(Rel, "cannot decode implicit addend");
+      Addend += static_cast<int64_t>(*Value);
     }
     const int128_t S = int128_t(Graph.sections()[Symbol.Section].Address) +
                        Symbol.Offset + Addend;
@@ -161,7 +174,10 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       if ((Instruction & BranchOpcodeMask) != Opcode) {
         return fail(Rel, "invalid branch instruction");
       }
-      const int128_t Value = S - P;
+      int128_t Value = S - P;
+      if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF)
+        Value += signExtend(Instruction & BranchImmediateMask, 26)
+                 << BranchImmediateShift;
       if ((Value & InstructionAlignmentMask) != 0 ||
           !signedBits(Value, BranchDisplacementBits)) {
         return fail(Rel, "branch displacement overflows");
@@ -188,7 +204,14 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       if ((Instruction & AdrpOpcodeMask) != AdrpOpcode) {
         return fail(Rel, "invalid ADRP instruction");
       }
-      const int128_t Pages = (S >> PageShift) - (P >> PageShift);
+      int128_t TargetAddress = S;
+      if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF) {
+        const uint32_t Raw =
+            ((Instruction >> AdrpImmediateLowShift) & 3) |
+            ((Instruction >> AdrpImmediateHighShift) & AdrpImmediateHighMask);
+        TargetAddress += signExtend(Raw, PageDisplacementBits);
+      }
+      const int128_t Pages = (TargetAddress >> PageShift) - (P >> PageShift);
       if (!signedBits(Pages, PageDisplacementBits)) {
         return fail(Rel, "ADRP page displacement overflows");
       }
@@ -216,10 +239,18 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       } else if (Rel.Format == ObjectFormat::COFF &&
                  (Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A ||
                   Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L)) {
-        Encoding = {Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L
-                        ? static_cast<Low12Scale>((Instruction >> 30) & 3)
-                        : Low12Scale::Byte,
-                    0, 0};
+        if (Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A) {
+          Encoding = {Low12Scale::Byte, UINT32_C(0x7FC00000),
+                      UINT32_C(0x11000000)};
+        } else {
+          if ((Instruction & UINT32_C(0x3B000000)) != UINT32_C(0x39000000))
+            return fail(Rel, "invalid low12 instruction");
+          unsigned Scale = (Instruction >> 30) & 3;
+          if (Scale == 0 &&
+              (Instruction & UINT32_C(0x04800000)) == UINT32_C(0x04800000))
+            Scale = 4;
+          Encoding = {static_cast<Low12Scale>(Scale), 0, 0};
+        }
       } else
         switch (Rel.Type) {
         case llvm::ELF::R_AARCH64_ADD_ABS_LO12_NC:
@@ -257,9 +288,13 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       if ((Low & ((UINT64_C(1) << value(Encoding.Scale)) - 1)) != 0) {
         return fail(Rel, "unaligned low12 relocation");
       }
-      Instruction = (Instruction & ~Low12ImmediateMask) |
-                    (static_cast<uint32_t>(Low >> value(Encoding.Scale))
-                     << Low12ImmediateShift);
+      uint64_t Immediate = Low >> value(Encoding.Scale);
+      if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF)
+        Immediate += (Instruction & Low12ImmediateMask) >> Low12ImmediateShift;
+      const uint64_t Maximum = UINT64_C(0xFFF) >> value(Encoding.Scale);
+      Instruction =
+          (Instruction & ~Low12ImmediateMask) |
+          (static_cast<uint32_t>(Immediate & Maximum) << Low12ImmediateShift);
     }
     if (!writeUnsigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little,
                        Instruction)) {

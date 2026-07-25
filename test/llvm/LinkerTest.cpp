@@ -3512,6 +3512,123 @@ data:
             UINT32_C(0xF9400021) | ((Low12 >> 3) << 10));
 }
 
+TEST(AArch64RelocationTest, DecodesCOFFImplicitAddendsExactly) {
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  struct Case {
+    uint32_t Type;
+    uint32_t Initial;
+    uint64_t Target;
+    uint64_t Patch;
+    uint32_t Expected;
+  };
+  const std::array<Case, 6> Cases{{
+      {llvm::COFF::IMAGE_REL_ARM64_ADDR32NB, 5, ImageBase + 0x2000,
+       ImageBase + 0x1000, 0x2005},
+      {llvm::COFF::IMAGE_REL_ARM64_BRANCH26, 0x94000002, ImageBase + 0x1100,
+       ImageBase + 0x1000, 0x94000042},
+      {llvm::COFF::IMAGE_REL_ARM64_BRANCH26, 0x97FFFFFF, ImageBase + 0x1100,
+       ImageBase + 0x1000, 0x9400003F},
+      {llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21, 0xB0000000,
+       ImageBase + 0x1FFF, ImageBase + 0x1000, 0xB0000000},
+      {llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A, 0x91001400,
+       ImageBase + 0x1FFC, ImageBase + 0x1000, 0x91000400},
+      {llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L, 0xF9400800,
+       ImageBase + 0x1FF8, ImageBase + 0x1000, 0xF9400400},
+  }};
+  for (const auto &Test : Cases) {
+    std::vector<WasmEdge::Byte> Bytes(8);
+    ASSERT_TRUE(
+        Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little, Test.Initial));
+    auto Graph = makeELFRelocationGraph(
+        Target::AArch64, Endianness::Little, Test.Type, 4, Test.Target,
+        Test.Patch, 0, 0, true, std::move(Bytes), ObjectFormat::COFF);
+    ASSERT_TRUE(applyRelocations(Graph));
+    EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 4,
+                                      Endianness::Little),
+              Test.Expected)
+        << Test.Type;
+  }
+
+  std::vector<WasmEdge::Byte> SIMD(8);
+  ASSERT_TRUE(Internal::writeUnsigned(SIMD, 0, 4, Endianness::Little,
+                                      UINT32_C(0x3DC00400)));
+  auto SIMDGraph = makeELFRelocationGraph(
+      Target::AArch64, Endianness::Little,
+      llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L, 4, ImageBase + 0x1FF0,
+      ImageBase + 0x1000, 0, 0, true, std::move(SIMD), ObjectFormat::COFF);
+  ASSERT_TRUE(applyRelocations(SIMDGraph));
+  EXPECT_EQ(*Internal::readUnsigned(SIMDGraph.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            UINT32_C(0x3DC00000));
+}
+
+TEST(AArch64RelocationTest, RejectsMalformedCOFFImplicitInstructions) {
+  for (const auto Type : {llvm::COFF::IMAGE_REL_ARM64_BRANCH26,
+                          llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21,
+                          llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A,
+                          llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L}) {
+    std::vector<WasmEdge::Byte> Bytes(8);
+    ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                        UINT32_C(0xD503201F)));
+    auto Graph =
+        makeELFRelocationGraph(Target::AArch64, Endianness::Little, Type, 4,
+                               UINT64_C(0x180002000), UINT64_C(0x180001000), 0,
+                               0, true, std::move(Bytes), ObjectFormat::COFF);
+    const auto Snapshot = Graph;
+    EXPECT_FALSE(applyRelocations(Graph)) << Type;
+    expectGraphStateEquals(Graph, Snapshot);
+  }
+}
+
+TEST(AArch64RelocationTest, RelocatesGeneratedCOFFAddendsExactly) {
+  const auto Object =
+      makeAssemblyObject(llvm::Triple("aarch64-pc-windows-msvc"), R"(
+.text
+.globl f
+.globl target
+f:
+  adrp x0, data+4097
+  add x0, x0, :lo12:data+4097
+  adrp x1, data+4088
+  ldr x1, [x1, :lo12:data+4088]
+  bl target+8
+target:
+  ret
+.data
+.p2align 4
+.globl data
+data:
+  .xword 0
+)");
+  auto Graph = ObjectReader::read(Object, Target::AArch64);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->relocations().size(), 4U);
+  ASSERT_TRUE(PEWriter::layout(*Graph));
+  const auto Before =
+      Graph->sections()[Graph->relocations()[0].Section].Content;
+  EXPECT_TRUE(std::any_of(Before.begin(), Before.end(),
+                          [](WasmEdge::Byte Value) { return Value != 0; }));
+  ASSERT_TRUE(applyRelocations(*Graph));
+  const auto &Text = Graph->sections()[Graph->relocations()[0].Section];
+  const auto DataSymbol =
+      std::find_if(Graph->symbols().begin(), Graph->symbols().end(),
+                   [](const auto &Symbol) { return Symbol.Name == "data"; });
+  ASSERT_NE(DataSymbol, Graph->symbols().end());
+  const uint64_t DataAddress =
+      Graph->sections()[DataSymbol->Section].Address + DataSymbol->Offset;
+  const uint64_t TextAddress = Text.Address;
+  const uint32_t FirstPages =
+      static_cast<uint32_t>(((DataAddress + 4097) >> 12) - (TextAddress >> 12));
+  EXPECT_EQ(*Internal::readUnsigned(Text.Content, 0, 4, Endianness::Little),
+            UINT32_C(0x90000000) | ((FirstPages & 3) << 29) |
+                ((FirstPages & 0x1FFFFC) << 3));
+  EXPECT_EQ(*Internal::readUnsigned(Text.Content, 4, 4, Endianness::Little),
+            UINT32_C(0x91000000) | (((DataAddress + 4097) & 0xFFF) << 10));
+  EXPECT_EQ(*Internal::readUnsigned(Text.Content, 12, 4, Endianness::Little),
+            UINT32_C(0xF9400021) |
+                ((((DataAddress + 4088) & 0xFFF) >> 3) << 10));
+}
+
 TEST(RISCVRelocationTest, AppliesAbsoluteCallAndUnwindRelocations) {
   auto Absolute = makeELFRelocationGraph(Target::RISCV64, Endianness::Little, 2,
                                          8, 0x2000, 0x1000, 0, -8);

@@ -471,6 +471,193 @@ TEST(PEWriterTest, ValidatesExportOrdinalCapacity) {
   EXPECT_FALSE(Internal::validPEExportCount(SIZE_MAX));
 }
 
+TEST(PEWriterTest, SortsRuntimeFunctionTables) {
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
+    LinkGraph Graph(Architecture, Endianness::Little, ObjectFormat::COFF);
+    ASSERT_TRUE(Graph.beginInput("unwind.obj"));
+    auto Text = Graph.addSection(
+        Section{".text", SectionKind::Text, 4, 64, 0, 0,
+                std::vector<WasmEdge::Byte>(64, Architecture == Target::X86_64
+                                                    ? WasmEdge::Byte{0x90}
+                                                    : WasmEdge::Byte{0})});
+    auto XData = Graph.addSection(Section{".xdata", SectionKind::Unwind, 4, 8,
+                                          0, 0, std::vector<WasmEdge::Byte>(8),
+                                          SectionPurpose::XData});
+    const size_t EntrySize = Architecture == Target::X86_64 ? 12 : 8;
+    auto PDataA = Graph.addSection(
+        Section{".pdata$a", SectionKind::Unwind, 4, EntrySize, 0, 0,
+                std::vector<WasmEdge::Byte>(EntrySize), SectionPurpose::PData});
+    auto PDataB = Graph.addSection(
+        Section{".pdata$b", SectionKind::Unwind, 16, EntrySize, 0, 0,
+                std::vector<WasmEdge::Byte>(EntrySize), SectionPurpose::PData});
+    ASSERT_TRUE(Text && XData && PDataA && PDataB);
+    ASSERT_TRUE(PEWriter::layout(Graph));
+    auto Write32 = [&](SectionId Section, size_t Offset, uint32_t Value) {
+      auto Content = Graph.sectionContent(Section);
+      ASSERT_TRUE(Content);
+      for (uint8_t I = 0; I < 4; ++I)
+        (*Content)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+    };
+    const uint32_t TextRVA =
+        static_cast<uint32_t>(Graph.sections()[*Text].Address - ImageBase);
+    const uint32_t XDataRVA =
+        static_cast<uint32_t>(Graph.sections()[*XData].Address - ImageBase);
+    if (Architecture == Target::X86_64) {
+      Write32(*PDataA, 0, TextRVA + 32);
+      Write32(*PDataA, 4, TextRVA + 48);
+      Write32(*PDataA, 8, XDataRVA + 4);
+      Write32(*PDataB, 0, TextRVA);
+      Write32(*PDataB, 4, TextRVA + 16);
+      Write32(*PDataB, 8, XDataRVA);
+    } else {
+      Write32(*XData, 0, 4);
+      Write32(*PDataA, 0, TextRVA + 32);
+      Write32(*PDataA, 4, (4U << 2) | 1U);
+      Write32(*PDataB, 0, TextRVA);
+      Write32(*PDataB, 4, XDataRVA);
+    }
+    ASSERT_TRUE(applyRelocations(Graph));
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    ASSERT_TRUE(PEWriter::write(Graph, "sorted.dll", Output));
+    auto Object =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                            Bytes.size()),
+            "sorted.dll"));
+    ASSERT_TRUE(static_cast<bool>(Object));
+    llvm::object::SectionRef Storage;
+    const auto *PData = findSection(**Object, ".pdata", Storage);
+    ASSERT_NE(PData, nullptr);
+    const uint32_t PEOffset =
+        static_cast<uint32_t>(readInteger(Bytes, 0x3C, 4, Endianness::Little));
+    const size_t ExceptionDirectory = PEOffset + 24 + 112 + 3 * 8;
+    EXPECT_EQ(readInteger(Bytes, ExceptionDirectory, 4, Endianness::Little),
+              PData->getAddress() - ImageBase);
+    EXPECT_EQ(readInteger(Bytes, ExceptionDirectory + 4, 4, Endianness::Little),
+              EntrySize * 2);
+    auto Content = PData->getContents();
+    ASSERT_TRUE(static_cast<bool>(Content));
+    std::vector<WasmEdge::Byte> PDataBytes(Content->bytes_begin(),
+                                           Content->bytes_end());
+    EXPECT_EQ(readInteger(PDataBytes, 0, 4, Endianness::Little), TextRVA);
+    EXPECT_EQ(readInteger(PDataBytes, EntrySize, 4, Endianness::Little),
+              TextRVA + 32);
+  }
+}
+
+TEST(PEWriterTest, RejectsSymbolsReferencingSortedRuntimeFunctions) {
+  auto Graph = makePEGraph(Target::X86_64);
+  ASSERT_TRUE(
+      Graph.addSymbol(Symbol{"bad_pdata", 4, 0, 12, true, std::nullopt, true}));
+  ASSERT_TRUE(PEWriter::layout(Graph));
+  auto PData = Graph.sectionContent(4);
+  ASSERT_TRUE(PData);
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  const uint32_t TextRVA =
+      static_cast<uint32_t>(Graph.sections()[0].Address - ImageBase);
+  const uint32_t XDataRVA =
+      static_cast<uint32_t>(Graph.sections()[5].Address - ImageBase);
+  for (const auto [Offset, Value] : std::array<std::pair<size_t, uint32_t>, 3>{
+           {{0, TextRVA}, {4, TextRVA + 4}, {8, XDataRVA}}})
+    for (uint8_t I = 0; I < 4; ++I)
+      (*PData)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_FALSE(PEWriter::write(Graph, "bad-symbol.dll", Output));
+  EXPECT_TRUE(Bytes.empty());
+}
+
+TEST(PEWriterTest, RejectsInvalidRuntimeFunctionTables) {
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
+    auto Graph = makePEGraph(Architecture);
+    ASSERT_TRUE(PEWriter::layout(Graph));
+    auto PData = Graph.sectionContent(4);
+    ASSERT_TRUE(PData);
+    const uint32_t TextRVA =
+        static_cast<uint32_t>(Graph.sections()[0].Address - ImageBase);
+    const uint32_t XDataRVA =
+        static_cast<uint32_t>(Graph.sections()[5].Address - ImageBase);
+    auto Write = [&](size_t Offset, uint32_t Value) {
+      for (uint8_t I = 0; I < 4; ++I)
+        (*PData)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+    };
+    Write(0, TextRVA);
+    if (Architecture == Target::X86_64) {
+      Write(4, TextRVA);
+      Write(8, XDataRVA + 8);
+    } else {
+      Write(4, XDataRVA + 8);
+    }
+    ASSERT_TRUE(applyRelocations(Graph));
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    EXPECT_FALSE(PEWriter::write(Graph, "invalid-unwind.dll", Output));
+    EXPECT_TRUE(Bytes.empty());
+  }
+}
+
+TEST(PEWriterTest, RejectsDuplicateAndOverlappingRuntimeFunctions) {
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  for (const bool Duplicate : {true, false}) {
+    LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::COFF);
+    ASSERT_TRUE(Graph.beginInput("overlap.obj"));
+    auto Text = Graph.addSection(Section{".text", SectionKind::Text, 4, 64, 0,
+                                         0, std::vector<WasmEdge::Byte>(64)});
+    auto XData = Graph.addSection(Section{".xdata",
+                                          SectionKind::Unwind,
+                                          4,
+                                          4,
+                                          0,
+                                          0,
+                                          {1, 0, 0, 0},
+                                          SectionPurpose::XData});
+    auto PData = Graph.addSection(Section{".pdata", SectionKind::Unwind, 4, 24,
+                                          0, 0, std::vector<WasmEdge::Byte>(24),
+                                          SectionPurpose::PData});
+    ASSERT_TRUE(Text && XData && PData);
+    ASSERT_TRUE(PEWriter::layout(Graph));
+    auto Content = Graph.sectionContent(*PData);
+    ASSERT_TRUE(Content);
+    const uint32_t TextRVA =
+        static_cast<uint32_t>(Graph.sections()[*Text].Address - ImageBase);
+    const uint32_t XDataRVA =
+        static_cast<uint32_t>(Graph.sections()[*XData].Address - ImageBase);
+    auto Write = [&](size_t Offset, uint32_t Value) {
+      for (uint8_t I = 0; I < 4; ++I)
+        (*Content)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+    };
+    Write(0, TextRVA);
+    Write(4, TextRVA + 32);
+    Write(8, XDataRVA);
+    Write(12, TextRVA + (Duplicate ? 0 : 16));
+    Write(16, TextRVA + 48);
+    Write(20, XDataRVA);
+    ASSERT_TRUE(applyRelocations(Graph));
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    EXPECT_FALSE(PEWriter::write(Graph, "overlap.dll", Output));
+    EXPECT_TRUE(Bytes.empty());
+  }
+
+  LinkGraph MisSized(Target::AArch64, Endianness::Little, ObjectFormat::COFF);
+  ASSERT_TRUE(MisSized.beginInput("mis-sized.obj"));
+  ASSERT_TRUE(MisSized.addSection(Section{".text", SectionKind::Text, 4, 16, 0,
+                                          0, std::vector<WasmEdge::Byte>(16)}));
+  ASSERT_TRUE(MisSized.addSection(Section{".pdata", SectionKind::Unwind, 4, 9,
+                                          0, 0, std::vector<WasmEdge::Byte>(9),
+                                          SectionPurpose::PData}));
+  ASSERT_TRUE(PEWriter::layout(MisSized));
+  ASSERT_TRUE(applyRelocations(MisSized));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_FALSE(PEWriter::write(MisSized, "mis-sized.dll", Output));
+  EXPECT_TRUE(Bytes.empty());
+}
+
 TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
   const std::array<ELFCase, 5> Cases{{
       {Target::ARM, Endianness::Little, llvm::ELF::EM_ARM,
