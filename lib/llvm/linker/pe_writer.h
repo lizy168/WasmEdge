@@ -6,11 +6,16 @@
 #include "linker/link_graph.h"
 #include "linker/writer.h"
 
+#include <cstddef>
 #include <string_view>
 
 namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
+
+namespace Internal {
+bool validPEExportCount(size_t Count) noexcept;
+} // namespace Internal
 
 class PEWriter {
 public:

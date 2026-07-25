@@ -36,6 +36,13 @@ bool add(uint64_t Left, uint64_t Right, uint64_t &Result) noexcept {
   return true;
 }
 
+bool multiply(uint64_t Left, uint64_t Right, uint64_t &Result) noexcept {
+  if (Left != 0 && Right > UINT64_MAX / Left)
+    return false;
+  Result = Left * Right;
+  return true;
+}
+
 bool align(uint64_t Value, uint64_t Alignment, uint64_t &Result) noexcept {
   uint64_t Sum = 0;
   if (!add(Value, Alignment - 1, Sum))
@@ -119,6 +126,11 @@ bool appendSection(std::vector<OutputSection> &Sections, std::string Name,
 
 } // namespace
 
+bool Internal::validPEExportCount(size_t Count) noexcept {
+  constexpr size_t MaximumExportCount = UINT16_MAX + size_t{1};
+  return Count <= MaximumExportCount;
+}
+
 Expect<void> PEWriter::layout(LinkGraph &Graph) noexcept {
   try {
     if (Graph.format() != ObjectFormat::COFF || Graph.relocationsApplied() ||
@@ -145,6 +157,12 @@ Expect<void> PEWriter::layout(LinkGraph &Graph) noexcept {
       auto Group = Groups.find(std::string(Name));
       if (Group == Groups.end())
         continue;
+      uint64_t GroupAlignment = SectionAlignment;
+      for (const SectionId Id : Group->second)
+        GroupAlignment =
+            std::max(GroupAlignment, Graph.sections()[Id].Alignment);
+      if (!align(RVA, GroupAlignment, RVA))
+        return fail();
       uint64_t GroupOffset = 0;
       for (const SectionId Id : Group->second) {
         const auto &Input = Graph.sections()[Id];
@@ -252,7 +270,7 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
                     Right->ExportName ? *Right->ExportName : Right->Name;
                 return std::tie(L, Left->Name) < std::tie(R, Right->Name);
               });
-    if (Exports.size() > UINT32_MAX)
+    if (!Internal::validPEExportCount(Exports.size()))
       return fail();
     for (size_t I = 1; I < Exports.size(); ++I) {
       const auto &L = Exports[I - 1]->ExportName ? *Exports[I - 1]->ExportName
@@ -262,7 +280,13 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
       if (L == R)
         return fail();
     }
-    uint64_t ExportSize = 40 + Exports.size() * 10 + DLLName.size() + 1;
+    uint64_t ExportTableSize = 0;
+    uint64_t ExportSize = 0;
+    if (!multiply(Exports.size(), 10, ExportTableSize) ||
+        !add(40, ExportTableSize, ExportSize) ||
+        !add(ExportSize, DLLName.size(), ExportSize) ||
+        !add(ExportSize, 1, ExportSize))
+      return fail();
     for (const auto *Symbol : Exports) {
       const auto &Name =
           Symbol->ExportName ? *Symbol->ExportName : Symbol->Name;
@@ -273,9 +297,16 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
         ExportSize > std::numeric_limits<size_t>::max())
       return fail();
     std::vector<Byte> EData(static_cast<size_t>(ExportSize));
+    if (RVA > UINT32_MAX)
+      return fail();
     const uint32_t ExportRVA = static_cast<uint32_t>(RVA);
-    uint32_t Cursor = 40 + static_cast<uint32_t>(Exports.size()) * 10;
-    const uint32_t DLLNameRVA = ExportRVA + Cursor;
+    uint64_t Cursor64 = 0;
+    uint64_t DLLNameRVA64 = 0;
+    if (!add(40, ExportTableSize, Cursor64) || Cursor64 > UINT32_MAX ||
+        !add(ExportRVA, Cursor64, DLLNameRVA64) || DLLNameRVA64 > UINT32_MAX)
+      return fail();
+    uint32_t Cursor = static_cast<uint32_t>(Cursor64);
+    const uint32_t DLLNameRVA = static_cast<uint32_t>(DLLNameRVA64);
     std::copy(DLLName.begin(), DLLName.end(), EData.begin() + Cursor);
     Cursor += static_cast<uint32_t>(DLLName.size()) + 1;
     put(EData, 12, DLLNameRVA, 4);
@@ -283,16 +314,29 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
     put(EData, 20, Exports.size(), 4);
     put(EData, 24, Exports.size(), 4);
     put(EData, 28, ExportRVA + 40, 4);
-    put(EData, 32, ExportRVA + 40 + Exports.size() * 4, 4);
-    put(EData, 36, ExportRVA + 40 + Exports.size() * 8, 4);
+    uint64_t NameTableRVA = 0;
+    uint64_t OrdinalTableRVA = 0;
+    uint64_t TableBytes = 0;
+    uint64_t AddressTableRVA = 0;
+    if (!add(ExportRVA, 40, AddressTableRVA) ||
+        !multiply(Exports.size(), 4, TableBytes) ||
+        !add(AddressTableRVA, TableBytes, NameTableRVA) ||
+        !add(NameTableRVA, TableBytes, OrdinalTableRVA) ||
+        OrdinalTableRVA > UINT32_MAX)
+      return fail();
+    put(EData, 32, NameTableRVA, 4);
+    put(EData, 36, OrdinalTableRVA, 4);
     for (size_t I = 0; I < Exports.size(); ++I) {
       const auto &Symbol = *Exports[I];
       const uint64_t Address =
           Graph.sections()[Symbol.Section].Address + Symbol.Offset;
       if (Address < ImageBase || Address - ImageBase > UINT32_MAX)
         return fail();
+      uint64_t NameRVA = 0;
+      if (!add(ExportRVA, Cursor, NameRVA) || NameRVA > UINT32_MAX)
+        return fail();
       put(EData, 40 + I * 4, Address - ImageBase, 4);
-      put(EData, 40 + Exports.size() * 4 + I * 4, ExportRVA + Cursor, 4);
+      put(EData, 40 + Exports.size() * 4 + I * 4, NameRVA, 4);
       put(EData, 40 + Exports.size() * 8 + I * 2, I, 2);
       const auto &Name = Symbol.ExportName ? *Symbol.ExportName : Symbol.Name;
       std::copy(Name.begin(), Name.end(), EData.begin() + Cursor);
@@ -420,8 +464,10 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
       put(Bytes, Optional + 112 + 3 * 8, PData->RVA, 4);
       put(Bytes, Optional + 116 + 3 * 8, PData->VirtualSize, 4);
     }
-    put(Bytes, Optional + 112 + 5 * 8, RelocRVA, 4);
-    put(Bytes, Optional + 116 + 5 * 8, RelocSize, 4);
+    if (RelocSize != 0) {
+      put(Bytes, Optional + 112 + 5 * 8, RelocRVA, 4);
+      put(Bytes, Optional + 116 + 5 * 8, RelocSize, 4);
+    }
     for (size_t I = 0; I < Sections.size(); ++I) {
       const auto &Section = Sections[I];
       const size_t Header =

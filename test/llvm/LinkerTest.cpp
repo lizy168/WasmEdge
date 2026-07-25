@@ -250,10 +250,6 @@ std::vector<WasmEdge::Byte> makeObject(
   Module.setDataLayout(Machine->createDataLayout());
   Module.setModuleInlineAsm(ModuleAssembly);
   auto *I32 = llvm::Type::getInt32Ty(Context);
-  if (FloatingPoint && Triple.isOSWindows())
-    new llvm::GlobalVariable(Module, I32, false,
-                             llvm::GlobalValue::ExternalLinkage,
-                             llvm::ConstantInt::get(I32, 0), "_fltused");
   auto *Value = new llvm::GlobalVariable(
       Module, I32, false, llvm::GlobalValue::ExternalLinkage,
       Undefined ? nullptr : llvm::ConstantInt::get(I32, 7), "value");
@@ -4375,14 +4371,83 @@ TEST(PEWriterTest, LinksGeneratedWindowsObjects) {
            {"x86_64-pc-windows-msvc", Target::X86_64},
            {"aarch64-pc-windows-msvc", Target::AArch64},
        }}) {
-    const auto Object = makeObject(llvm::Triple(Triple), false, false, "f0",
-                                   "/EXPORT:f0 /EXPORT:value", false, false,
-                                   "generic", {}, true, true, false, false,
-                                   true, false, {}, false, false, true);
+    const auto Object = makeObject(
+        llvm::Triple(Triple), false, false, "f0", "/EXPORT:f0 /EXPORT:value",
+        false, false, "generic", {}, true, true, false, false, true);
     auto Graph = ObjectReader::read(Object, Architecture);
     ASSERT_TRUE(Graph) << Triple;
+    const std::set<uint32_t> Allowed =
+        Architecture == Target::X86_64
+            ? std::set<uint32_t>{llvm::COFF::IMAGE_REL_AMD64_ADDR64,
+                                 llvm::COFF::IMAGE_REL_AMD64_ADDR32NB,
+                                 llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                 llvm::COFF::IMAGE_REL_AMD64_REL32_1,
+                                 llvm::COFF::IMAGE_REL_AMD64_REL32_2,
+                                 llvm::COFF::IMAGE_REL_AMD64_REL32_3,
+                                 llvm::COFF::IMAGE_REL_AMD64_REL32_4,
+                                 llvm::COFF::IMAGE_REL_AMD64_REL32_5}
+            : std::set<uint32_t>{llvm::COFF::IMAGE_REL_ARM64_ADDR64,
+                                 llvm::COFF::IMAGE_REL_ARM64_ADDR32NB,
+                                 llvm::COFF::IMAGE_REL_ARM64_BRANCH26,
+                                 llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21,
+                                 llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A,
+                                 llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L};
+    const std::set<uint32_t> Core =
+        Architecture == Target::X86_64
+            ? std::set<uint32_t>{llvm::COFF::IMAGE_REL_AMD64_ADDR64,
+                                 llvm::COFF::IMAGE_REL_AMD64_ADDR32NB,
+                                 llvm::COFF::IMAGE_REL_AMD64_REL32}
+            : std::set<uint32_t>{llvm::COFF::IMAGE_REL_ARM64_ADDR64,
+                                 llvm::COFF::IMAGE_REL_ARM64_ADDR32NB,
+                                 llvm::COFF::IMAGE_REL_ARM64_BRANCH26,
+                                 llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21};
+    const std::set<uint32_t> Expected =
+        Architecture == Target::X86_64
+            ? Core
+            : std::set<uint32_t>{llvm::COFF::IMAGE_REL_ARM64_ADDR64,
+                                 llvm::COFF::IMAGE_REL_ARM64_ADDR32NB,
+                                 llvm::COFF::IMAGE_REL_ARM64_BRANCH26,
+                                 llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21,
+                                 llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L};
+    std::set<uint32_t> Actual;
+    for (const auto &Relocation : Graph->relocations()) {
+      Actual.insert(Relocation.Type);
+      EXPECT_EQ(Relocation.PatchSize,
+                Relocation.Type == llvm::COFF::IMAGE_REL_AMD64_ADDR64 ||
+                        Relocation.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR64
+                    ? 8
+                    : 4);
+    }
+    EXPECT_TRUE(std::includes(Allowed.begin(), Allowed.end(), Actual.begin(),
+                              Actual.end()))
+        << Triple;
+    EXPECT_TRUE(
+        std::includes(Actual.begin(), Actual.end(), Core.begin(), Core.end()))
+        << Triple;
+    EXPECT_EQ(Actual, Expected) << Triple;
+    auto RawObject =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
+                            Object.size()),
+            "generated.obj"));
+    ASSERT_TRUE(static_cast<bool>(RawObject));
+    for (const auto &Symbol : (*RawObject)->symbols()) {
+      auto Name = Symbol.getName();
+      ASSERT_TRUE(static_cast<bool>(Name));
+      EXPECT_NE(*Name, "_fltused");
+      EXPECT_NE(*Name, "_DllMainCRTStartup");
+    }
     ASSERT_TRUE(PEWriter::layout(*Graph)) << Triple;
     ASSERT_TRUE(applyRelocations(*Graph)) << Triple;
+    ASSERT_FALSE(Graph->rebases().empty()) << Triple;
+    for (const auto &Rebase : Graph->rebases()) {
+      EXPECT_EQ(Rebase.Width, 8U);
+      EXPECT_EQ(
+          Rebase.Type,
+          Architecture == Target::X86_64
+              ? static_cast<uint32_t>(llvm::COFF::IMAGE_REL_AMD64_ADDR64)
+              : static_cast<uint32_t>(llvm::COFF::IMAGE_REL_ARM64_ADDR64));
+    }
     std::vector<WasmEdge::Byte> Bytes;
     Writer Output(Bytes);
     ASSERT_TRUE(PEWriter::write(*Graph, "generated.dll", Output)) << Triple;
@@ -4404,6 +4469,30 @@ TEST(PEWriterTest, LinksGeneratedWindowsObjects) {
     }
     EXPECT_EQ(Exports, (std::set<std::string>{"f0", "value"}));
   }
+}
+
+TEST(PEWriterTest, RejectsCompilerRequiredFltusedImport) {
+  const auto Object =
+      makeObject(llvm::Triple("x86_64-pc-windows-msvc"), false, false, "f0",
+                 "/EXPORT:f0", false, false, "generic", {}, true, true, false,
+                 false, false, false, {}, false, false, true);
+  auto Parsed =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
+                          Object.size()),
+          "floating.obj"));
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  bool HasUndefinedFltused = false;
+  for (const auto &Symbol : (*Parsed)->symbols()) {
+    auto Name = Symbol.getName();
+    auto Flags = Symbol.getFlags();
+    ASSERT_TRUE(Name && Flags);
+    HasUndefinedFltused |=
+        *Name == "_fltused" &&
+        (*Flags & llvm::object::SymbolRef::SF_Undefined) != 0;
+  }
+  EXPECT_TRUE(HasUndefinedFltused);
+  EXPECT_FALSE(ObjectReader::read(Object, Target::X86_64));
 }
 
 TEST(EHFrameTest, RequiresTypeWrapperCoverage) {

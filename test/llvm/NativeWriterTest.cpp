@@ -440,6 +440,37 @@ TEST(PEWriterTest, RejectsInvalidRebasesAndOverflowAtomically) {
   EXPECT_EQ(Overflow.sections()[0].FileOffset, 0U);
 }
 
+TEST(PEWriterTest, HonorsInputAlignmentAboveSectionAlignment) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::COFF);
+  ASSERT_TRUE(Graph.beginInput("aligned.obj"));
+  ASSERT_TRUE(Graph.addSection(
+      Section{".text$a", SectionKind::Text, 16, 1, 0, 0, {0xC3}}));
+  ASSERT_TRUE(Graph.addSection(
+      Section{".text$b", SectionKind::Text, 8192, 1, 0, 0, {0xC3}}));
+  ASSERT_TRUE(PEWriter::layout(Graph));
+  EXPECT_EQ(Graph.sections()[1].Address % 8192, 0U);
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(PEWriter::write(Graph, "aligned.dll", Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "aligned.dll"));
+  ASSERT_TRUE(static_cast<bool>(Object)) << llvm::toString(Object.takeError());
+  llvm::object::SectionRef Storage;
+  const auto *Text = findSection(**Object, ".text", Storage);
+  ASSERT_NE(Text, nullptr);
+  EXPECT_EQ(Text->getAddress() % 8192, 0U);
+}
+
+TEST(PEWriterTest, ValidatesExportOrdinalCapacity) {
+  EXPECT_TRUE(Internal::validPEExportCount(65536));
+  EXPECT_FALSE(Internal::validPEExportCount(65537));
+  EXPECT_FALSE(Internal::validPEExportCount(SIZE_MAX));
+}
+
 TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
   const std::array<ELFCase, 5> Cases{{
       {Target::ARM, Endianness::Little, llvm::ELF::EM_ARM,

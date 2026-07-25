@@ -266,10 +266,6 @@ Expect<void> CodeGen::codegen(Span<const Byte> WasmData, Data D,
   std::filesystem::path LLPath(OutputPath);
   LLPath.replace_extension("ll"sv);
 
-#if WASMEDGE_OS_WINDOWS
-  LLModule.addGlobal(LLContext.getInt32Ty(), false, LLVMExternalLinkage,
-                     LLContext.getInt32(0), "_fltused");
-#endif
 #if WASMEDGE_OS_MACOS
   {
     const auto [Major, Minor] = getSDKVersionPair();
