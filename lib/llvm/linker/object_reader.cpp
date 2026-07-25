@@ -160,6 +160,48 @@ bool readELFInteger(Span<const Byte> Buffer, uint64_t Offset, bool LittleEndian,
   return true;
 }
 
+bool hasTrailingELFObject(Span<const Byte> Buffer,
+                          const llvm::object::ObjectFile &Object) noexcept {
+  if (!Object.isELF() || Buffer.size() < value(ELFIdentification::Size)) {
+    return false;
+  }
+  const bool Is64 =
+      Buffer[value(ELFIdentification::Class)] == llvm::ELF::ELFCLASS64;
+  const bool LittleEndian =
+      Buffer[value(ELFIdentification::Data)] == llvm::ELF::ELFDATA2LSB;
+  uint64_t SectionTable = 0;
+  uint16_t SectionEntrySize = 0;
+  uint16_t SectionCount = 0;
+  if (!readELFInteger(Buffer,
+                      Is64 ? value(ELF64Offset::SectionTable)
+                           : value(ELF32Offset::SectionTable),
+                      LittleEndian, SectionTable) ||
+      !readELFInteger(Buffer,
+                      Is64 ? value(ELF64Offset::SectionEntrySize)
+                           : value(ELF32Offset::SectionEntrySize),
+                      LittleEndian, SectionEntrySize) ||
+      !readELFInteger(Buffer,
+                      Is64 ? value(ELF64Offset::SectionCount)
+                           : value(ELF32Offset::SectionCount),
+                      LittleEndian, SectionCount) ||
+      (SectionEntrySize != 0 &&
+       SectionCount > (UINT64_MAX - SectionTable) / SectionEntrySize)) {
+    return false;
+  }
+  uint64_t End = SectionTable + SectionEntrySize * SectionCount;
+  for (const auto &Section : Object.sections()) {
+    const llvm::object::ELFSectionRef ELFSection(Section);
+    if (ELFSection.getType() != llvm::ELF::SHT_NOBITS) {
+      End = std::max(End, ELFSection.getOffset() + ELFSection.getSize());
+    }
+  }
+  return End <= Buffer.size() - std::min<size_t>(Buffer.size(), 4) &&
+         Buffer[End] == llvm::ELF::ElfMagic[0] &&
+         Buffer[End + 1] == llvm::ELF::ElfMagic[1] &&
+         Buffer[End + 2] == llvm::ELF::ElfMagic[2] &&
+         Buffer[End + 3] == llvm::ELF::ElfMagic[3];
+}
+
 bool validELFRelocations(Span<const Byte> Buffer) noexcept {
   constexpr uint64_t MinimumCrelEntrySize = 1;
   constexpr uint64_t ELF32SectionEntrySize = 40;
@@ -629,6 +671,9 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     return Unexpect(ErrCode::Value::IllegalPath);
   }
   const auto &Object = **ObjectResult;
+  if (hasTrailingELFObject(Buffer, Object)) {
+    return fail<LinkGraph>("multiple input objects are not supported");
+  }
   if (!Object.isRelocatableObject()) {
     return fail<LinkGraph>("input is not a relocatable object");
   }

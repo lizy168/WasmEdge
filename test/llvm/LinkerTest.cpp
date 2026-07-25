@@ -176,17 +176,16 @@ bool expectedELFPCRelative(Target Architecture, uint32_t Type) {
   }
 }
 
-std::vector<WasmEdge::Byte>
-makeObject(const llvm::Triple &Triple, bool Undefined = false,
-           bool DLLExport = false, std::string FunctionName = "f0",
-           std::string Directives = {}, bool Hidden = false,
-           bool HiddenData = false, std::string CPU = "generic",
-           std::string Features = {}, bool UnwindTable = false,
-           bool Optimize = false, bool Interruptible = false,
-           bool Atomic = false, bool Representative = false,
-           bool Exceptions = false, std::string ModuleAssembly = {},
-           bool SemanticSymbols = false, bool TypeWrapper = false,
-           bool FloatingPoint = false, bool DefineFltused = false) {
+std::vector<WasmEdge::Byte> makeObject(
+    const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
+    std::string FunctionName = "f0", std::string Directives = {},
+    bool Hidden = false, bool HiddenData = false, std::string CPU = "generic",
+    std::string Features = {}, bool UnwindTable = false, bool Optimize = false,
+    bool Interruptible = false, bool Atomic = false,
+    bool Representative = false, bool Exceptions = false,
+    std::string ModuleAssembly = {}, bool SemanticSymbols = false,
+    bool TypeWrapper = false, bool FloatingPoint = false,
+    bool DefineFltused = false, bool UnusedAllocatableSections = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -259,6 +258,16 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
                                         llvm::GlobalValue::InternalLinkage,
                                         llvm::ConstantInt::get(I32, 0), "zero");
   Zero->setAlignment(llvm::Align(16));
+  if (UnusedAllocatableSections) {
+    auto *UnusedData = new llvm::GlobalVariable(
+        Module, I32, false, llvm::GlobalValue::ExternalLinkage,
+        llvm::ConstantInt::get(I32, UINT32_C(0x6E6F6367)), "unused_data");
+    UnusedData->setVisibility(llvm::GlobalValue::HiddenVisibility);
+    UnusedData->setSection(Triple.isOSBinFormatMachO()  ? "__TEXT,__unused_data"
+                           : Triple.isOSBinFormatCOFF() ? ".rdata$unused"
+                                                        : ".data.unused");
+    UnusedData->setAlignment(llvm::Align(4));
+  }
   auto *F0 = llvm::Function::Create(llvm::FunctionType::get(I32, false),
                                     llvm::GlobalValue::ExternalLinkage,
                                     FunctionName, Module);
@@ -282,6 +291,21 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
     llvm::IRBuilder<> WrapperBuilder(
         llvm::BasicBlock::Create(Context, "entry", T0));
     WrapperBuilder.CreateRet(llvm::ConstantInt::get(I32, 0));
+  }
+  if (UnusedAllocatableSections) {
+    auto *UnusedFunction = llvm::Function::Create(
+        llvm::FunctionType::get(I32, false), llvm::GlobalValue::ExternalLinkage,
+        "unused_function", Module);
+    UnusedFunction->setVisibility(llvm::GlobalValue::HiddenVisibility);
+    UnusedFunction->setSection(Triple.isOSBinFormatMachO()
+                                   ? "__TEXT,__unused_text"
+                               : Triple.isOSBinFormatCOFF() ? ".text$unused"
+                                                            : ".text.unused");
+    UnusedFunction->addFnAttr(llvm::Attribute::NoInline);
+    UnusedFunction->addFnAttr(llvm::Attribute::NoUnwind);
+    llvm::IRBuilder<> UnusedBuilder(
+        llvm::BasicBlock::Create(Context, "entry", UnusedFunction));
+    UnusedBuilder.CreateRet(llvm::ConstantInt::get(I32, UINT32_C(0x5A17)));
   }
   F0->setVisibility(Hidden ? llvm::GlobalValue::HiddenVisibility
                            : llvm::GlobalValue::DefaultVisibility);
@@ -488,6 +512,19 @@ std::vector<WasmEdge::Byte> makeX86_64CrelObject() {
 std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
   return makeObject(llvm::Triple(llvm::sys::getDefaultTargetTriple()),
                     Undefined);
+}
+
+std::vector<WasmEdge::Byte> makeUnusedNativeObject() {
+  return makeObject(llvm::Triple(llvm::sys::getDefaultTargetTriple()), false,
+                    false, "f0", {}, false, false, "generic", {}, false, false,
+                    false, false, false, false, {}, true, false, false, false,
+                    true);
+}
+
+std::vector<WasmEdge::Byte> makeSemanticObject(const llvm::Triple &Triple,
+                                               bool Undefined = false) {
+  return makeObject(Triple, Undefined, false, "f0", {}, false, false, "generic",
+                    {}, false, false, false, false, false, false, {}, true);
 }
 
 std::vector<WasmEdge::Byte> makeAssemblyObject(const llvm::Triple &Triple,
@@ -1121,6 +1158,111 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsBadObjectsAtomically) {
               (std::vector<WasmEdge::Byte>(Existing.begin(), Existing.end())));
     expectNoTemporaryFiles();
   }
+}
+
+TEST_F(LinkerOutputTest, NativeLinkerRejectsUnsupportedInputsAtomically) {
+  const auto Output = Directory / "existing.wasm";
+  const std::array<WasmEdge::Byte, 3> Sentinel{1, 2, 3};
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                    0x01, 0x00, 0x00, 0x00};
+  const auto Native =
+      makeSemanticObject(llvm::Triple(llvm::sys::getDefaultTargetTriple()));
+  auto Concatenated = Native;
+  Concatenated.insert(Concatenated.end(), Native.begin(), Native.end());
+  const std::string ArchiveMagic = "!<arch>\n";
+  std::vector<std::vector<WasmEdge::Byte>> Invalid{
+      Concatenated,
+      std::vector<WasmEdge::Byte>(ArchiveMagic.begin(), ArchiveMagic.end()),
+      makeSemanticObject(llvm::Triple(llvm::sys::getDefaultTargetTriple()),
+                         true),
+  };
+#if WASMEDGE_OS_LINUX && (defined(__x86_64__) || defined(_M_X64))
+  Invalid.emplace_back(makeSemanticObject(llvm::Triple("x86_64-apple-macosx")));
+  Invalid.emplace_back(
+      makeSemanticObject(llvm::Triple("x86_64-pc-windows-msvc")));
+  Invalid.emplace_back(
+      makeSemanticObject(llvm::Triple("aarch64-unknown-linux-gnu")));
+#endif
+  for (const auto &Object : Invalid) {
+    {
+      std::ofstream File(Output, std::ios_base::binary | std::ios_base::trunc);
+      File.write(reinterpret_cast<const char *>(Sentinel.data()),
+                 Sentinel.size());
+      ASSERT_TRUE(File);
+    }
+    EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output,
+                                    OutputKind::UniversalWasm));
+    EXPECT_EQ(readFile(Output),
+              (std::vector<WasmEdge::Byte>(Sentinel.begin(), Sentinel.end())));
+    expectNoTemporaryFiles();
+  }
+}
+
+TEST_F(LinkerOutputTest, RetainsUnusedAllocatableSections) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Object = makeUnusedNativeObject();
+  auto Graph =
+      ObjectReader::read(Object, nativeTarget(), ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  std::vector<WasmEdge::Byte> UnusedText;
+  std::vector<WasmEdge::Byte> UnusedData;
+  for (const auto &Section : Graph->sections()) {
+    if (Section.Name.find("text.unused") != std::string::npos) {
+      EXPECT_EQ(Section.Kind, SectionKind::Text);
+      UnusedText = Section.Content;
+    }
+    if (Section.Name.find("data.unused") != std::string::npos) {
+      EXPECT_EQ(Section.Kind, SectionKind::Data);
+      UnusedData = Section.Content;
+    }
+  }
+  ASSERT_FALSE(UnusedText.empty());
+  ASSERT_EQ(UnusedData, (std::vector<WasmEdge::Byte>{0x67, 0x63, 0x6F, 0x6E}));
+  auto Contains = [](const auto &Bytes, const auto &Marker) {
+    return std::search(Bytes.begin(), Bytes.end(), Marker.begin(),
+                       Marker.end()) != Bytes.end();
+  };
+
+  const auto Universal = Directory / "retained.wasm";
+  ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Universal,
+                                 OutputKind::UniversalWasm));
+  const auto Metadata = parseAOTMetadata(Universal);
+  bool UniversalText = false;
+  bool UniversalData = false;
+  for (const auto &Section : Metadata.Sections) {
+    const auto &Content = std::get<3>(Section);
+    UniversalText |= Contains(Content, UnusedText);
+    UniversalData |= Contains(Content, UnusedData);
+  }
+  EXPECT_TRUE(UniversalText);
+  EXPECT_TRUE(UniversalData);
+
+#if WASMEDGE_OS_LINUX
+  const auto Native = Directory / "retained.so";
+  ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Native, OutputKind::ELF));
+  auto Image = llvm::object::ObjectFile::createObjectFile(Native.string());
+  ASSERT_TRUE(static_cast<bool>(Image));
+  bool NativeText = false;
+  bool NativeData = false;
+  for (const auto &Section : Image->getBinary()->sections()) {
+    auto Content = Section.getContents();
+    ASSERT_TRUE(static_cast<bool>(Content));
+    const std::vector<WasmEdge::Byte> Bytes(Content->bytes_begin(),
+                                            Content->bytes_end());
+    const llvm::object::ELFSectionRef ELFSection(Section);
+    NativeText |= Contains(Bytes, UnusedText) &&
+                  (ELFSection.getFlags() & llvm::ELF::SHF_ALLOC) != 0 &&
+                  (ELFSection.getFlags() & llvm::ELF::SHF_EXECINSTR) != 0;
+    NativeData |= Contains(Bytes, UnusedData) &&
+                  (ELFSection.getFlags() & llvm::ELF::SHF_ALLOC) != 0 &&
+                  (ELFSection.getFlags() & llvm::ELF::SHF_WRITE) != 0;
+  }
+  EXPECT_TRUE(NativeText);
+  EXPECT_TRUE(NativeData);
+#endif
 }
 
 TEST_F(LinkerOutputTest, NativeLinkerRejectsMalformedWasmAtomically) {
