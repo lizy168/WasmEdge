@@ -22,12 +22,12 @@
 
 #include "gtest/gtest.h"
 
-#include <llvm/ADT/SmallString.h>
-#include <llvm/Support/FileSystem.h>
-
+#include <atomic>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -170,6 +170,36 @@ std::array<uint64_t, 4> Answers{
 
 using namespace std::literals;
 
+class TempDirectory {
+public:
+  TempDirectory() {
+    static std::atomic<uint64_t> Sequence{0};
+    std::random_device Random;
+    const auto Parent = std::filesystem::temp_directory_path();
+    while (true) {
+      Path =
+          Parent / ("wasmedge-concurrent-compiler-" + std::to_string(Random()) +
+                    "-" + std::to_string(Sequence.fetch_add(1)));
+      std::error_code Error;
+      if (std::filesystem::create_directory(Path, Error))
+        return;
+      if (Error)
+        throw std::filesystem::filesystem_error("create temp directory", Path,
+                                                Error);
+    }
+  }
+
+  ~TempDirectory() {
+    std::error_code Error;
+    std::filesystem::remove_all(Path, Error);
+  }
+
+  const std::filesystem::path &path() const noexcept { return Path; }
+
+private:
+  std::filesystem::path Path;
+};
+
 TEST(AsyncExecute, ThreadTest) {
   WasmEdge::Configure Conf;
   WasmEdge::VM::VM VM(Conf);
@@ -248,17 +278,7 @@ TEST(AOTCompile, IndependentCompilersRunConcurrently) {
   }};
   constexpr std::array<uint32_t, 2> Answers{11, 29};
   constexpr size_t Iterations = 8;
-  llvm::SmallString<128> UniqueRoot;
-  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory(
-      "wasmedge-concurrent-compiler", UniqueRoot));
-  const auto Root = std::filesystem::u8path(UniqueRoot.str().str());
-  struct Cleanup {
-    std::filesystem::path Root;
-    ~Cleanup() {
-      std::error_code Error;
-      std::filesystem::remove_all(Root, Error);
-    }
-  } CleanupGuard{Root};
+  TempDirectory Root;
   std::promise<void> Start;
   const auto Ready = Start.get_future().share();
   std::array<std::future<bool>, 2> Results;
@@ -277,8 +297,8 @@ TEST(AOTCompile, IndependentCompilersRunConcurrently) {
         WasmEdge::LLVM::Compiler Compiler(Conf);
         WasmEdge::LLVM::CodeGen CodeGen(Conf);
         const auto Path =
-            Root / ("output-" + std::to_string(Thread) + "-" +
-                    std::to_string(Iteration) + WASMEDGE_LIB_EXTENSION);
+            Root.path() / ("output-" + std::to_string(Thread) + "-" +
+                           std::to_string(Iteration) + WASMEDGE_LIB_EXTENSION);
         auto Module = Loader.parseModule(Modules[Thread]);
         if (!Module || !Validator.validate(**Module))
           return false;
