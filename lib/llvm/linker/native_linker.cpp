@@ -203,10 +203,14 @@ Internal::publishMachO(const std::filesystem::path &Temporary,
                        const std::filesystem::path &Output,
                        const std::filesystem::path &SignExecutable,
                        const std::filesystem::path &VerifyExecutable) noexcept {
-  return publishAtomically(
-      Temporary, Output, [&](const std::filesystem::path &Path) {
-        return signMachO(Path, SignExecutable, VerifyExecutable);
-      });
+  try {
+    return publishAtomically(
+        Temporary, Output, [&](const std::filesystem::path &Path) {
+          return signMachO(Path, SignExecutable, VerifyExecutable);
+        });
+  } catch (...) {
+    return linkError();
+  }
 }
 
 Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,

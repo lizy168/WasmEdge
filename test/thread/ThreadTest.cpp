@@ -22,6 +22,9 @@
 
 #include "gtest/gtest.h"
 
+#include <llvm/ADT/SmallString.h>
+#include <llvm/Support/FileSystem.h>
+
 #include <fstream>
 #include <future>
 #include <memory>
@@ -245,6 +248,17 @@ TEST(AOTCompile, IndependentCompilersRunConcurrently) {
   }};
   constexpr std::array<uint32_t, 2> Answers{11, 29};
   constexpr size_t Iterations = 8;
+  llvm::SmallString<128> UniqueRoot;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory(
+      "wasmedge-concurrent-compiler", UniqueRoot));
+  const auto Root = std::filesystem::u8path(UniqueRoot.str().str());
+  struct Cleanup {
+    std::filesystem::path Root;
+    ~Cleanup() {
+      std::error_code Error;
+      std::filesystem::remove_all(Root, Error);
+    }
+  } CleanupGuard{Root};
   std::promise<void> Start;
   const auto Ready = Start.get_future().share();
   std::array<std::future<bool>, 2> Results;
@@ -263,9 +277,8 @@ TEST(AOTCompile, IndependentCompilersRunConcurrently) {
         WasmEdge::LLVM::Compiler Compiler(Conf);
         WasmEdge::LLVM::CodeGen CodeGen(Conf);
         const auto Path =
-            std::filesystem::temp_directory_path() /
-            ("ConcurrentCompiler-" + std::to_string(Thread) + "-" +
-             std::to_string(Iteration) + WASMEDGE_LIB_EXTENSION);
+            Root / ("output-" + std::to_string(Thread) + "-" +
+                    std::to_string(Iteration) + WASMEDGE_LIB_EXTENSION);
         auto Module = Loader.parseModule(Modules[Thread]);
         if (!Module || !Validator.validate(**Module))
           return false;
