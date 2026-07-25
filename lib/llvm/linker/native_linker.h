@@ -16,8 +16,14 @@ namespace Linker {
 
 namespace Internal {
 Expect<void> signMachO(const std::filesystem::path &Path,
-                       const std::filesystem::path &Executable) noexcept;
-}
+                       const std::filesystem::path &SignExecutable,
+                       const std::filesystem::path &VerifyExecutable) noexcept;
+Expect<void>
+publishMachO(const std::filesystem::path &Temporary,
+             const std::filesystem::path &Output,
+             const std::filesystem::path &SignExecutable,
+             const std::filesystem::path &VerifyExecutable) noexcept;
+} // namespace Internal
 
 enum class OutputKind : uint8_t { UniversalWasm, ELF, MachO, PE };
 

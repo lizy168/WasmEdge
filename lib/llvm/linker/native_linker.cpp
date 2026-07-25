@@ -118,24 +118,30 @@ private:
 
 Expect<void>
 Internal::signMachO(const std::filesystem::path &Path,
-                    const std::filesystem::path &Executable) noexcept {
+                    const std::filesystem::path &SignExecutable,
+                    const std::filesystem::path &VerifyExecutable) noexcept {
 #if WASMEDGE_OS_WINDOWS
   static_cast<void>(Path);
-  static_cast<void>(Executable);
+  static_cast<void>(SignExecutable);
+  static_cast<void>(VerifyExecutable);
   return linkError();
 #else
   try {
-    const auto Program = Executable.string();
+    const auto SignProgram = SignExecutable.string();
+    const auto VerifyProgram = VerifyExecutable.string();
     const auto File = Path.string();
     const std::array<std::array<const char *, 6>, 2> Arguments{{
-        {Program.c_str(), "--force", "--sign", "-", File.c_str(), nullptr},
-        {Program.c_str(), "--verify", "--strict", "--verbose=2", File.c_str(),
-         nullptr},
+        {SignProgram.c_str(), "--force", "--sign", "-", File.c_str(), nullptr},
+        {VerifyProgram.c_str(), "--verify", "--strict", "--verbose=2",
+         File.c_str(), nullptr},
     }};
-    for (const auto &Values : Arguments) {
+    const std::array<const std::string *, 2> Programs{&SignProgram,
+                                                      &VerifyProgram};
+    for (size_t I = 0; I < Arguments.size(); ++I) {
+      const auto &Values = Arguments[I];
       pid_t Child = -1;
       const int SpawnResult =
-          ::posix_spawn(&Child, Program.c_str(), nullptr, nullptr,
+          ::posix_spawn(&Child, Programs[I]->c_str(), nullptr, nullptr,
                         const_cast<char *const *>(Values.data()), environ);
       if (SpawnResult != 0)
         return linkError();
@@ -152,6 +158,34 @@ Internal::signMachO(const std::filesystem::path &Path,
     return linkError();
   }
 #endif
+}
+
+Expect<void>
+Internal::publishMachO(const std::filesystem::path &Temporary,
+                       const std::filesystem::path &Output,
+                       const std::filesystem::path &SignExecutable,
+                       const std::filesystem::path &VerifyExecutable) noexcept {
+  try {
+    struct Guard {
+      const std::filesystem::path &Path;
+      bool Published = false;
+      ~Guard() {
+        if (!Published) {
+          std::error_code Error;
+          std::filesystem::remove(Path, Error);
+        }
+      }
+    } Cleanup{Temporary};
+    EXPECTED_TRY(signMachO(Temporary, SignExecutable, VerifyExecutable));
+    std::error_code Error;
+    std::filesystem::rename(Temporary, Output, Error);
+    if (Error)
+      return linkError();
+    Cleanup.Published = true;
+    return {};
+  } catch (...) {
+    return linkError();
+  }
 }
 
 Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
@@ -228,8 +262,12 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
       }
     }
 #if WASMEDGE_OS_MACOS
-    if (Kind == OutputKind::MachO)
-      EXPECTED_TRY(Internal::signMachO(Guard.path(), "/usr/bin/codesign"));
+    if (Kind == OutputKind::MachO) {
+      EXPECTED_TRY(Internal::publishMachO(
+          Guard.path(), Output, "/usr/bin/codesign", "/usr/bin/codesign"));
+      Guard.publish();
+      return {};
+    }
 #endif
 #if WASMEDGE_OS_WINDOWS
     if (!winapi::MoveFileExW(Guard.path().c_str(), Output.c_str(),

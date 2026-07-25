@@ -22,6 +22,10 @@
 #include <set>
 #include <string>
 #include <vector>
+#if !WASMEDGE_OS_WINDOWS
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -131,6 +135,52 @@ uint64_t readInteger(const std::vector<WasmEdge::Byte> &Bytes, size_t Offset,
     Result |= static_cast<uint64_t>(Bytes[Offset + I]) << (Shift * 8);
   }
   return Result;
+}
+
+uint64_t readULEB(const std::vector<WasmEdge::Byte> &Bytes, size_t &Offset,
+                  size_t End) {
+  uint64_t Result = 0;
+  for (uint8_t Shift = 0; Shift < 64 && Offset < End; Shift += 7) {
+    const uint8_t Value = Bytes[Offset++];
+    Result |= static_cast<uint64_t>(Value & 0x7F) << Shift;
+    if ((Value & 0x80) == 0)
+      return Result;
+  }
+  ADD_FAILURE() << "malformed ULEB";
+  return 0;
+}
+
+void readExportNode(const std::vector<WasmEdge::Byte> &Bytes, size_t Base,
+                    size_t Start, size_t End, const std::string &Prefix,
+                    std::map<std::string, uint64_t> &Exports,
+                    std::set<size_t> &Visited) {
+  ASSERT_LT(Start, End);
+  ASSERT_TRUE(Visited.insert(Start).second);
+  size_t Offset = Start;
+  const uint64_t TerminalSize = readULEB(Bytes, Offset, End);
+  ASSERT_LE(TerminalSize, End - Offset);
+  const size_t TerminalEnd = Offset + TerminalSize;
+  if (TerminalSize != 0) {
+    const uint64_t Flags = readULEB(Bytes, Offset, TerminalEnd);
+    EXPECT_EQ(Flags, llvm::MachO::EXPORT_SYMBOL_FLAGS_KIND_REGULAR);
+    const uint64_t Address = readULEB(Bytes, Offset, TerminalEnd);
+    EXPECT_EQ(Offset, TerminalEnd);
+    Exports.emplace(Prefix, Address);
+  }
+  Offset = TerminalEnd;
+  ASSERT_LT(Offset, End);
+  const uint8_t ChildCount = Bytes[Offset++];
+  for (uint8_t I = 0; I < ChildCount; ++I) {
+    std::string Suffix;
+    while (Offset < End && Bytes[Offset] != 0)
+      Suffix.push_back(static_cast<char>(Bytes[Offset++]));
+    ASSERT_LT(Offset, End);
+    ++Offset;
+    const uint64_t Child = readULEB(Bytes, Offset, End);
+    ASSERT_LT(Child, End - Base);
+    readExportNode(Bytes, Base, Base + Child, End, Prefix + Suffix, Exports,
+                   Visited);
+  }
 }
 
 const llvm::object::SectionRef *
@@ -1001,6 +1051,7 @@ TEST(MachOWriterTest, WritesDeterministicDylibsForMacOSTargets) {
 
     size_t Command = 32;
     uint64_t FirstSectionOffset = UINT64_MAX;
+    size_t DyldInfo = 0;
     std::set<uint32_t> Commands;
     std::set<std::string> SegmentNames;
     for (uint32_t I = 0; I < readInteger(Bytes, 16, 4, Endianness::Little);
@@ -1012,6 +1063,8 @@ TEST(MachOWriterTest, WritesDeterministicDylibsForMacOSTargets) {
       ASSERT_GE(Size, 8U);
       ASSERT_LE(Command + Size, Bytes.size());
       Commands.insert(Type);
+      if (Type == llvm::MachO::LC_DYLD_INFO_ONLY)
+        DyldInfo = Command;
       if (Type == llvm::MachO::LC_SEGMENT_64) {
         const char *Name =
             reinterpret_cast<const char *>(Bytes.data() + Command + 8);
@@ -1045,6 +1098,67 @@ TEST(MachOWriterTest, WritesDeterministicDylibsForMacOSTargets) {
           llvm::MachO::LC_BUILD_VERSION})
       EXPECT_TRUE(Commands.count(Required)) << Required;
     EXPECT_FALSE(Commands.count(llvm::MachO::LC_UUID));
+    ASSERT_NE(DyldInfo, 0U);
+    EXPECT_EQ(readInteger(Bytes, DyldInfo + 16, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, DyldInfo + 20, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, DyldInfo + 24, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, DyldInfo + 28, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, DyldInfo + 32, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, DyldInfo + 36, 4, Endianness::Little), 0U);
+
+    const size_t ExportOffset = static_cast<size_t>(
+        readInteger(Bytes, DyldInfo + 40, 4, Endianness::Little));
+    const size_t ExportEnd =
+        ExportOffset + static_cast<size_t>(readInteger(Bytes, DyldInfo + 44, 4,
+                                                       Endianness::Little));
+    std::map<std::string, uint64_t> TrieExports;
+    std::set<size_t> Visited;
+    readExportNode(Bytes, ExportOffset, ExportOffset, ExportEnd, "",
+                   TrieExports, Visited);
+    EXPECT_EQ(TrieExports, (std::map<std::string, uint64_t>{
+                               {"_f0", Graph.sections()[0].Address},
+                               {"_value", Graph.sections()[3].Address}}));
+
+    const size_t RebaseOffset = static_cast<size_t>(
+        readInteger(Bytes, DyldInfo + 8, 4, Endianness::Little));
+    const size_t RebaseEnd =
+        RebaseOffset + static_cast<size_t>(readInteger(Bytes, DyldInfo + 12, 4,
+                                                       Endianness::Little));
+    size_t RebaseCursor = RebaseOffset;
+    ASSERT_LT(RebaseCursor, RebaseEnd);
+    EXPECT_EQ(Bytes[RebaseCursor++], llvm::MachO::REBASE_OPCODE_SET_TYPE_IMM |
+                                         llvm::MachO::REBASE_TYPE_POINTER);
+    std::set<uint64_t> RebasedAddresses;
+    while (RebaseCursor < RebaseEnd &&
+           Bytes[RebaseCursor] != llvm::MachO::REBASE_OPCODE_DONE) {
+      const uint8_t SegmentOpcode = Bytes[RebaseCursor++];
+      EXPECT_EQ(SegmentOpcode & llvm::MachO::REBASE_OPCODE_MASK,
+                llvm::MachO::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB);
+      const uint8_t SegmentIndex =
+          SegmentOpcode & llvm::MachO::REBASE_IMMEDIATE_MASK;
+      ASSERT_LT(SegmentIndex, 4U);
+      const uint64_t SegmentOffset = readULEB(Bytes, RebaseCursor, RebaseEnd);
+      ASSERT_LT(RebaseCursor, RebaseEnd);
+      EXPECT_EQ(Bytes[RebaseCursor++],
+                llvm::MachO::REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1);
+      const uint64_t SegmentAddress =
+          SegmentIndex == 1 ? Graph.sections()[1].Address & ~UINT64_C(0xFFF)
+                            : Graph.sections()[3].Address;
+      RebasedAddresses.insert(SegmentAddress + SegmentOffset);
+    }
+    ASSERT_LT(RebaseCursor, RebaseEnd);
+    EXPECT_EQ(Bytes[RebaseCursor++], llvm::MachO::REBASE_OPCODE_DONE);
+    EXPECT_EQ(RebaseCursor, RebaseEnd);
+    std::set<uint64_t> ExpectedRebases;
+    for (const auto &Rebase : Graph.rebases()) {
+      EXPECT_EQ(Rebase.Width, 8U);
+      EXPECT_EQ(Rebase.Format, ObjectFormat::MachO);
+      EXPECT_TRUE(Graph.sections()[Rebase.Section].Kind == SectionKind::Data ||
+                  Graph.sections()[Rebase.Section].Kind == SectionKind::BSS);
+      ExpectedRebases.insert(Graph.sections()[Rebase.Section].Address +
+                             Rebase.Offset);
+    }
+    EXPECT_EQ(RebasedAddresses, ExpectedRebases);
 
     std::set<std::string> Names;
     for (const auto &Symbol : (*Object)->symbols()) {
@@ -1160,9 +1274,82 @@ TEST(MachOWriterTest, AppliesMachOAbsolutePointersAsRebases) {
 }
 
 #if !WASMEDGE_OS_WINDOWS
-TEST(MachOWriterTest, PropagatesSignerStatus) {
-  EXPECT_TRUE(Internal::signMachO("unused", "/bin/true"));
-  EXPECT_FALSE(Internal::signMachO("unused", "/bin/false"));
+TEST(MachOWriterTest, PublishesOnlyAfterSigningAndVerification) {
+  const auto Root = std::filesystem::temp_directory_path() /
+                    ("wasmedge-macho-sign-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(Root);
+  const auto Helper = Root / "sign helper";
+  const auto Log = Root / "order.log";
+  {
+    std::ofstream Script(Helper);
+    Script << "#!/bin/sh\n"
+              "printf '%s\\n' \"$1\" >> \"$WASMEDGE_SIGN_LOG\"\n"
+              "case \"$WASMEDGE_SIGN_MODE:$1\" in\n"
+              "signal:--force) kill -TERM $$ ;;\n"
+              "sign-fail:--force) exit 7 ;;\n"
+              "verify-fail:--verify) exit 8 ;;\n"
+              "esac\n"
+              "exit 0\n";
+  }
+  ASSERT_EQ(::chmod(Helper.c_str(), 0700), 0);
+  ASSERT_EQ(::setenv("WASMEDGE_SIGN_LOG", Log.c_str(), 1), 0);
+
+  const auto Destination = Root / "library.dylib";
+  const std::vector<WasmEdge::Byte> Existing{1, 2, 3};
+  const std::vector<WasmEdge::Byte> Replacement{4, 5, 6};
+  auto Write = [](const std::filesystem::path &Path,
+                  const std::vector<WasmEdge::Byte> &Bytes) {
+    std::ofstream File(Path, std::ios_base::binary);
+    File.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+  };
+  auto Read = [](const std::filesystem::path &Path) {
+    std::ifstream File(Path, std::ios_base::binary);
+    return std::vector<WasmEdge::Byte>(std::istreambuf_iterator<char>(File),
+                                       std::istreambuf_iterator<char>());
+  };
+  Write(Destination, Existing);
+
+  struct Case {
+    const char *Mode;
+    std::filesystem::path Sign;
+    std::filesystem::path Verify;
+    const char *LogValue;
+  };
+  const std::array<Case, 5> Failures{{
+      {"success", Root / "missing", Helper, ""},
+      {"signal", Helper, Helper, "--force\n"},
+      {"sign-fail", Helper, Helper, "--force\n"},
+      {"success", "/bin/false", Helper, ""},
+      {"verify-fail", Helper, Helper, "--force\n--verify\n"},
+  }};
+  for (size_t I = 0; I < Failures.size(); ++I) {
+    const auto Temporary = Root / ("temporary-" + std::to_string(I));
+    Write(Temporary, Replacement);
+    std::filesystem::remove(Log);
+    ASSERT_EQ(::setenv("WASMEDGE_SIGN_MODE", Failures[I].Mode, 1), 0);
+    EXPECT_FALSE(Internal::publishMachO(Temporary, Destination,
+                                        Failures[I].Sign, Failures[I].Verify));
+    EXPECT_EQ(Read(Destination), Existing);
+    EXPECT_FALSE(std::filesystem::exists(Temporary));
+    std::string LogValue;
+    if (std::filesystem::exists(Log)) {
+      const auto LogBytes = Read(Log);
+      LogValue.assign(LogBytes.begin(), LogBytes.end());
+    }
+    EXPECT_EQ(LogValue, Failures[I].LogValue);
+  }
+
+  const auto Temporary = Root / "temporary-success";
+  Write(Temporary, Replacement);
+  std::filesystem::remove(Log);
+  ASSERT_EQ(::setenv("WASMEDGE_SIGN_MODE", "success", 1), 0);
+  EXPECT_TRUE(Internal::publishMachO(Temporary, Destination, Helper, Helper));
+  EXPECT_EQ(Read(Destination), Replacement);
+  EXPECT_FALSE(std::filesystem::exists(Temporary));
+  const auto LogBytes = Read(Log);
+  EXPECT_EQ(std::string(LogBytes.begin(), LogBytes.end()),
+            "--force\n--verify\n");
+  std::filesystem::remove_all(Root);
 }
 #endif
 

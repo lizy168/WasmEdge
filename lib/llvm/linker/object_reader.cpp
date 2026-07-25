@@ -495,6 +495,16 @@ struct RelocationMetadata {
   bool Scattered = false;
 };
 
+} // namespace
+
+bool Internal::supportsMachORelocationMetadata(Target TargetValue,
+                                               bool Scattered) noexcept {
+  return !Scattered ||
+         (TargetValue != Target::X86_64 && TargetValue != Target::AArch64);
+}
+
+namespace {
+
 std::optional<RelocationMetadata>
 relocationMetadata(const llvm::object::ObjectFile &Object,
                    const llvm::object::RelocationRef &Relocation,
@@ -516,7 +526,8 @@ relocationMetadata(const llvm::object::ObjectFile &Object,
     Metadata.PatchSize = static_cast<uint8_t>(BytePatch << Length);
     Metadata.External =
         !Metadata.Scattered && MachO->getPlainRelocationExternal(Raw);
-    if (TargetValue == Target::X86_64 && Metadata.Scattered) {
+    if (!Internal::supportsMachORelocationMetadata(TargetValue,
+                                                   Metadata.Scattered)) {
       return std::nullopt;
     }
     if (TargetValue == Target::X86_64 &&
@@ -828,6 +839,11 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       return fail<LinkGraph>("personality relocation in .xdata is unsupported");
     }
     for (const auto &InputRelocation : InputSection.relocations()) {
+      const auto Metadata =
+          relocationMetadata(Object, InputRelocation, *ActualTarget);
+      if (!Metadata) {
+        return fail<LinkGraph>("malformed relocation metadata");
+      }
       const auto InputSymbol = InputRelocation.getSymbol();
       if (InputSymbol == Object.symbol_end()) {
         return fail<LinkGraph>("relocation has no target symbol");
@@ -851,11 +867,6 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
         }
       }
       const auto [Addend, Implicit] = relocationAddend(Object, InputRelocation);
-      const auto Metadata =
-          relocationMetadata(Object, InputRelocation, *ActualTarget);
-      if (!Metadata) {
-        return fail<LinkGraph>("malformed relocation metadata");
-      }
       const auto PatchSize =
           relocationPatchSize(objectFormat(Object), *ActualTarget,
                               static_cast<uint32_t>(InputRelocation.getType()),

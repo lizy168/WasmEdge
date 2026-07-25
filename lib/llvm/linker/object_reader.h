@@ -27,6 +27,8 @@ namespace Internal {
 uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept;
 std::optional<std::map<std::string, std::string>>
 parseCOFFExports(std::string_view Directives);
+bool supportsMachORelocationMetadata(Target TargetValue,
+                                     bool Scattered) noexcept;
 
 } // namespace Internal
 

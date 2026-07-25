@@ -1341,6 +1341,70 @@ TEST_F(LinkerOutputTest, NativeAOTWriterLoadsAndExecutesWithoutImports) {
 }
 #endif
 
+#if WASMEDGE_OS_MACOS
+TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Output = Directory / "native.dylib";
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Output, OutputKind::MachO));
+
+  auto Image = llvm::object::ObjectFile::createObjectFile(Output.string());
+  ASSERT_TRUE(static_cast<bool>(Image));
+  const auto *MachO =
+      llvm::dyn_cast<llvm::object::MachOObjectFile>(Image->getBinary());
+  ASSERT_NE(MachO, nullptr);
+  std::set<std::string> Symbols;
+  std::set<std::string> Sections;
+  for (const auto &Section : MachO->sections()) {
+    auto Name = Section.getName();
+    ASSERT_TRUE(Name);
+    Sections.emplace(Name->str());
+  }
+  EXPECT_TRUE(Sections.count("__eh_frame"));
+  EXPECT_FALSE(Sections.count("__compact_unwind"));
+  for (const auto &Symbol : MachO->symbols()) {
+    auto Name = Symbol.getName();
+    auto Flags = Symbol.getFlags();
+    ASSERT_TRUE(Name && Flags);
+    EXPECT_EQ(*Flags & llvm::object::SymbolRef::SF_Undefined, 0U);
+    Symbols.emplace(Name->str());
+  }
+  for (const char *Name : {"_f0", "_version", "_intrinsics"})
+    EXPECT_TRUE(Symbols.count(Name)) << Name;
+  const auto Bytes = readFile(Output);
+  size_t Command = sizeof(llvm::MachO::mach_header_64);
+  bool HasDyldInfo = false;
+  auto Read32 = [&](size_t Offset) {
+    uint32_t Value = 0;
+    std::memcpy(&Value, Bytes.data() + Offset, sizeof(Value));
+    return Value;
+  };
+  for (uint32_t I = 0; I < Read32(16); ++I) {
+    const uint32_t Type = Read32(Command);
+    const uint32_t Size = Read32(Command + 4);
+    ASSERT_GE(Size, 8U);
+    if (Type == llvm::MachO::LC_DYLD_INFO_ONLY) {
+      HasDyldInfo = true;
+      for (const size_t Offset : {size_t{16}, size_t{20}, size_t{24},
+                                  size_t{28}, size_t{32}, size_t{36}})
+        EXPECT_EQ(Read32(Command + Offset), 0U);
+    }
+    Command += Size;
+  }
+  EXPECT_TRUE(HasDyldInfo);
+
+  auto Library = std::make_shared<WasmEdge::Loader::SharedLibrary>();
+  ASSERT_TRUE(Library->load(Output));
+  EXPECT_TRUE(Library->get<uint32_t>("version"));
+  EXPECT_TRUE(Library->get<const WasmEdge::Executable::IntrinsicsTable *>(
+      "intrinsics"));
+  EXPECT_EQ(execute(Output), 7U);
+}
+#endif
+
 TEST_F(LinkerOutputTest, NativeLinkerCreatesNoNativeTemporary) {
   constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
       0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
@@ -4412,6 +4476,36 @@ TEST(ObjectReaderTest, RejectsMalformedX86_64MachOSignedMetadata) {
   std::memcpy(Scattered.data() + RelocationOffset, &AddressWord,
               sizeof(AddressWord));
   EXPECT_FALSE(ObjectReader::read(Scattered, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsScatteredAArch64MachORelocation) {
+  EXPECT_FALSE(
+      Internal::supportsMachORelocationMetadata(Target::AArch64, true));
+  auto Bytes = makeObject(llvm::Triple("arm64-apple-macosx"));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "arm64.o"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+  ASSERT_NE(MachO, nullptr);
+  size_t RelocationOffset = 0;
+  for (const auto &Section : MachO->sections()) {
+    if (Section.relocation_begin() == Section.relocation_end())
+      continue;
+    const auto Ref = Section.relocation_begin()->getRawDataRefImpl();
+    llvm::object::DataRefImpl SectionRef;
+    SectionRef.d.a = Ref.d.a;
+    RelocationOffset = MachO->getSection64(SectionRef).reloff + Ref.d.b * 8;
+    break;
+  }
+  ASSERT_NE(RelocationOffset, 0U);
+  uint32_t Address = 0;
+  std::memcpy(&Address, Bytes.data() + RelocationOffset, sizeof(Address));
+  Address |= UINT32_C(1) << 31;
+  std::memcpy(Bytes.data() + RelocationOffset, &Address, sizeof(Address));
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::AArch64));
 }
 
 TEST(ObjectReaderTest, DoesNotExportHiddenMachOSymbols) {
