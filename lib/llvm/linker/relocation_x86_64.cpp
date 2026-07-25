@@ -22,6 +22,8 @@ namespace {
 
 using namespace std::literals;
 
+constexpr uint64_t PEImageBase = UINT64_C(0x180000000);
+
 enum class Opcode : uint8_t {
   Group5 = 0xFF,
   Load = 0x8B,
@@ -178,6 +180,10 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
         break;
       }
     } else if (RelocationValue.Format == ObjectFormat::COFF &&
+               RelocationValue.Type == llvm::COFF::IMAGE_REL_AMD64_ADDR64) {
+      Width = DoubleWordWidth;
+      Absolute = true;
+    } else if (RelocationValue.Format == ObjectFormat::COFF &&
                RelocationValue.Type >= llvm::COFF::IMAGE_REL_AMD64_REL32 &&
                RelocationValue.Type <= llvm::COFF::IMAGE_REL_AMD64_REL32_5) {
       Width = WordWidth;
@@ -227,7 +233,12 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
     if (Absolute || ImageRelative) {
       uint64_t Value = 0;
       if (!addUnsigned(S, Addend, Value) ||
-          !writeUnsigned(Bytes, RelocationValue.Offset, Width,
+          (ImageRelative && Value < PEImageBase)) {
+        return fail(RelocationValue, "absolute relocation overflows");
+      }
+      if (ImageRelative)
+        Value -= PEImageBase;
+      if (!writeUnsigned(Bytes, RelocationValue.Offset, Width,
                          Graph.endianness(), Value)) {
         return fail(RelocationValue, "absolute relocation overflows");
       }

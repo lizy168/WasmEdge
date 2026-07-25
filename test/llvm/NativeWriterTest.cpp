@@ -4,12 +4,15 @@
 #include "linker/elf_writer.h"
 #include "linker/macho_writer.h"
 #include "linker/native_linker.h"
+#include "linker/pe_writer.h"
 #include "linker/relocation.h"
 
 #include <gtest/gtest.h>
 
+#include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/ELF.h>
 #include <llvm/BinaryFormat/MachO.h>
+#include <llvm/Object/COFF.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/FileSystem.h>
@@ -31,6 +34,45 @@
 namespace {
 
 using namespace WasmEdge::LLVM::Linker;
+
+LinkGraph makePEGraph(Target Architecture) {
+  LinkGraph Graph(Architecture, Endianness::Little, ObjectFormat::COFF);
+  EXPECT_TRUE(Graph.beginInput("writer.obj"));
+  auto Text = Graph.addSection(
+      Section{".text$f", SectionKind::Text, 16, 4, 0, 0,
+              Architecture == Target::X86_64
+                  ? std::vector<WasmEdge::Byte>{0xC3, 0, 0, 0}
+                  : std::vector<WasmEdge::Byte>{0xC0, 0x03, 0x5F, 0xD6}});
+  auto RData = Graph.addSection(
+      Section{".rdata", SectionKind::ReadOnly, 8, 4, 0, 0, {1, 2, 3, 4}});
+  auto Data = Graph.addSection(Section{".data", SectionKind::Data, 8, 8, 0, 0,
+                                       std::vector<WasmEdge::Byte>(8)});
+  auto BSS = Graph.addSection(Section{".bss", SectionKind::BSS, 8, 16});
+  const size_t PDataSize = Architecture == Target::X86_64 ? 12 : 8;
+  auto PData = Graph.addSection(
+      Section{".pdata", SectionKind::Unwind, 4, PDataSize, 0, 0,
+              std::vector<WasmEdge::Byte>(PDataSize), SectionPurpose::PData});
+  auto XData = Graph.addSection(Section{".xdata",
+                                        SectionKind::Unwind,
+                                        4,
+                                        4,
+                                        0,
+                                        0,
+                                        {1, 0, 0, 0},
+                                        SectionPurpose::XData});
+  EXPECT_TRUE(Text && RData && Data && BSS && PData && XData);
+  EXPECT_TRUE(
+      Graph.addSymbol(Symbol{"z_impl", *Text, 0, 4, true, "alias", true}));
+  EXPECT_TRUE(
+      Graph.addSymbol(Symbol{"alpha", *Text, 0, 4, true, std::nullopt, true}));
+  EXPECT_TRUE(Graph.addRebase(
+      Rebase{*Data, 0,
+             Architecture == Target::X86_64
+                 ? static_cast<uint32_t>(llvm::COFF::IMAGE_REL_AMD64_ADDR64)
+                 : static_cast<uint32_t>(llvm::COFF::IMAGE_REL_ARM64_ADDR64),
+             0, 8, ObjectFormat::COFF}));
+  return Graph;
+}
 
 struct ELFCase {
   Target Architecture;
@@ -208,6 +250,194 @@ uint32_t elfHash(std::string_view Name) {
     Result &= ~High;
   }
   return Result;
+}
+
+TEST(PEWriterTest, WritesDeterministicPE32PlusDLLs) {
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
+    auto Graph = makePEGraph(Architecture);
+    ASSERT_TRUE(PEWriter::layout(Graph));
+    auto Data = Graph.sectionContent(2);
+    auto PData = Graph.sectionContent(4);
+    ASSERT_TRUE(Data && PData);
+    for (uint8_t I = 0; I < 8; ++I)
+      (*Data)[I] =
+          static_cast<WasmEdge::Byte>(Graph.sections()[0].Address >> (I * 8));
+    auto WritePData = [&](size_t Offset, uint64_t Value) {
+      for (uint8_t I = 0; I < 4; ++I)
+        (*PData)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+    };
+    WritePData(0, Graph.sections()[0].Address - ImageBase);
+    WritePData(4,
+               (Architecture == Target::X86_64 ? Graph.sections()[0].Address + 4
+                                               : Graph.sections()[5].Address) -
+                   ImageBase);
+    if (Architecture == Target::X86_64)
+      WritePData(8, Graph.sections()[5].Address - ImageBase);
+    ASSERT_TRUE(applyRelocations(Graph));
+
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    ASSERT_TRUE(PEWriter::write(Graph, "writer.dll", Output));
+    std::vector<WasmEdge::Byte> Again;
+    Writer Second(Again);
+    ASSERT_TRUE(PEWriter::write(Graph, "writer.dll", Second));
+    EXPECT_EQ(Bytes, Again);
+    ASSERT_GE(Bytes.size(), 512U);
+    EXPECT_EQ(Bytes[0], 'M');
+    EXPECT_EQ(Bytes[1], 'Z');
+    const uint32_t PEOffset =
+        static_cast<uint32_t>(readInteger(Bytes, 0x3C, 4, Endianness::Little));
+    EXPECT_GE(PEOffset, 0x40U);
+    EXPECT_EQ(readInteger(Bytes, PEOffset, 4, Endianness::Little),
+              UINT32_C(0x00004550));
+    const size_t COFF = PEOffset + 4;
+    EXPECT_EQ(readInteger(Bytes, COFF, 2, Endianness::Little),
+              Architecture == Target::X86_64
+                  ? llvm::COFF::IMAGE_FILE_MACHINE_AMD64
+                  : llvm::COFF::IMAGE_FILE_MACHINE_ARM64);
+    EXPECT_EQ(readInteger(Bytes, COFF + 16, 2, Endianness::Little), 240U);
+    const uint16_t Characteristics = static_cast<uint16_t>(
+        readInteger(Bytes, COFF + 18, 2, Endianness::Little));
+    EXPECT_EQ(Characteristics & (llvm::COFF::IMAGE_FILE_DLL |
+                                 llvm::COFF::IMAGE_FILE_EXECUTABLE_IMAGE |
+                                 llvm::COFF::IMAGE_FILE_LARGE_ADDRESS_AWARE),
+              llvm::COFF::IMAGE_FILE_DLL |
+                  llvm::COFF::IMAGE_FILE_EXECUTABLE_IMAGE |
+                  llvm::COFF::IMAGE_FILE_LARGE_ADDRESS_AWARE);
+    const size_t Optional = COFF + 20;
+    EXPECT_EQ(readInteger(Bytes, Optional, 2, Endianness::Little), 0x20BU);
+    EXPECT_NE(readInteger(Bytes, Optional + 4, 4, Endianness::Little), 0U);
+    EXPECT_NE(readInteger(Bytes, Optional + 8, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 12, 4, Endianness::Little), 16U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 16, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 20, 4, Endianness::Little),
+              Graph.sections()[0].Address - ImageBase);
+    EXPECT_EQ(readInteger(Bytes, Optional + 24, 8, Endianness::Little),
+              ImageBase);
+    EXPECT_EQ(readInteger(Bytes, Optional + 32, 4, Endianness::Little), 4096U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 36, 4, Endianness::Little), 512U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 64, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 56, 4, Endianness::Little) % 4096,
+              0U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 60, 4, Endianness::Little) % 512,
+              0U);
+    EXPECT_EQ(readInteger(Bytes, Optional + 68, 2, Endianness::Little),
+              llvm::COFF::IMAGE_SUBSYSTEM_WINDOWS_CUI);
+    const uint16_t DLLCharacteristics = static_cast<uint16_t>(
+        readInteger(Bytes, Optional + 70, 2, Endianness::Little));
+    EXPECT_EQ(DLLCharacteristics &
+                  (llvm::COFF::IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE |
+                   llvm::COFF::IMAGE_DLL_CHARACTERISTICS_NX_COMPAT |
+                   llvm::COFF::IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA),
+              llvm::COFF::IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE |
+                  llvm::COFF::IMAGE_DLL_CHARACTERISTICS_NX_COMPAT |
+                  llvm::COFF::IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA);
+    EXPECT_EQ(readInteger(Bytes, Optional + 108, 4, Endianness::Little), 16U);
+
+    auto Object =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                            Bytes.size()),
+            "writer.dll"));
+    ASSERT_TRUE(static_cast<bool>(Object))
+        << llvm::toString(Object.takeError());
+    const auto *PE = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Object);
+    ASSERT_NE(PE, nullptr);
+    std::map<std::string, uint32_t> Exports;
+    for (const auto &Export : PE->export_directories()) {
+      llvm::StringRef Name;
+      llvm::StringRef DLL;
+      uint32_t RVA = 0;
+      uint32_t Base = 0;
+      uint32_t Ordinal = 0;
+      bool Forwarder = true;
+      ASSERT_FALSE(Export.getSymbolName(Name));
+      ASSERT_FALSE(Export.getDllName(DLL));
+      ASSERT_FALSE(Export.getExportRVA(RVA));
+      ASSERT_FALSE(Export.getOrdinalBase(Base));
+      ASSERT_FALSE(Export.getOrdinal(Ordinal));
+      ASSERT_FALSE(Export.isForwarder(Forwarder));
+      EXPECT_EQ(DLL, "writer.dll");
+      EXPECT_EQ(Base, 1U);
+      EXPECT_FALSE(Forwarder);
+      Exports.emplace(Name.str(), RVA);
+    }
+    EXPECT_EQ(Exports,
+              (std::map<std::string, uint32_t>{
+                  {"alias", static_cast<uint32_t>(Graph.sections()[0].Address -
+                                                  ImageBase)},
+                  {"alpha", static_cast<uint32_t>(Graph.sections()[0].Address -
+                                                  ImageBase)}}));
+    std::map<std::string, uint32_t> Sections;
+    for (const auto &Section : PE->sections()) {
+      auto Name = Section.getName();
+      ASSERT_TRUE(static_cast<bool>(Name));
+      const auto *Header = PE->getCOFFSection(Section);
+      Sections.emplace(Name->str(), Header->Characteristics);
+      EXPECT_FALSE(
+          (Header->Characteristics & llvm::COFF::IMAGE_SCN_MEM_WRITE) != 0 &&
+          (Header->Characteristics & llvm::COFF::IMAGE_SCN_MEM_EXECUTE) != 0);
+    }
+    EXPECT_EQ(Sections[".text"], llvm::COFF::IMAGE_SCN_CNT_CODE |
+                                     llvm::COFF::IMAGE_SCN_MEM_EXECUTE |
+                                     llvm::COFF::IMAGE_SCN_MEM_READ);
+    EXPECT_NE(Sections[".data"] & llvm::COFF::IMAGE_SCN_MEM_WRITE, 0U);
+    EXPECT_NE(Sections[".bss"] & llvm::COFF::IMAGE_SCN_CNT_UNINITIALIZED_DATA,
+              0U);
+    for (const char *Name : {".rdata", ".pdata", ".xdata", ".edata", ".reloc"})
+      EXPECT_NE(Sections.count(Name), 0U) << Name;
+
+    const std::array<size_t, 8> EmptyDirectories{1, 6, 9, 10, 11, 12, 13, 14};
+    for (const size_t Index : EmptyDirectories) {
+      const size_t Directory = Optional + 112 + Index * 8;
+      EXPECT_EQ(readInteger(Bytes, Directory, 8, Endianness::Little), 0U)
+          << Index;
+    }
+    const size_t ExportDirectory = Optional + 112;
+    const size_t ExceptionDirectory = Optional + 112 + 3 * 8;
+    const size_t RelocDirectory = Optional + 112 + 5 * 8;
+    EXPECT_NE(readInteger(Bytes, ExportDirectory, 4, Endianness::Little), 0U);
+    EXPECT_NE(readInteger(Bytes, RelocDirectory, 4, Endianness::Little), 0U);
+    EXPECT_EQ(readInteger(Bytes, ExceptionDirectory + 4, 4, Endianness::Little),
+              Architecture == Target::X86_64 ? 12U : 8U);
+    llvm::object::SectionRef RelocStorage;
+    const auto *RelocSection = findSection(*PE, ".reloc", RelocStorage);
+    ASSERT_NE(RelocSection, nullptr);
+    auto RelocContent = RelocSection->getContents();
+    ASSERT_TRUE(static_cast<bool>(RelocContent));
+    const std::vector<WasmEdge::Byte> RelocBytes(RelocContent->bytes_begin(),
+                                                 RelocContent->bytes_end());
+    ASSERT_GE(RelocBytes.size(), 12U);
+    const uint32_t DataRVA =
+        static_cast<uint32_t>(Graph.sections()[2].Address - ImageBase);
+    EXPECT_EQ(readInteger(RelocBytes, 0, 4, Endianness::Little),
+              DataRVA & ~UINT32_C(0xFFF));
+    EXPECT_EQ(readInteger(RelocBytes, 4, 4, Endianness::Little), 12U);
+    EXPECT_EQ(readInteger(RelocBytes, 8, 2, Endianness::Little),
+              (llvm::COFF::IMAGE_REL_BASED_DIR64 << 12) | (DataRVA & 0xFFF));
+    EXPECT_EQ(readInteger(RelocBytes, 10, 2, Endianness::Little), 0U);
+  }
+}
+
+TEST(PEWriterTest, RejectsInvalidRebasesAndOverflowAtomically) {
+  auto Graph = makePEGraph(Target::X86_64);
+  ASSERT_TRUE(PEWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  auto &RebaseValue = const_cast<std::vector<Rebase> &>(Graph.rebases())[0];
+  RebaseValue.Width = 4;
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_FALSE(PEWriter::write(Graph, "invalid.dll", Output));
+  EXPECT_TRUE(Bytes.empty());
+
+  LinkGraph Overflow(Target::X86_64, Endianness::Little, ObjectFormat::COFF);
+  ASSERT_TRUE(Overflow.beginInput("overflow.obj"));
+  ASSERT_TRUE(Overflow.addSection(
+      Section{".text", SectionKind::Text, 1, UINT64_C(1) << 32, 0, 0, {0}}));
+  EXPECT_FALSE(PEWriter::layout(Overflow));
+  EXPECT_EQ(Overflow.sections()[0].Address, 0U);
+  EXPECT_EQ(Overflow.sections()[0].FileOffset, 0U);
 }
 
 TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {

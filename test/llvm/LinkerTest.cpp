@@ -8,6 +8,7 @@
 #include "linker/macho_writer.h"
 #include "linker/native_linker.h"
 #include "linker/object_reader.h"
+#include "linker/pe_writer.h"
 #include "linker/relocation.h"
 #include "linker/universal_wasm_writer.h"
 #include "linker/writer.h"
@@ -28,6 +29,7 @@
 #if LLVM_VERSION_MAJOR >= 14
 #include <lld/Common/CommonLinkerContext.h>
 #endif
+
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -38,6 +40,7 @@
 #if LLVM_VERSION_MAJOR >= 19
 #include <llvm/MC/MCELFExtras.h>
 #endif
+#include <llvm/Object/COFF.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/MachO.h>
 #include <llvm/Object/ObjectFile.h>
@@ -188,16 +191,15 @@ bool expectedELFPCRelative(Target Architecture, uint32_t Type) {
   }
 }
 
-std::vector<WasmEdge::Byte>
-makeObject(const llvm::Triple &Triple, bool Undefined = false,
-           bool DLLExport = false, std::string FunctionName = "f0",
-           std::string Directives = {}, bool Hidden = false,
-           bool HiddenData = false, std::string CPU = "generic",
-           std::string Features = {}, bool UnwindTable = false,
-           bool Optimize = false, bool Interruptible = false,
-           bool Atomic = false, bool Representative = false,
-           bool Exceptions = false, std::string ModuleAssembly = {},
-           bool SemanticSymbols = false, bool TypeWrapper = false) {
+std::vector<WasmEdge::Byte> makeObject(
+    const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
+    std::string FunctionName = "f0", std::string Directives = {},
+    bool Hidden = false, bool HiddenData = false, std::string CPU = "generic",
+    std::string Features = {}, bool UnwindTable = false, bool Optimize = false,
+    bool Interruptible = false, bool Atomic = false,
+    bool Representative = false, bool Exceptions = false,
+    std::string ModuleAssembly = {}, bool SemanticSymbols = false,
+    bool TypeWrapper = false, bool FloatingPoint = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -248,6 +250,10 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
   Module.setDataLayout(Machine->createDataLayout());
   Module.setModuleInlineAsm(ModuleAssembly);
   auto *I32 = llvm::Type::getInt32Ty(Context);
+  if (FloatingPoint && Triple.isOSWindows())
+    new llvm::GlobalVariable(Module, I32, false,
+                             llvm::GlobalValue::ExternalLinkage,
+                             llvm::ConstantInt::get(I32, 0), "_fltused");
   auto *Value = new llvm::GlobalVariable(
       Module, I32, false, llvm::GlobalValue::ExternalLinkage,
       Undefined ? nullptr : llvm::ConstantInt::get(I32, 7), "value");
@@ -302,6 +308,12 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
     Loaded->setAlignment(llvm::Align(4));
   }
   llvm::Value *Result = Loaded;
+  if (FloatingPoint) {
+    auto *Double = Builder.CreateSIToFP(Result, Builder.getDoubleTy());
+    Double = Builder.CreateFAdd(
+        Double, llvm::ConstantFP::get(Builder.getDoubleTy(), 0.5));
+    Result = Builder.CreateFPToSI(Double, I32);
+  }
   if (Representative) {
     constexpr uint64_t LinearMemorySize = 64;
     constexpr unsigned VectorLanes = 4;
@@ -1411,6 +1423,32 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
   EXPECT_EQ(execute(Output), 7U);
   Library->unload();
   EXPECT_FALSE(Library->get<uint32_t>("version"));
+}
+#endif
+
+#if WASMEDGE_OS_WINDOWS
+TEST_F(LinkerOutputTest, NativePEWriterLoadsAndExecutesWithoutImports) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Output = Directory / "native.dll";
+  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Output, OutputKind::PE));
+  auto Image = llvm::object::ObjectFile::createObjectFile(Output.string());
+  ASSERT_TRUE(static_cast<bool>(Image));
+  const auto *PE =
+      llvm::dyn_cast<llvm::object::COFFObjectFile>(Image->getBinary());
+  ASSERT_NE(PE, nullptr);
+  EXPECT_EQ(PE->import_directory_begin(), PE->import_directory_end());
+  EXPECT_EQ(PE->getPE32PlusHeader()->AddressOfEntryPoint, 0U);
+  auto Library = std::make_shared<WasmEdge::Loader::SharedLibrary>();
+  ASSERT_TRUE(Library->load(Output));
+  EXPECT_TRUE(Library->get<uint32_t>("version"));
+  EXPECT_TRUE(Library->get<const WasmEdge::Executable::IntrinsicsTable *>(
+      "intrinsics"));
+  EXPECT_TRUE(Library->get<WasmEdge::Executable::Wrapper>("f0"));
+  EXPECT_EQ(execute(Output), 7U);
 }
 #endif
 
@@ -4186,10 +4224,12 @@ TEST(RelocationTest, AcceptsMachOAbsoluteAndRejectsGOTForms) {
                                    llvm::MachO::X86_64_RELOC_GOT, 4));
   EXPECT_FALSE(relocationPatchSize(ObjectFormat::MachO, Target::AArch64,
                                    llvm::MachO::ARM64_RELOC_POINTER_TO_GOT, 8));
-  EXPECT_FALSE(relocationPatchSize(ObjectFormat::COFF, Target::X86_64,
-                                   llvm::COFF::IMAGE_REL_AMD64_ADDR64, 8));
-  EXPECT_FALSE(relocationPatchSize(ObjectFormat::COFF, Target::AArch64,
-                                   llvm::COFF::IMAGE_REL_ARM64_ADDR64, 8));
+  EXPECT_EQ(relocationPatchSize(ObjectFormat::COFF, Target::X86_64,
+                                llvm::COFF::IMAGE_REL_AMD64_ADDR64, 8),
+            8);
+  EXPECT_EQ(relocationPatchSize(ObjectFormat::COFF, Target::AArch64,
+                                llvm::COFF::IMAGE_REL_ARM64_ADDR64, 8),
+            8);
 }
 
 TEST(RelocationTest, ReadsRealisticPortableObjectsWithoutPersonality) {
@@ -4326,6 +4366,43 @@ _wasmedge_unwind_anchor:
             "generated.dylib"));
     ASSERT_TRUE(static_cast<bool>(Image))
         << Triple << " " << llvm::toString(Image.takeError());
+  }
+}
+
+TEST(PEWriterTest, LinksGeneratedWindowsObjects) {
+  for (const auto &[Triple, Architecture] :
+       std::array<std::pair<const char *, Target>, 2>{{
+           {"x86_64-pc-windows-msvc", Target::X86_64},
+           {"aarch64-pc-windows-msvc", Target::AArch64},
+       }}) {
+    const auto Object = makeObject(llvm::Triple(Triple), false, false, "f0",
+                                   "/EXPORT:f0 /EXPORT:value", false, false,
+                                   "generic", {}, true, true, false, false,
+                                   true, false, {}, false, false, true);
+    auto Graph = ObjectReader::read(Object, Architecture);
+    ASSERT_TRUE(Graph) << Triple;
+    ASSERT_TRUE(PEWriter::layout(*Graph)) << Triple;
+    ASSERT_TRUE(applyRelocations(*Graph)) << Triple;
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    ASSERT_TRUE(PEWriter::write(*Graph, "generated.dll", Output)) << Triple;
+    auto Image =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                            Bytes.size()),
+            "generated.dll"));
+    ASSERT_TRUE(static_cast<bool>(Image))
+        << Triple << " " << llvm::toString(Image.takeError());
+    const auto *PE = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Image);
+    ASSERT_NE(PE, nullptr);
+    EXPECT_EQ(PE->import_directory_begin(), PE->import_directory_end());
+    std::set<std::string> Exports;
+    for (const auto &Export : PE->export_directories()) {
+      llvm::StringRef Name;
+      ASSERT_FALSE(Export.getSymbolName(Name));
+      Exports.emplace(Name.str());
+    }
+    EXPECT_EQ(Exports, (std::set<std::string>{"f0", "value"}));
   }
 }
 

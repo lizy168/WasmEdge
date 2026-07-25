@@ -267,30 +267,8 @@ Expect<void> CodeGen::codegen(Span<const Byte> WasmData, Data D,
   LLPath.replace_extension("ll"sv);
 
 #if WASMEDGE_OS_WINDOWS
-  {
-    // create dummy dllmain function
-    auto FTy = LLVM::Type::getFunctionType(LLContext.getInt32Ty(), {});
-    auto F =
-        LLModule.addFunction(FTy, LLVMExternalLinkage, "_DllMainCRTStartup");
-    F.setVisibility(LLVMProtectedVisibility);
-    F.setDSOLocal(true);
-    F.addFnAttr(
-        LLVM::Attribute::createString(LLContext, "no-stack-arg-probe"sv, {}));
-    F.addFnAttr(
-        LLVM::Attribute::createEnum(LLContext, LLVM::Core::StrictFP, 0));
-    F.addFnAttr(LLVM::Attribute::createEnum(LLContext, LLVM::Core::UWTable,
-                                            LLVM::Core::UWTableDefault));
-    F.addFnAttr(
-        LLVM::Attribute::createEnum(LLContext, LLVM::Core::NoReturn, 0));
-    LLVM::Builder Builder(LLContext);
-    Builder.positionAtEnd(LLVM::BasicBlock::create(LLContext, F, "entry"));
-    Builder.createRet(LLContext.getInt32(1u));
-
-    auto A = LLModule.addAlias(F.getType(), F, "_fltused");
-    A.setLinkage(LLVMExternalLinkage);
-    A.setVisibility(LLVMProtectedVisibility);
-    A.setDSOLocal(true);
-  }
+  LLModule.addGlobal(LLContext.getInt32Ty(), false, LLVMExternalLinkage,
+                     LLContext.getInt32(0), "_fltused");
 #endif
 #if WASMEDGE_OS_MACOS
   {

@@ -10,6 +10,7 @@
 #include "linker/layout.h"
 #include "linker/macho_writer.h"
 #include "linker/object_reader.h"
+#include "linker/pe_writer.h"
 #include "linker/relocation.h"
 #include "linker/universal_wasm_writer.h"
 #include "loader/loader.h"
@@ -201,8 +202,8 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
 #elif WASMEDGE_OS_MACOS
     if (Kind != OutputKind::UniversalWasm && Kind != OutputKind::MachO)
       return linkError();
-#else
-    if (Kind != OutputKind::UniversalWasm)
+#elif WASMEDGE_OS_WINDOWS
+    if (Kind != OutputKind::UniversalWasm && Kind != OutputKind::PE)
       return linkError();
 #endif
     const auto TargetValue = hostTarget();
@@ -233,8 +234,11 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     if (Kind == OutputKind::MachO && !MachOWriter::layout(Graph)) {
       return linkError();
     }
+    if (Kind == OutputKind::PE && !PEWriter::layout(Graph)) {
+      return linkError();
+    }
     if (Kind != OutputKind::ELF && Kind != OutputKind::MachO &&
-        !layout(Graph, 0, HostPageSize)) {
+        Kind != OutputKind::PE && !layout(Graph, 0, HostPageSize)) {
       return linkError();
     }
     if (Graph.format() == ObjectFormat::MachO) {
@@ -257,6 +261,9 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
         EXPECTED_TRY(ELFWriter::write(Graph, OutputWriter));
       } else if (Kind == OutputKind::MachO) {
         EXPECTED_TRY(MachOWriter::write(Graph, OutputWriter));
+      } else if (Kind == OutputKind::PE) {
+        EXPECTED_TRY(
+            PEWriter::write(Graph, Output.filename().string(), OutputWriter));
       } else {
         EXPECTED_TRY(UniversalWasmWriter::write(Graph, Wasm, OutputWriter));
       }

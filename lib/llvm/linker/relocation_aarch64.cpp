@@ -19,6 +19,8 @@ namespace {
 
 using namespace std::literals;
 
+constexpr uint64_t PEImageBase = UINT64_C(0x180000000);
+
 enum class Low12Scale : unsigned {
   Byte,
   Half,
@@ -63,8 +65,11 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
     auto &Bytes = Result.Content[Rel.Section];
     const auto &Symbol = Graph.symbols()[Rel.Symbol];
     int64_t Addend = Rel.Addend;
-    if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::MachO &&
-        Rel.Type == llvm::MachO::ARM64_RELOC_UNSIGNED) {
+    if (Rel.AddendIsImplicit &&
+        ((Rel.Format == ObjectFormat::MachO &&
+          Rel.Type == llvm::MachO::ARM64_RELOC_UNSIGNED) ||
+         (Rel.Format == ObjectFormat::COFF &&
+          Rel.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR64))) {
       auto Value = readSigned(Bytes, Rel.Offset, 8, Endianness::Little);
       if (!Value)
         return fail(Rel, "cannot decode implicit addend");
@@ -76,9 +81,10 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
         int128_t(Graph.sections()[Rel.Section].Address) + Rel.Offset;
     if (Rel.Format == ObjectFormat::COFF &&
         Rel.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR32NB) {
-      if (S < 0 || S > UINT32_MAX ||
+      if (S < PEImageBase || S - PEImageBase > UINT32_MAX ||
           !writeUnsigned(Bytes, Rel.Offset, InstructionWidth,
-                         Endianness::Little, static_cast<uint64_t>(S))) {
+                         Endianness::Little,
+                         static_cast<uint64_t>(S - PEImageBase))) {
         return fail(Rel, "ADDR32NB relocation overflows");
       }
       continue;
@@ -86,7 +92,9 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
     if ((Rel.Format == ObjectFormat::ELF &&
          Rel.Type == llvm::ELF::R_AARCH64_ABS64) ||
         (Rel.Format == ObjectFormat::MachO &&
-         Rel.Type == llvm::MachO::ARM64_RELOC_UNSIGNED)) {
+         Rel.Type == llvm::MachO::ARM64_RELOC_UNSIGNED) ||
+        (Rel.Format == ObjectFormat::COFF &&
+         Rel.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR64)) {
       constexpr uint8_t DoubleWordWidth = 8;
       if (S < 0 || S > UINT64_MAX ||
           !writeUnsigned(Bytes, Rel.Offset, DoubleWordWidth, Endianness::Little,

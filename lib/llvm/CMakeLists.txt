@@ -33,6 +33,7 @@ set(WASMEDGE_LLVM_SOURCES
   linker/link_graph.cpp
   linker/macho_writer.cpp
   linker/native_linker.cpp
+  linker/pe_writer.cpp
   linker/object_reader.cpp
   linker/relocation.cpp
   linker/relocation_aarch64.cpp
@@ -52,6 +53,7 @@ set(WASMEDGE_LLVM_LINKER_SOURCES
   linker/link_graph.cpp
   linker/macho_writer.cpp
   linker/native_linker.cpp
+  linker/pe_writer.cpp
   linker/object_reader.cpp
   linker/relocation.cpp
   linker/relocation_aarch64.cpp

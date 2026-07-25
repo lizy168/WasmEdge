@@ -807,10 +807,14 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       SymbolName += "." + std::to_string((*InputSection)->getIndex()) + "." +
                     std::to_string(SymbolIds.size());
     }
-    auto Added = Graph.addSymbol(
-        Symbol{std::move(SymbolName), Section->second, Address - Base,
-               SymbolSizes[InputSymbol.getRawDataRefImpl()], Exported,
-               ExportName, Global});
+    uint64_t SymbolSize = SymbolSizes[InputSymbol.getRawDataRefImpl()];
+    if (const auto *COFF =
+            llvm::dyn_cast<llvm::object::COFFObjectFile>(&Object);
+        COFF && COFF->getCOFFSymbol(InputSymbol).isSectionDefinition())
+      SymbolSize = 0;
+    auto Added = Graph.addSymbol(Symbol{std::move(SymbolName), Section->second,
+                                        Address - Base, SymbolSize, Exported,
+                                        ExportName, Global});
     if (!Added) {
       return fail<LinkGraph>(Added.error().Message);
     }

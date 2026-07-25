@@ -93,6 +93,8 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
       }
     }
     if (Format == ObjectFormat::COFF) {
+      if (Type == llvm::COFF::IMAGE_REL_AMD64_ADDR64)
+        return DoubleWordPatch;
       if ((Type >= llvm::COFF::IMAGE_REL_AMD64_REL32 &&
            Type <= llvm::COFF::IMAGE_REL_AMD64_REL32_5) ||
           Type == llvm::COFF::IMAGE_REL_AMD64_ADDR32NB) {
@@ -115,6 +117,8 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
   }
   if (TargetValue == Target::AArch64 && Format == ObjectFormat::COFF) {
     switch (Type) {
+    case llvm::COFF::IMAGE_REL_ARM64_ADDR64:
+      return DoubleWordPatch;
     case llvm::COFF::IMAGE_REL_ARM64_BRANCH26:
     case llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21:
     case llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A:
