@@ -444,7 +444,11 @@ bool isAllocatable(const llvm::object::ObjectFile &Object,
 
 SectionPurpose sectionPurpose(const llvm::object::ObjectFile &Object,
                               llvm::StringRef Name) noexcept {
+#if LLVM_VERSION_MAJOR >= 19
   if (Name == ".ARM.exidx" || Name.starts_with(".ARM.exidx."))
+#else
+  if (Name == ".ARM.exidx" || Name.startswith(".ARM.exidx."))
+#endif
     return SectionPurpose::ARMExidx;
   if (Name.contains("eh_frame"))
     return SectionPurpose::EHFrame;
