@@ -328,9 +328,30 @@ if((WASMEDGE_LINK_LLVM_STATIC OR WASMEDGE_BUILD_STATIC_LIB) AND WASMEDGE_USE_LLV
   string(REPLACE " " ";" WASMEDGE_LLVM_LINK_LIBS_NAME "${WASMEDGE_LLVM_LINK_LIBS_NAME}")
   set(WASMEDGE_LLVM_LINK_LIBS_NAME "${WASMEDGE_LLVM_LINK_LIBS_NAME}")
 
+  set(POLLY_LIBS)
+  set(MISSING_POLLY_LIBS)
+  foreach(LIB_NAME Polly PollyISL)
+    if(LIB_NAME IN_LIST WASMEDGE_LLVM_LINK_LIBS_NAME)
+      list(APPEND POLLY_LIBS ${LIB_NAME})
+      if(NOT EXISTS "${LLVM_LIBRARY_DIR}/lib${LIB_NAME}.a")
+        list(APPEND MISSING_POLLY_LIBS ${LIB_NAME})
+      endif()
+    endif()
+  endforeach()
+  if(MISSING_POLLY_LIBS AND MISSING_POLLY_LIBS STREQUAL POLLY_LIBS)
+    list(REMOVE_ITEM WASMEDGE_LLVM_LINK_LIBS_NAME ${MISSING_POLLY_LIBS})
+    message(WARNING "llvm-config reported optional Polly archives that are not installed; omitting them")
+  elseif(MISSING_POLLY_LIBS)
+    message(FATAL_ERROR "Incomplete Polly installation: missing ${MISSING_POLLY_LIBS}")
+  endif()
+
   foreach(LIB_NAME IN LISTS WASMEDGE_LLVM_LINK_LIBS_NAME)
+    set(LIB_PATH "${LLVM_LIBRARY_DIR}/lib${LIB_NAME}.a")
+    if(NOT EXISTS "${LIB_PATH}")
+      message(FATAL_ERROR "llvm-config reported missing required archive: ${LIB_PATH}")
+    endif()
     list(APPEND WASMEDGE_LLVM_LINK_STATIC_COMPONENTS
-      ${LLVM_LIBRARY_DIR}/lib${LIB_NAME}.a
+      ${LIB_PATH}
     )
   endforeach()
   if(LLVM_ENABLE_ZSTD)

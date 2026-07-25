@@ -13,6 +13,7 @@
         wasmedge_buildInputs = with pkgs; [
           cmake
           llvmPackages.clang-unwrapped
+          llvmPackages.lld
           llvmPackages.llvm
           openssl
           pkg-config
