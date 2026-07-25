@@ -204,14 +204,13 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       if ((Instruction & AdrpOpcodeMask) != AdrpOpcode) {
         return fail(Rel, "invalid ADRP instruction");
       }
-      int128_t TargetAddress = S;
+      int128_t Pages = (S >> PageShift) - (P >> PageShift);
       if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF) {
         const uint32_t Raw =
             ((Instruction >> AdrpImmediateLowShift) & 3) |
             ((Instruction >> AdrpImmediateHighShift) & AdrpImmediateHighMask);
-        TargetAddress += signExtend(Raw, PageDisplacementBits);
+        Pages += signExtend(Raw, PageDisplacementBits);
       }
-      const int128_t Pages = (TargetAddress >> PageShift) - (P >> PageShift);
       if (!signedBits(Pages, PageDisplacementBits)) {
         return fail(Rel, "ADRP page displacement overflows");
       }

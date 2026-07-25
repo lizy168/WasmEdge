@@ -3101,7 +3101,7 @@ TEST(ARMRelocationTest, EncodesThumbCallBoundariesAndImplicitAddend) {
     int64_t Delta;
     bool Accepted;
   };
-  const std::array<Case, 6> Cases{{
+  const std::array<Case, 7> Cases{{
       {-INT64_C(16777216), true},
       {INT64_C(16777214), true},
       {-INT64_C(16777218), false},
@@ -3521,7 +3521,7 @@ TEST(AArch64RelocationTest, DecodesCOFFImplicitAddendsExactly) {
     uint64_t Patch;
     uint32_t Expected;
   };
-  const std::array<Case, 6> Cases{{
+  const std::array<Case, 7> Cases{{
       {llvm::COFF::IMAGE_REL_ARM64_ADDR32NB, 5, ImageBase + 0x2000,
        ImageBase + 0x1000, 0x2005},
       {llvm::COFF::IMAGE_REL_ARM64_BRANCH26, 0x94000002, ImageBase + 0x1100,
@@ -3529,7 +3529,9 @@ TEST(AArch64RelocationTest, DecodesCOFFImplicitAddendsExactly) {
       {llvm::COFF::IMAGE_REL_ARM64_BRANCH26, 0x97FFFFFF, ImageBase + 0x1100,
        ImageBase + 0x1000, 0x9400003F},
       {llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21, 0xB0000000,
-       ImageBase + 0x1FFF, ImageBase + 0x1000, 0xB0000000},
+       ImageBase + 0x5000, ImageBase + 0x1000, 0xB0000020},
+      {llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21, 0xF0FFFFE0,
+       ImageBase + 0x5000, ImageBase + 0x1000, 0xF0000000},
       {llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A, 0x91001400,
        ImageBase + 0x1FFC, ImageBase + 0x1000, 0x91000400},
       {llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L, 0xF9400800,
@@ -3548,6 +3550,18 @@ TEST(AArch64RelocationTest, DecodesCOFFImplicitAddendsExactly) {
               Test.Expected)
         << Test.Type;
   }
+
+  std::vector<WasmEdge::Byte> OverflowBytes(8);
+  ASSERT_TRUE(Internal::writeUnsigned(OverflowBytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0xB0000000)));
+  auto Overflow = makeELFRelocationGraph(
+      Target::AArch64, Endianness::Little,
+      llvm::COFF::IMAGE_REL_ARM64_PAGEBASE_REL21, 4,
+      ImageBase + (UINT64_C(1048575) << 12), ImageBase, 0, 0, true,
+      std::move(OverflowBytes), ObjectFormat::COFF);
+  const auto Snapshot = Overflow;
+  EXPECT_FALSE(applyRelocations(Overflow));
+  expectGraphStateEquals(Overflow, Snapshot);
 
   std::vector<WasmEdge::Byte> SIMD(8);
   ASSERT_TRUE(Internal::writeUnsigned(SIMD, 0, 4, Endianness::Little,
@@ -3617,8 +3631,14 @@ data:
   const uint64_t DataAddress =
       Graph->sections()[DataSymbol->Section].Address + DataSymbol->Offset;
   const uint64_t TextAddress = Text.Address;
-  const uint32_t FirstPages =
-      static_cast<uint32_t>(((DataAddress + 4097) >> 12) - (TextAddress >> 12));
+  const uint32_t InitialADRP = static_cast<uint32_t>(
+      *Internal::readUnsigned(Before, 0, 4, Endianness::Little));
+  const uint32_t RawPages =
+      ((InitialADRP >> 29) & 3) | ((InitialADRP >> 3) & UINT32_C(0x1FFFFC));
+  const int32_t PageAddend = static_cast<int32_t>(RawPages << 11) >> 11;
+  const uint32_t FirstPages = static_cast<uint32_t>(
+      static_cast<int64_t>((DataAddress >> 12) - (TextAddress >> 12)) +
+      PageAddend);
   EXPECT_EQ(*Internal::readUnsigned(Text.Content, 0, 4, Endianness::Little),
             UINT32_C(0x90000000) | ((FirstPages & 3) << 29) |
                 ((FirstPages & 0x1FFFFC) << 3));
