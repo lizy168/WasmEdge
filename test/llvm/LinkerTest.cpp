@@ -5,6 +5,7 @@
 #include "linker/elf_writer.h"
 #include "linker/layout.h"
 #include "linker/link_graph.h"
+#include "linker/macho_writer.h"
 #include "linker/native_linker.h"
 #include "linker/object_reader.h"
 #include "linker/relocation.h"
@@ -336,7 +337,8 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
                                           "direct", Module);
     Direct->addFnAttr(llvm::Attribute::NoUnwind);
     Direct->addFnAttr(llvm::Attribute::NoInline);
-    Direct->setSection(".text.direct");
+    Direct->setSection(Triple.isOSBinFormatMachO() ? "__TEXT,__text"
+                                                   : ".text.direct");
     llvm::IRBuilder<> DirectBuilder(
         llvm::BasicBlock::Create(Context, "entry", Direct));
     DirectBuilder.CreateRet(llvm::ConstantInt::get(I32, 3));
@@ -353,7 +355,8 @@ makeObject(const llvm::Triple &Triple, bool Undefined = false,
         llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false),
         llvm::GlobalValue::InternalLinkage, "poll", Module);
     Poll->addFnAttr(llvm::Attribute::NoUnwind);
-    Poll->setSection(".text.poll");
+    Poll->setSection(Triple.isOSBinFormatMachO() ? "__TEXT,__text"
+                                                 : ".text.poll");
     llvm::IRBuilder<> PollBuilder(
         llvm::BasicBlock::Create(Context, "entry", Poll));
     PollBuilder.CreateRetVoid();
@@ -3925,9 +3928,13 @@ TEST(RelocationTest, RecognizesObservedPortablePatchWidthsAndPCRelativeForms) {
   }
 }
 
-TEST(RelocationTest, RejectsUnsafePortableAbsoluteAndGOTForms) {
-  EXPECT_FALSE(relocationPatchSize(ObjectFormat::MachO, Target::X86_64,
-                                   llvm::MachO::X86_64_RELOC_UNSIGNED, 8));
+TEST(RelocationTest, AcceptsMachOAbsoluteAndRejectsGOTForms) {
+  EXPECT_EQ(relocationPatchSize(ObjectFormat::MachO, Target::X86_64,
+                                llvm::MachO::X86_64_RELOC_UNSIGNED, 8),
+            8);
+  EXPECT_EQ(relocationPatchSize(ObjectFormat::MachO, Target::AArch64,
+                                llvm::MachO::ARM64_RELOC_UNSIGNED, 8),
+            8);
   EXPECT_FALSE(relocationPatchSize(ObjectFormat::MachO, Target::X86_64,
                                    llvm::MachO::X86_64_RELOC_GOT, 4));
   EXPECT_FALSE(relocationPatchSize(ObjectFormat::MachO, Target::AArch64,
@@ -4021,6 +4028,57 @@ _wasmedge_unwind_anchor:
       EXPECT_NE(std::find(First->begin(), First->end(), Address), First->end())
           << Triple << " " << Name;
     }
+  }
+}
+
+TEST(MachOWriterTest, LinksGeneratedMacOSObjects) {
+  constexpr std::string_view Anchor = R"(
+.private_extern _wasmedge_unwind_anchor
+_wasmedge_unwind_anchor:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  .cfi_escape 0x2e, 0x10
+  ret
+  .cfi_endproc
+)";
+  for (const auto &[Triple, Architecture] :
+       std::array<std::pair<const char *, Target>, 2>{{
+           {"x86_64-apple-macosx", Target::X86_64},
+           {"arm64-apple-macosx", Target::AArch64},
+       }}) {
+    const auto Object = makeObject(
+        llvm::Triple(Triple), false, false, "f0", {}, false, false, "generic",
+        {}, true, false, false, false, false, false, std::string(Anchor), true);
+    auto Parsed =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
+                            Object.size()),
+            "generated.o"));
+    ASSERT_TRUE(static_cast<bool>(Parsed));
+    std::set<std::string> InputSections;
+    for (const auto &Section : (*Parsed)->sections()) {
+      auto Name = Section.getName();
+      ASSERT_TRUE(static_cast<bool>(Name));
+      InputSections.emplace(Name->str());
+    }
+    EXPECT_TRUE(InputSections.count("__eh_frame")) << Triple;
+    auto Graph =
+        ObjectReader::read(Object, Architecture, ObjectReaderPolicy::Universal);
+    ASSERT_TRUE(Graph) << Triple;
+    ASSERT_TRUE(MachOWriter::layout(*Graph)) << Triple;
+    ASSERT_TRUE(normalizeMachOEHFrame(*Graph)) << Triple;
+    ASSERT_TRUE(validateMachOEHFrameCoverage(*Graph)) << Triple;
+    ASSERT_TRUE(applyRelocations(*Graph)) << Triple;
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    ASSERT_TRUE(MachOWriter::write(*Graph, Output)) << Triple;
+    auto Image =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                            Bytes.size()),
+            "generated.dylib"));
+    ASSERT_TRUE(static_cast<bool>(Image))
+        << Triple << " " << llvm::toString(Image.takeError());
   }
 }
 

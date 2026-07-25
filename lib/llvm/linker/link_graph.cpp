@@ -80,6 +80,8 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
     }
     if (Format == ObjectFormat::MachO) {
       switch (Type) {
+      case llvm::MachO::X86_64_RELOC_UNSIGNED:
+        return DoubleWordPatch;
       case llvm::MachO::X86_64_RELOC_SIGNED:
       case llvm::MachO::X86_64_RELOC_SIGNED_1:
       case llvm::MachO::X86_64_RELOC_SIGNED_2:
@@ -101,6 +103,8 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
   }
   if (TargetValue == Target::AArch64 && Format == ObjectFormat::MachO) {
     switch (Type) {
+    case llvm::MachO::ARM64_RELOC_UNSIGNED:
+      return DoubleWordPatch;
     case llvm::MachO::ARM64_RELOC_BRANCH26:
     case llvm::MachO::ARM64_RELOC_PAGE21:
     case llvm::MachO::ARM64_RELOC_PAGEOFF12:

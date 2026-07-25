@@ -2,11 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
 #include "linker/elf_writer.h"
+#include "linker/macho_writer.h"
+#include "linker/native_linker.h"
 #include "linker/relocation.h"
 
 #include <gtest/gtest.h>
 
 #include <llvm/BinaryFormat/ELF.h>
+#include <llvm/BinaryFormat/MachO.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/MemoryBufferRef.h>
@@ -914,5 +917,253 @@ TEST(ELFWriterTest, RejectsUnsupportedRebasesAndInvalidState) {
       Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}}));
   EXPECT_FALSE(ELFWriter::layout(WrongEndian));
 }
+
+LinkGraph makeMachOGraph(Target Architecture) {
+  LinkGraph Graph(Architecture, Endianness::Little, ObjectFormat::MachO);
+  EXPECT_TRUE(Graph.beginInput("writer.o"));
+  auto Text = Graph.addSection(
+      Section{"__text", SectionKind::Text, 16, 4, 0, 0,
+              Architecture == Target::X86_64
+                  ? std::vector<WasmEdge::Byte>{0xC3, 0, 0, 0}
+                  : std::vector<WasmEdge::Byte>{0xC0, 0x03, 0x5F, 0xD6}});
+  auto Constant = Graph.addSection(
+      Section{"__const", SectionKind::ReadOnly, 8, 4, 0, 0, {1, 2, 3, 4}});
+  auto EHFrame = Graph.addSection(Section{"__eh_frame",
+                                          SectionKind::Unwind,
+                                          8,
+                                          4,
+                                          0,
+                                          0,
+                                          {0, 0, 0, 0},
+                                          SectionPurpose::EHFrame});
+  auto Data = Graph.addSection(Section{"__data", SectionKind::Data, 8, 8, 0, 0,
+                                       std::vector<WasmEdge::Byte>(8)});
+  auto Pointer =
+      Graph.addSection(Section{"__pointer", SectionKind::Data, 8, 8, 0, 0,
+                               std::vector<WasmEdge::Byte>(8)});
+  auto BSS =
+      Graph.addSection(Section{"__bss", SectionKind::BSS, 8, 8, 0, 0, {}});
+  EXPECT_TRUE(Text && Constant && EHFrame && Data && Pointer && BSS);
+  EXPECT_TRUE(
+      Graph.addSymbol(Symbol{"_f0", *Text, 0, 4, true, std::nullopt, true}));
+  EXPECT_TRUE(
+      Graph.addSymbol(Symbol{"_value", *Data, 0, 8, true, std::nullopt, true}));
+  EXPECT_TRUE(Graph.addRebase(Rebase{*Data, 0,
+                                     Architecture == Target::X86_64
+                                         ? llvm::MachO::X86_64_RELOC_UNSIGNED
+                                         : llvm::MachO::ARM64_RELOC_UNSIGNED,
+                                     0, 8, ObjectFormat::MachO}));
+  EXPECT_TRUE(Graph.addRebase(Rebase{*Pointer, 0,
+                                     Architecture == Target::X86_64
+                                         ? llvm::MachO::X86_64_RELOC_UNSIGNED
+                                         : llvm::MachO::ARM64_RELOC_UNSIGNED,
+                                     0, 8, ObjectFormat::MachO}));
+  return Graph;
+}
+
+TEST(MachOWriterTest, WritesDeterministicDylibsForMacOSTargets) {
+  for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
+    auto Graph = makeMachOGraph(Architecture);
+    ASSERT_TRUE(MachOWriter::layout(Graph));
+    auto Data = Graph.sectionContent(3);
+    auto Pointer = Graph.sectionContent(4);
+    ASSERT_TRUE(Data && Pointer);
+    for (uint8_t I = 0; I < 8; ++I)
+      (*Data)[I] =
+          static_cast<WasmEdge::Byte>(Graph.sections()[3].Address >> (I * 8));
+    for (uint8_t I = 0; I < 8; ++I)
+      (*Pointer)[I] =
+          static_cast<WasmEdge::Byte>(Graph.sections()[4].Address >> (I * 8));
+    ASSERT_TRUE(applyRelocations(Graph));
+    std::vector<WasmEdge::Byte> Bytes;
+    Writer Output(Bytes);
+    ASSERT_TRUE(MachOWriter::write(Graph, Output));
+    std::vector<WasmEdge::Byte> Again;
+    Writer Second(Again);
+    ASSERT_TRUE(MachOWriter::write(Graph, Second));
+    EXPECT_EQ(Bytes, Again);
+
+    auto Object =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                            Bytes.size()),
+            "writer.dylib"));
+    ASSERT_TRUE(static_cast<bool>(Object))
+        << llvm::toString(Object.takeError());
+    EXPECT_TRUE((*Object)->isMachO());
+    EXPECT_EQ(readInteger(Bytes, 0, 4, Endianness::Little),
+              llvm::MachO::MH_MAGIC_64);
+    EXPECT_EQ(readInteger(Bytes, 12, 4, Endianness::Little),
+              llvm::MachO::MH_DYLIB);
+    EXPECT_EQ(readInteger(Bytes, 24, 4, Endianness::Little),
+              llvm::MachO::MH_NOUNDEFS | llvm::MachO::MH_DYLDLINK |
+                  llvm::MachO::MH_TWOLEVEL);
+
+    size_t Command = 32;
+    uint64_t FirstSectionOffset = UINT64_MAX;
+    std::set<uint32_t> Commands;
+    std::set<std::string> SegmentNames;
+    for (uint32_t I = 0; I < readInteger(Bytes, 16, 4, Endianness::Little);
+         ++I) {
+      const uint32_t Type = static_cast<uint32_t>(
+          readInteger(Bytes, Command, 4, Endianness::Little));
+      const uint32_t Size = static_cast<uint32_t>(
+          readInteger(Bytes, Command + 4, 4, Endianness::Little));
+      ASSERT_GE(Size, 8U);
+      ASSERT_LE(Command + Size, Bytes.size());
+      Commands.insert(Type);
+      if (Type == llvm::MachO::LC_SEGMENT_64) {
+        const char *Name =
+            reinterpret_cast<const char *>(Bytes.data() + Command + 8);
+        SegmentNames.emplace(Name, strnlen(Name, 16));
+        const uint32_t MaxProtection = static_cast<uint32_t>(
+            readInteger(Bytes, Command + 56, 4, Endianness::Little));
+        const uint32_t InitialProtection = static_cast<uint32_t>(
+            readInteger(Bytes, Command + 60, 4, Endianness::Little));
+        EXPECT_EQ(InitialProtection & ~MaxProtection, 0U);
+        EXPECT_FALSE((InitialProtection & llvm::MachO::VM_PROT_WRITE) != 0 &&
+                     (InitialProtection & llvm::MachO::VM_PROT_EXECUTE) != 0);
+        const uint32_t SectionCount = static_cast<uint32_t>(
+            readInteger(Bytes, Command + 64, 4, Endianness::Little));
+        for (uint32_t Section = 0; Section < SectionCount; ++Section) {
+          const uint64_t Offset = readInteger(
+              Bytes, Command + 72 + Section * 80 + 48, 4, Endianness::Little);
+          if (Offset != 0)
+            FirstSectionOffset = std::min(FirstSectionOffset, Offset);
+        }
+      }
+      Command += Size;
+    }
+    EXPECT_EQ(Command, 32U + readInteger(Bytes, 20, 4, Endianness::Little));
+    ASSERT_NE(FirstSectionOffset, UINT64_MAX);
+    EXPECT_GE(FirstSectionOffset - Command, 16U);
+    EXPECT_EQ(SegmentNames, (std::set<std::string>{"__TEXT", "__DATA_CONST",
+                                                   "__DATA", "__LINKEDIT"}));
+    for (const uint32_t Required :
+         {llvm::MachO::LC_DYLD_INFO_ONLY, llvm::MachO::LC_SYMTAB,
+          llvm::MachO::LC_DYSYMTAB, llvm::MachO::LC_ID_DYLIB,
+          llvm::MachO::LC_BUILD_VERSION})
+      EXPECT_TRUE(Commands.count(Required)) << Required;
+    EXPECT_FALSE(Commands.count(llvm::MachO::LC_UUID));
+
+    std::set<std::string> Names;
+    for (const auto &Symbol : (*Object)->symbols()) {
+      auto Name = Symbol.getName();
+      ASSERT_TRUE(static_cast<bool>(Name));
+      Names.emplace(Name->str());
+      auto Flags = Symbol.getFlags();
+      ASSERT_TRUE(static_cast<bool>(Flags));
+      EXPECT_EQ(*Flags & llvm::object::SymbolRef::SF_Undefined, 0U);
+    }
+    EXPECT_EQ(Names, (std::set<std::string>{"_f0", "_value"}));
+  }
+}
+
+TEST(MachOWriterTest, RejectsRawCompactUnwind) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("compact.o"));
+  ASSERT_TRUE(Graph.addSection(
+      Section{"__compact_unwind", SectionKind::Unwind, 8, 32, 0, 0,
+              std::vector<WasmEdge::Byte>(32), SectionPurpose::CompactUnwind}));
+  EXPECT_FALSE(MachOWriter::layout(Graph));
+}
+
+TEST(MachOWriterTest, RejectsResidualCompactUnwindWithEHFrame) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("mixed-unwind.o"));
+  ASSERT_TRUE(Graph.addSection(Section{"__eh_frame",
+                                       SectionKind::Unwind,
+                                       8,
+                                       4,
+                                       0,
+                                       0,
+                                       {0, 0, 0, 0},
+                                       SectionPurpose::EHFrame}));
+  ASSERT_TRUE(Graph.addSection(
+      Section{"__compact_unwind", SectionKind::Unwind, 8, 32, 0, 0,
+              std::vector<WasmEdge::Byte>(32), SectionPurpose::CompactUnwind}));
+  EXPECT_FALSE(MachOWriter::layout(Graph));
+}
+
+TEST(MachOWriterTest, RejectsMissingEHFrame) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("no-eh.o"));
+  ASSERT_TRUE(Graph.addSection(
+      Section{"__text", SectionKind::Text, 1, 1, 0, 0, {0xC3}}));
+  EXPECT_FALSE(MachOWriter::layout(Graph));
+}
+
+TEST(MachOWriterTest, WritesBSSOnlyDataSegment) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("bss.o"));
+  ASSERT_TRUE(Graph.addSection(
+      Section{"__text", SectionKind::Text, 1, 1, 0, 0, {0xC3}}));
+  ASSERT_TRUE(Graph.addSection(Section{"__eh_frame",
+                                       SectionKind::Unwind,
+                                       8,
+                                       4,
+                                       0,
+                                       0,
+                                       {0, 0, 0, 0},
+                                       SectionPurpose::EHFrame}));
+  ASSERT_TRUE(
+      Graph.addSection(Section{"__bss", SectionKind::BSS, 8, 8, 0, 0, {}}));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(MachOWriter::write(Graph, Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "bss.dylib"));
+  ASSERT_TRUE(static_cast<bool>(Object)) << llvm::toString(Object.takeError());
+}
+
+TEST(MachOWriterTest, AppliesMachOAbsolutePointersAsRebases) {
+  for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
+    LinkGraph Graph(Architecture, Endianness::Little, ObjectFormat::MachO);
+    ASSERT_TRUE(Graph.beginInput("absolute.o"));
+    auto Text = Graph.addSection(
+        Section{"__text", SectionKind::Text, 4, 4, 0, 0,
+                Architecture == Target::X86_64
+                    ? std::vector<WasmEdge::Byte>{0xC3, 0, 0, 0}
+                    : std::vector<WasmEdge::Byte>{0xC0, 0x03, 0x5F, 0xD6}});
+    auto Data = Graph.addSection(Section{"__data", SectionKind::Data, 8, 8, 0,
+                                         0, std::vector<WasmEdge::Byte>(8)});
+    auto EHFrame = Graph.addSection(Section{"__eh_frame",
+                                            SectionKind::Unwind,
+                                            8,
+                                            4,
+                                            0,
+                                            0,
+                                            {0, 0, 0, 0},
+                                            SectionPurpose::EHFrame});
+    ASSERT_TRUE(Text && Data && EHFrame);
+    auto Function =
+        Graph.addSymbol(Symbol{"_f0", *Text, 0, 4, true, std::nullopt, true});
+    ASSERT_TRUE(Function);
+    const uint32_t Type = Architecture == Target::X86_64
+                              ? llvm::MachO::X86_64_RELOC_UNSIGNED
+                              : llvm::MachO::ARM64_RELOC_UNSIGNED;
+    ASSERT_TRUE(Graph.addRelocation(Relocation{*Data, 0, Type, *Function, 0,
+                                               true, ObjectFormat::MachO, 8,
+                                               false, false, false}));
+    ASSERT_TRUE(MachOWriter::layout(Graph));
+    ASSERT_TRUE(applyRelocations(Graph));
+    ASSERT_EQ(Graph.rebases().size(), 1U);
+    EXPECT_EQ(
+        readInteger(Graph.sections()[*Data].Content, 0, 8, Endianness::Little),
+        Graph.sections()[*Text].Address);
+  }
+}
+
+#if !WASMEDGE_OS_WINDOWS
+TEST(MachOWriterTest, PropagatesSignerStatus) {
+  EXPECT_TRUE(Internal::signMachO("unused", "/bin/true"));
+  EXPECT_FALSE(Internal::signMachO("unused", "/bin/false"));
+}
+#endif
 
 } // namespace

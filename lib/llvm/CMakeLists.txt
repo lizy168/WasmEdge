@@ -31,6 +31,7 @@ set(WASMEDGE_LLVM_SOURCES
   linker/layout.cpp
   linker/eh_frame.cpp
   linker/link_graph.cpp
+  linker/macho_writer.cpp
   linker/native_linker.cpp
   linker/object_reader.cpp
   linker/relocation.cpp
@@ -49,6 +50,7 @@ set(WASMEDGE_LLVM_LINKER_SOURCES
   linker/eh_frame.cpp
   linker/layout.cpp
   linker/link_graph.cpp
+  linker/macho_writer.cpp
   linker/native_linker.cpp
   linker/object_reader.cpp
   linker/relocation.cpp

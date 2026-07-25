@@ -14,6 +14,11 @@ namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
 
+namespace Internal {
+Expect<void> signMachO(const std::filesystem::path &Path,
+                       const std::filesystem::path &Executable) noexcept;
+}
+
 enum class OutputKind : uint8_t { UniversalWasm, ELF, MachO, PE };
 
 class NativeLinker {

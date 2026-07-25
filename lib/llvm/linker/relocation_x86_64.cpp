@@ -150,6 +150,10 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
         return fail(RelocationValue, "unsupported x86_64 relocation type");
       }
     } else if (RelocationValue.Format == ObjectFormat::MachO &&
+               RelocationValue.Type == llvm::MachO::X86_64_RELOC_UNSIGNED) {
+      Width = DoubleWordWidth;
+      Absolute = true;
+    } else if (RelocationValue.Format == ObjectFormat::MachO &&
                (RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED ||
                 RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED_1 ||
                 RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED_2 ||

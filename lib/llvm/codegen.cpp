@@ -360,8 +360,6 @@ Expect<void> CodeGen::codegen(Span<const Byte> WasmData, Data D,
     }
 
 #if WASMEDGE_OS_MACOS
-    const bool Universal = Conf.getCompilerConfigure().getOutputFormat() ==
-                           CompilerConfigure::OutputFormat::Wasm;
     constexpr std::string_view UnwindAnchor = R"(
 .private_extern _wasmedge_unwind_anchor
 _wasmedge_unwind_anchor:
@@ -376,26 +374,22 @@ _wasmedge_unwind_anchor:
     auto *TargetMachine = reinterpret_cast<llvm::TargetMachine *>(TM.unwrap());
     auto OriginalDwarfUnwind = TargetMachine->Options.MCOptions.EmitDwarfUnwind;
 #endif
-    if (Universal) {
-      OriginalAssembly = LLModule.getInlineAsm();
-      std::string Assembly = OriginalAssembly;
-      Assembly.append(UnwindAnchor);
-      LLModule.setInlineAsm(Assembly);
+    OriginalAssembly = LLModule.getInlineAsm();
+    std::string Assembly = OriginalAssembly;
+    Assembly.append(UnwindAnchor);
+    LLModule.setInlineAsm(Assembly);
 #if LLVM_VERSION_MAJOR >= 15
-      TargetMachine->Options.MCOptions.EmitDwarfUnwind =
-          llvm::EmitDwarfUnwindType::Always;
+    TargetMachine->Options.MCOptions.EmitDwarfUnwind =
+        llvm::EmitDwarfUnwindType::Always;
 #endif
-    }
 #endif
     auto [OSVec, ErrorMessage] =
         TM.emitToMemoryBuffer(LLModule, LLVMObjectFile);
 #if WASMEDGE_OS_MACOS
-    if (Universal) {
-      LLModule.setInlineAsm(OriginalAssembly);
+    LLModule.setInlineAsm(OriginalAssembly);
 #if LLVM_VERSION_MAJOR >= 15
-      TargetMachine->Options.MCOptions.EmitDwarfUnwind = OriginalDwarfUnwind;
+    TargetMachine->Options.MCOptions.EmitDwarfUnwind = OriginalDwarfUnwind;
 #endif
-    }
 #endif
     if (ErrorMessage) {
       // TODO:return error

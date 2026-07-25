@@ -62,8 +62,16 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
   for (const auto &Rel : Graph.relocations()) {
     auto &Bytes = Result.Content[Rel.Section];
     const auto &Symbol = Graph.symbols()[Rel.Symbol];
+    int64_t Addend = Rel.Addend;
+    if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::MachO &&
+        Rel.Type == llvm::MachO::ARM64_RELOC_UNSIGNED) {
+      auto Value = readUnsigned(Bytes, Rel.Offset, 8, Endianness::Little);
+      if (!Value || *Value > INT64_MAX)
+        return fail(Rel, "cannot decode implicit addend");
+      Addend = static_cast<int64_t>(*Value);
+    }
     const int128_t S = int128_t(Graph.sections()[Symbol.Section].Address) +
-                       Symbol.Offset + Rel.Addend;
+                       Symbol.Offset + Addend;
     const int128_t P =
         int128_t(Graph.sections()[Rel.Section].Address) + Rel.Offset;
     if (Rel.Format == ObjectFormat::COFF &&
@@ -75,8 +83,10 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       }
       continue;
     }
-    if (Rel.Format == ObjectFormat::ELF &&
-        Rel.Type == llvm::ELF::R_AARCH64_ABS64) {
+    if ((Rel.Format == ObjectFormat::ELF &&
+         Rel.Type == llvm::ELF::R_AARCH64_ABS64) ||
+        (Rel.Format == ObjectFormat::MachO &&
+         Rel.Type == llvm::MachO::ARM64_RELOC_UNSIGNED)) {
       constexpr uint8_t DoubleWordWidth = 8;
       if (S < 0 || S > UINT64_MAX ||
           !writeUnsigned(Bytes, Rel.Offset, DoubleWordWidth, Endianness::Little,
@@ -87,8 +97,8 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
                            DoubleWordWidth)) {
         return fail(Rel, "overlapping generated rebase");
       }
-      Result.Rebases.push_back(Rebase{Rel.Section, Rel.Offset, Rel.Type,
-                                      Rel.Addend, DoubleWordWidth});
+      Result.Rebases.push_back(Rebase{Rel.Section, Rel.Offset, Rel.Type, Addend,
+                                      DoubleWordWidth, Rel.Format});
       continue;
     }
     if (Rel.Format == ObjectFormat::ELF &&

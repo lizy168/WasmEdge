@@ -8,6 +8,7 @@
 #include "linker/eh_frame.h"
 #include "linker/elf_writer.h"
 #include "linker/layout.h"
+#include "linker/macho_writer.h"
 #include "linker/object_reader.h"
 #include "linker/relocation.h"
 #include "linker/universal_wasm_writer.h"
@@ -19,10 +20,15 @@
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/FileSystem.h>
 
+#include <array>
 #include <optional>
 #include <stdexcept>
 #if !WASMEDGE_OS_WINDOWS
+#include <cerrno>
+#include <spawn.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+extern char **environ;
 #endif
 
 namespace WasmEdge {
@@ -110,6 +116,44 @@ private:
 
 } // namespace
 
+Expect<void>
+Internal::signMachO(const std::filesystem::path &Path,
+                    const std::filesystem::path &Executable) noexcept {
+#if WASMEDGE_OS_WINDOWS
+  static_cast<void>(Path);
+  static_cast<void>(Executable);
+  return linkError();
+#else
+  try {
+    const auto Program = Executable.string();
+    const auto File = Path.string();
+    const std::array<std::array<const char *, 6>, 2> Arguments{{
+        {Program.c_str(), "--force", "--sign", "-", File.c_str(), nullptr},
+        {Program.c_str(), "--verify", "--strict", "--verbose=2", File.c_str(),
+         nullptr},
+    }};
+    for (const auto &Values : Arguments) {
+      pid_t Child = -1;
+      const int SpawnResult =
+          ::posix_spawn(&Child, Program.c_str(), nullptr, nullptr,
+                        const_cast<char *const *>(Values.data()), environ);
+      if (SpawnResult != 0)
+        return linkError();
+      int Status = 0;
+      while (::waitpid(Child, &Status, 0) == -1) {
+        if (errno != EINTR)
+          return linkError();
+      }
+      if (!WIFEXITED(Status) || WEXITSTATUS(Status) != 0)
+        return linkError();
+    }
+    return {};
+  } catch (...) {
+    return linkError();
+  }
+#endif
+}
+
 Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
                                 const std::filesystem::path &Output,
                                 OutputKind Kind) noexcept {
@@ -119,6 +163,9 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     }
 #if WASMEDGE_OS_LINUX
     if (Kind != OutputKind::UniversalWasm && Kind != OutputKind::ELF)
+      return linkError();
+#elif WASMEDGE_OS_MACOS
+    if (Kind != OutputKind::UniversalWasm && Kind != OutputKind::MachO)
       return linkError();
 #else
     if (Kind != OutputKind::UniversalWasm)
@@ -135,7 +182,8 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
       return linkError();
     EXPECTED_TRY(auto Graph,
                  ObjectReader::read(Object, *TargetValue,
-                                    Kind == OutputKind::UniversalWasm
+                                    Kind == OutputKind::UniversalWasm ||
+                                            Kind == OutputKind::MachO
                                         ? ObjectReaderPolicy::Universal
                                         : ObjectReaderPolicy::Default));
     if (Graph.format() != hostFormat())
@@ -148,7 +196,11 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     if (Kind == OutputKind::ELF && !ELFWriter::layout(Graph)) {
       return linkError();
     }
-    if (Kind != OutputKind::ELF && !layout(Graph, 0, HostPageSize)) {
+    if (Kind == OutputKind::MachO && !MachOWriter::layout(Graph)) {
+      return linkError();
+    }
+    if (Kind != OutputKind::ELF && Kind != OutputKind::MachO &&
+        !layout(Graph, 0, HostPageSize)) {
       return linkError();
     }
     if (Graph.format() == ObjectFormat::MachO) {
@@ -165,12 +217,20 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
         ::fchmod(Temp.File, DestinationStat.st_mode & 07777) != 0)
       return linkError();
 #endif
-    Writer OutputWriter(Guard.release());
-    if (Kind == OutputKind::ELF) {
-      EXPECTED_TRY(ELFWriter::write(Graph, OutputWriter));
-    } else {
-      EXPECTED_TRY(UniversalWasmWriter::write(Graph, Wasm, OutputWriter));
+    {
+      Writer OutputWriter(Guard.release());
+      if (Kind == OutputKind::ELF) {
+        EXPECTED_TRY(ELFWriter::write(Graph, OutputWriter));
+      } else if (Kind == OutputKind::MachO) {
+        EXPECTED_TRY(MachOWriter::write(Graph, OutputWriter));
+      } else {
+        EXPECTED_TRY(UniversalWasmWriter::write(Graph, Wasm, OutputWriter));
+      }
     }
+#if WASMEDGE_OS_MACOS
+    if (Kind == OutputKind::MachO)
+      EXPECTED_TRY(Internal::signMachO(Guard.path(), "/usr/bin/codesign"));
+#endif
 #if WASMEDGE_OS_WINDOWS
     if (!winapi::MoveFileExW(Guard.path().c_str(), Output.c_str(),
                              winapi::MOVEFILE_REPLACE_EXISTING_)) {
