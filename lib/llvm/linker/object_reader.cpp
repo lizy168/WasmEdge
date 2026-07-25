@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -610,7 +611,8 @@ parseCOFFExports(std::string_view Input) {
 
 Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
                                      Target ExpectedTarget,
-                                     ObjectReaderPolicy Policy) {
+                                     ObjectReaderPolicy Policy,
+                                     ObjectReaderInputPolicy InputPolicy) {
   if (Buffer.empty()) {
     return fail<LinkGraph>("empty object buffer");
   }
@@ -734,6 +736,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
   }
 
   std::map<llvm::object::DataRefImpl, SymbolId> SymbolIds;
+  std::set<llvm::object::DataRefImpl> IgnorableUndefinedSymbols;
   std::map<llvm::object::DataRefImpl, uint64_t> SymbolSizes;
   for (const auto &[InputSymbol, Size] :
        llvm::object::computeSymbolSizes(Object)) {
@@ -751,6 +754,14 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     if ((Flags & llvm::object::SymbolRef::SF_Undefined) != 0) {
       if (!Name.empty() && Type != llvm::object::SymbolRef::ST_File &&
           Type != llvm::object::SymbolRef::ST_Debug) {
+        if (InputPolicy ==
+                ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused &&
+            Object.isCOFF() && Name == "_fltused" &&
+            (*ActualTarget == Target::X86_64 ||
+             *ActualTarget == Target::AArch64)) {
+          IgnorableUndefinedSymbols.insert(InputSymbol.getRawDataRefImpl());
+          continue;
+        }
         spdlog::error("object reader: undefined symbol '{}'"sv, Name);
         return Unexpect(ErrCode::Value::IllegalPath);
       }
@@ -819,6 +830,18 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       return fail<LinkGraph>(Added.error().Message);
     }
     SymbolIds.emplace(InputSymbol.getRawDataRefImpl(), *Added);
+  }
+
+  if (!IgnorableUndefinedSymbols.empty()) {
+    for (const auto &InputSection : Object.sections()) {
+      for (const auto &InputRelocation : InputSection.relocations()) {
+        const auto InputSymbol = InputRelocation.getSymbol();
+        if (InputSymbol != Object.symbol_end() &&
+            IgnorableUndefinedSymbols.count(InputSymbol->getRawDataRefImpl()) !=
+                0)
+          return fail<LinkGraph>("relocation targets MSVC CRT marker");
+      }
+    }
   }
 
   for (const auto &InputSection : Object.sections()) {

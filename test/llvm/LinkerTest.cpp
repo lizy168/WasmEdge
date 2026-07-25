@@ -191,15 +191,17 @@ bool expectedELFPCRelative(Target Architecture, uint32_t Type) {
   }
 }
 
-std::vector<WasmEdge::Byte> makeObject(
-    const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
-    std::string FunctionName = "f0", std::string Directives = {},
-    bool Hidden = false, bool HiddenData = false, std::string CPU = "generic",
-    std::string Features = {}, bool UnwindTable = false, bool Optimize = false,
-    bool Interruptible = false, bool Atomic = false,
-    bool Representative = false, bool Exceptions = false,
-    std::string ModuleAssembly = {}, bool SemanticSymbols = false,
-    bool TypeWrapper = false, bool FloatingPoint = false) {
+std::vector<WasmEdge::Byte>
+makeObject(const llvm::Triple &Triple, bool Undefined = false,
+           bool DLLExport = false, std::string FunctionName = "f0",
+           std::string Directives = {}, bool Hidden = false,
+           bool HiddenData = false, std::string CPU = "generic",
+           std::string Features = {}, bool UnwindTable = false,
+           bool Optimize = false, bool Interruptible = false,
+           bool Atomic = false, bool Representative = false,
+           bool Exceptions = false, std::string ModuleAssembly = {},
+           bool SemanticSymbols = false, bool TypeWrapper = false,
+           bool FloatingPoint = false, bool DefineFltused = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -250,6 +252,10 @@ std::vector<WasmEdge::Byte> makeObject(
   Module.setDataLayout(Machine->createDataLayout());
   Module.setModuleInlineAsm(ModuleAssembly);
   auto *I32 = llvm::Type::getInt32Ty(Context);
+  if (DefineFltused)
+    new llvm::GlobalVariable(Module, I32, false,
+                             llvm::GlobalValue::ExternalLinkage,
+                             llvm::ConstantInt::get(I32, 0), "_fltused");
   auto *Value = new llvm::GlobalVariable(
       Module, I32, false, llvm::GlobalValue::ExternalLinkage,
       Undefined ? nullptr : llvm::ConstantInt::get(I32, 7), "value");
@@ -4461,6 +4467,17 @@ TEST(PEWriterTest, LinksGeneratedWindowsObjects) {
     const auto *PE = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Image);
     ASSERT_NE(PE, nullptr);
     EXPECT_EQ(PE->import_directory_begin(), PE->import_directory_end());
+    auto Read = [&](size_t Offset, uint8_t Width) {
+      uint64_t Result = 0;
+      for (uint8_t I = 0; I < Width; ++I)
+        Result |= static_cast<uint64_t>(Bytes[Offset + I]) << (I * 8);
+      return Result;
+    };
+    const uint32_t HeaderOffset = static_cast<uint32_t>(Read(0x3C, 4));
+    const size_t Optional = HeaderOffset + 24;
+    EXPECT_EQ(Read(Optional + 16, 4), 0U);
+    for (const size_t Directory : {size_t{1}, size_t{12}})
+      EXPECT_EQ(Read(Optional + 112 + Directory * 8, 8), 0U);
     std::set<std::string> Exports;
     for (const auto &Export : PE->export_directories()) {
       llvm::StringRef Name;
@@ -4468,10 +4485,12 @@ TEST(PEWriterTest, LinksGeneratedWindowsObjects) {
       Exports.emplace(Name.str());
     }
     EXPECT_EQ(Exports, (std::set<std::string>{"f0", "value"}));
+    EXPECT_FALSE(Exports.count("_fltused"));
+    EXPECT_FALSE(Exports.count("_DllMainCRTStartup"));
   }
 }
 
-TEST(PEWriterTest, RejectsCompilerRequiredFltusedImport) {
+TEST(PEWriterTest, DiscardsUnreferencedCompilerRequiredFltusedMarker) {
   const auto Object =
       makeObject(llvm::Triple("x86_64-pc-windows-msvc"), false, false, "f0",
                  "/EXPORT:f0", false, false, "generic", {}, true, true, false,
@@ -4493,6 +4512,162 @@ TEST(PEWriterTest, RejectsCompilerRequiredFltusedImport) {
   }
   EXPECT_TRUE(HasUndefinedFltused);
   EXPECT_FALSE(ObjectReader::read(Object, Target::X86_64));
+  auto Graph =
+      ObjectReader::read(Object, Target::X86_64, ObjectReaderPolicy::Default,
+                         ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused);
+  ASSERT_TRUE(Graph);
+  EXPECT_TRUE(std::none_of(
+      Graph->symbols().begin(), Graph->symbols().end(), [](const auto &Symbol) {
+        return Symbol.Name == "_fltused" || Symbol.Name == "_DllMainCRTStartup";
+      }));
+  const auto ResolvedObject =
+      makeObject(llvm::Triple("x86_64-pc-windows-msvc"), false, false, "f0",
+                 "/EXPORT:f0", false, false, "generic", {}, true, true, false,
+                 false, false, false, {}, false, false, true, true);
+  auto Resolved = ObjectReader::read(ResolvedObject, Target::X86_64);
+  ASSERT_TRUE(Resolved);
+  const auto TextContent = [](const LinkGraph &Value) {
+    std::vector<std::vector<WasmEdge::Byte>> Result;
+    for (const auto &Section : Value.sections())
+      if (Section.Kind == SectionKind::Text)
+        Result.push_back(Section.Content);
+    return Result;
+  };
+  EXPECT_EQ(TextContent(*Graph), TextContent(*Resolved));
+  const auto RealSymbols = [](const LinkGraph &Value) {
+    std::set<std::string> Result;
+    for (const auto &Symbol : Value.symbols())
+      if (Symbol.Name != "_fltused")
+        Result.emplace(Symbol.Name);
+    return Result;
+  };
+  EXPECT_EQ(RealSymbols(*Graph), RealSymbols(*Resolved));
+  ASSERT_EQ(Graph->relocations().size(), Resolved->relocations().size());
+  for (size_t I = 0; I < Graph->relocations().size(); ++I) {
+    const auto &Left = Graph->relocations()[I];
+    const auto &Right = Resolved->relocations()[I];
+    EXPECT_EQ(Left.Section, Right.Section);
+    EXPECT_EQ(Left.Offset, Right.Offset);
+    EXPECT_EQ(Left.Type, Right.Type);
+    EXPECT_EQ(Left.Addend, Right.Addend);
+    EXPECT_EQ(Graph->symbols()[Left.Symbol].Name,
+              Resolved->symbols()[Right.Symbol].Name);
+  }
+  ASSERT_TRUE(PEWriter::layout(*Graph));
+  ASSERT_TRUE(applyRelocations(*Graph));
+  EXPECT_TRUE(std::none_of(Graph->relocations().begin(),
+                           Graph->relocations().end(), [&](const auto &Rel) {
+                             return Graph->symbols()[Rel.Symbol].Name ==
+                                    "_fltused";
+                           }));
+  std::vector<WasmEdge::Byte> ImageBytes;
+  Writer ImageWriter(ImageBytes);
+  ASSERT_TRUE(PEWriter::write(*Graph, "floating.dll", ImageWriter));
+  auto Image = llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+      llvm::StringRef(reinterpret_cast<const char *>(ImageBytes.data()),
+                      ImageBytes.size()),
+      "floating.dll"));
+  ASSERT_TRUE(static_cast<bool>(Image));
+  const auto *PE = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Image);
+  ASSERT_NE(PE, nullptr);
+  EXPECT_EQ(PE->getPE32PlusHeader()->AddressOfEntryPoint, 0U);
+  EXPECT_EQ(PE->import_directory_begin(), PE->import_directory_end());
+  auto Read = [&](size_t Offset, uint8_t Width) {
+    uint64_t Result = 0;
+    for (uint8_t I = 0; I < Width; ++I)
+      Result |= static_cast<uint64_t>(ImageBytes[Offset + I]) << (I * 8);
+    return Result;
+  };
+  const uint32_t PEOffset = static_cast<uint32_t>(Read(0x3C, 4));
+  const size_t Optional = PEOffset + 24;
+  for (const size_t Directory : {size_t{1}, size_t{12}})
+    EXPECT_EQ(Read(Optional + 112 + Directory * 8, 8), 0U);
+  std::set<std::string> Exports;
+  for (const auto &Export : PE->export_directories()) {
+    llvm::StringRef Name;
+    ASSERT_FALSE(Export.getSymbolName(Name));
+    Exports.emplace(Name.str());
+  }
+  EXPECT_EQ(Exports, (std::set<std::string>{"f0"}));
+}
+
+TEST(ObjectReaderTest, AppliesMSVCFltusedPolicyOnlyToUnreferencedCOFFMarkers) {
+  constexpr std::string_view Marker = R"(
+.def _fltused;
+.scl 2;
+.type 0;
+.endef
+)";
+  for (const auto &[Triple, Architecture] :
+       std::array<std::pair<const char *, Target>, 2>{{
+           {"x86_64-pc-windows-msvc", Target::X86_64},
+           {"aarch64-pc-windows-msvc", Target::AArch64},
+       }}) {
+    const auto Object = makeObject(
+        llvm::Triple(Triple), false, false, "f0", {}, false, false, "generic",
+        {}, false, false, false, false, false, false, std::string(Marker));
+    EXPECT_FALSE(ObjectReader::read(Object, Architecture)) << Triple;
+    auto Graph = ObjectReader::read(
+        Object, Architecture, ObjectReaderPolicy::Default,
+        ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused);
+    ASSERT_TRUE(Graph) << Triple;
+    EXPECT_TRUE(std::none_of(
+        Graph->symbols().begin(), Graph->symbols().end(),
+        [](const auto &Symbol) { return Symbol.Name == "_fltused"; }));
+  }
+
+  constexpr std::string_view Referenced = R"(
+.data
+.p2align 3
+.quad _fltused
+)";
+  for (const auto &[Triple, Architecture] :
+       std::array<std::pair<const char *, Target>, 2>{{
+           {"x86_64-pc-windows-msvc", Target::X86_64},
+           {"aarch64-pc-windows-msvc", Target::AArch64},
+       }}) {
+    const auto Object =
+        makeObject(llvm::Triple(Triple), false, false, "f0", {}, false, false,
+                   "generic", {}, false, false, false, false, false, false,
+                   std::string(Marker) + std::string(Referenced));
+    EXPECT_FALSE(ObjectReader::read(
+        Object, Architecture, ObjectReaderPolicy::Default,
+        ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused))
+        << Triple;
+  }
+
+  const auto ELF =
+      makeObject(llvm::Triple("x86_64-unknown-linux-gnu"), false, false, "f0",
+                 {}, false, false, "generic", {}, false, false, false, false,
+                 false, false, ".globl _fltused\n.quad _fltused\n");
+  EXPECT_FALSE(ObjectReader::read(
+      ELF, Target::X86_64, ObjectReaderPolicy::Default,
+      ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+
+  const auto OtherUndefined =
+      makeObject(llvm::Triple("x86_64-pc-windows-msvc"), true);
+  EXPECT_FALSE(ObjectReader::read(
+      OtherUndefined, Target::X86_64, ObjectReaderPolicy::Default,
+      ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+
+  const auto ARM64FP =
+      makeObject(llvm::Triple("aarch64-pc-windows-msvc"), false, false, "f0",
+                 {}, false, false, "generic", {}, true, true, false, false,
+                 false, false, {}, false, false, true);
+  auto ParsedARM64 =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(ARM64FP.data()),
+                          ARM64FP.size()),
+          "arm64-floating.obj"));
+  ASSERT_TRUE(static_cast<bool>(ParsedARM64));
+  for (const auto &Symbol : (*ParsedARM64)->symbols()) {
+    auto Name = Symbol.getName();
+    ASSERT_TRUE(static_cast<bool>(Name));
+    EXPECT_NE(*Name, "_fltused");
+  }
+  EXPECT_TRUE(ObjectReader::read(
+      ARM64FP, Target::AArch64, ObjectReaderPolicy::Default,
+      ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
 }
 
 TEST(EHFrameTest, RequiresTypeWrapperCoverage) {

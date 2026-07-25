@@ -215,12 +215,19 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     Loader::Loader WasmLoader(Conf);
     if (!WasmLoader.parseModule(Wasm))
       return linkError();
+#if WASMEDGE_OS_WINDOWS
+    constexpr auto InputPolicy =
+        ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused;
+#else
+    constexpr auto InputPolicy = ObjectReaderInputPolicy::Strict;
+#endif
     EXPECTED_TRY(auto Graph,
                  ObjectReader::read(Object, *TargetValue,
                                     Kind == OutputKind::UniversalWasm ||
                                             Kind == OutputKind::MachO
                                         ? ObjectReaderPolicy::Universal
-                                        : ObjectReaderPolicy::Default));
+                                        : ObjectReaderPolicy::Default,
+                                    InputPolicy));
     if (Graph.format() != hostFormat())
       return linkError();
 #if WASMEDGE_OS_MACOS && defined(__aarch64__)

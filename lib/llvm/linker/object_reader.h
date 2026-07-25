@@ -22,6 +22,11 @@ enum class ObjectReaderPolicy : uint8_t {
   Universal,
 };
 
+enum class ObjectReaderInputPolicy : uint8_t {
+  Strict,
+  AllowUnreferencedMSVCFltused,
+};
+
 namespace Internal {
 
 uint64_t normalizeSectionAlignment(uint64_t Alignment) noexcept;
@@ -36,7 +41,8 @@ class ObjectReader {
 public:
   static Expect<LinkGraph>
   read(Span<const Byte> Buffer, Target ExpectedTarget,
-       ObjectReaderPolicy Policy = ObjectReaderPolicy::Default);
+       ObjectReaderPolicy Policy = ObjectReaderPolicy::Default,
+       ObjectReaderInputPolicy InputPolicy = ObjectReaderInputPolicy::Strict);
 };
 
 } // namespace Linker
