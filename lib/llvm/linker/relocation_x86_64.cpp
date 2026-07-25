@@ -160,15 +160,19 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
                 RelocationValue.Type == llvm::MachO::X86_64_RELOC_SIGNED_4 ||
                 RelocationValue.Type == llvm::MachO::X86_64_RELOC_BRANCH)) {
       Width = WordWidth;
+      FormatAdjustment = -static_cast<int64_t>(WordWidth);
       switch (RelocationValue.Type) {
       case llvm::MachO::X86_64_RELOC_SIGNED_1:
-        FormatAdjustment = -1;
+        if (!RelocationValue.AddendIsImplicit)
+          FormatAdjustment -= 1;
         break;
       case llvm::MachO::X86_64_RELOC_SIGNED_2:
-        FormatAdjustment = -2;
+        if (!RelocationValue.AddendIsImplicit)
+          FormatAdjustment -= 2;
         break;
       case llvm::MachO::X86_64_RELOC_SIGNED_4:
-        FormatAdjustment = -4;
+        if (!RelocationValue.AddendIsImplicit)
+          FormatAdjustment -= 4;
         break;
       default:
         break;

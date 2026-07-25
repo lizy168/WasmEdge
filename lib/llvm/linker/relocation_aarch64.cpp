@@ -65,10 +65,10 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
     int64_t Addend = Rel.Addend;
     if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::MachO &&
         Rel.Type == llvm::MachO::ARM64_RELOC_UNSIGNED) {
-      auto Value = readUnsigned(Bytes, Rel.Offset, 8, Endianness::Little);
-      if (!Value || *Value > INT64_MAX)
+      auto Value = readSigned(Bytes, Rel.Offset, 8, Endianness::Little);
+      if (!Value)
         return fail(Rel, "cannot decode implicit addend");
-      Addend = static_cast<int64_t>(*Value);
+      Addend = *Value;
     }
     const int128_t S = int128_t(Graph.sections()[Symbol.Section].Address) +
                        Symbol.Offset + Addend;
@@ -195,10 +195,16 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       Low12Encoding Encoding{};
       if (Rel.Format == ObjectFormat::MachO &&
           Rel.Type == llvm::MachO::ARM64_RELOC_PAGEOFF12) {
-        Encoding = {(Instruction & UINT32_C(0x3B000000)) == UINT32_C(0x39000000)
-                        ? static_cast<Low12Scale>((Instruction >> 30) & 3)
-                        : Low12Scale::Byte,
-                    0, 0};
+        if ((Instruction & UINT32_C(0x3B000000)) == UINT32_C(0x39000000)) {
+          unsigned Scale = (Instruction >> 30) & 3;
+          if (Scale == 0 &&
+              (Instruction & UINT32_C(0x04800000)) == UINT32_C(0x04800000))
+            Scale = 4;
+          Encoding = {static_cast<Low12Scale>(Scale), 0, 0};
+        } else {
+          Encoding = {Low12Scale::Byte, UINT32_C(0x7FC00000),
+                      UINT32_C(0x11000000)};
+        }
       } else if (Rel.Format == ObjectFormat::COFF &&
                  (Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A ||
                   Rel.Type == llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12L)) {

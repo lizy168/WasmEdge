@@ -1398,10 +1398,19 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
 
   auto Library = std::make_shared<WasmEdge::Loader::SharedLibrary>();
   ASSERT_TRUE(Library->load(Output));
-  EXPECT_TRUE(Library->get<uint32_t>("version"));
-  EXPECT_TRUE(Library->get<const WasmEdge::Executable::IntrinsicsTable *>(
-      "intrinsics"));
+  {
+    auto Version = Library->get<uint32_t>("version");
+    auto Intrinsics =
+        Library->get<const WasmEdge::Executable::IntrinsicsTable *>(
+            "intrinsics");
+    auto F0 = Library->get<WasmEdge::Executable::Wrapper>("f0");
+    EXPECT_TRUE(Version);
+    EXPECT_TRUE(Intrinsics);
+    EXPECT_TRUE(F0);
+  }
   EXPECT_EQ(execute(Output), 7U);
+  Library->unload();
+  EXPECT_FALSE(Library->get<uint32_t>("version"));
 }
 #endif
 
@@ -2624,6 +2633,115 @@ TEST(RelocationTest, AppliesExplicitAndImplicitPC32AndPLT32) {
   }
 }
 
+TEST(RelocationTest, AppliesMachOSignedSuffixBiasExactly) {
+  struct Case {
+    uint32_t Type;
+    int64_t Suffix;
+  };
+  const std::array<Case, 4> Cases{{
+      {llvm::MachO::X86_64_RELOC_SIGNED, 0},
+      {llvm::MachO::X86_64_RELOC_SIGNED_1, 1},
+      {llvm::MachO::X86_64_RELOC_SIGNED_2, 2},
+      {llvm::MachO::X86_64_RELOC_SIGNED_4, 4},
+  }};
+  for (const auto &Test : Cases) {
+    for (const uint64_t Target : {UINT64_C(0x1100), UINT64_C(0x0F00)}) {
+      LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::MachO);
+      ASSERT_TRUE(Graph.beginInput("signed.o"));
+      auto Patch = Graph.addSection(
+          Section{"__text", SectionKind::Text, 1, 4, 0x1000, 0, {0, 0, 0, 0}});
+      auto TargetSection = Graph.addSection(
+          Section{"__target", SectionKind::Text, 1, 1, Target, 0, {0}});
+      ASSERT_TRUE(Patch && TargetSection);
+      auto TargetSymbol =
+          Graph.addSymbol(Symbol{"_target", *TargetSection, 0, 1, false});
+      ASSERT_TRUE(TargetSymbol);
+      ASSERT_TRUE(Internal::writeSigned(*Graph.sectionContent(*Patch), 0, 4,
+                                        Endianness::Little, 0));
+      ASSERT_TRUE(Graph.addRelocation(
+          Relocation{*Patch, 0, Test.Type, *TargetSymbol, 0, true,
+                     ObjectFormat::MachO, 4, true, false, false}));
+      ASSERT_TRUE(applyRelocations(Graph));
+      auto Value = Internal::readSigned(Graph.sections()[*Patch].Content, 0, 4,
+                                        Endianness::Little);
+      ASSERT_TRUE(Value);
+      EXPECT_EQ(*Value, static_cast<int64_t>(Target) - 0x1000 - 4)
+          << Test.Suffix;
+
+      LinkGraph Explicit(Target::X86_64, Endianness::Little,
+                         ObjectFormat::MachO);
+      ASSERT_TRUE(Explicit.beginInput("explicit-signed.o"));
+      auto ExplicitPatch = Explicit.addSection(
+          Section{"__text", SectionKind::Text, 1, 4, 0x1000, 0, {0, 0, 0, 0}});
+      auto ExplicitTarget = Explicit.addSection(
+          Section{"__target", SectionKind::Text, 1, 1, Target, 0, {0}});
+      ASSERT_TRUE(ExplicitPatch && ExplicitTarget);
+      auto ExplicitSymbol =
+          Explicit.addSymbol(Symbol{"_target", *ExplicitTarget, 0, 1, false});
+      ASSERT_TRUE(ExplicitSymbol);
+      ASSERT_TRUE(Explicit.addRelocation(
+          Relocation{*ExplicitPatch, 0, Test.Type, *ExplicitSymbol, 7, false,
+                     ObjectFormat::MachO, 4, true, false, false}));
+      ASSERT_TRUE(applyRelocations(Explicit));
+      auto ExplicitValue =
+          Internal::readSigned(Explicit.sections()[*ExplicitPatch].Content, 0,
+                               4, Endianness::Little);
+      ASSERT_TRUE(ExplicitValue);
+      EXPECT_EQ(*ExplicitValue,
+                static_cast<int64_t>(Target) + 7 - 0x1000 - 4 - Test.Suffix);
+    }
+  }
+}
+
+TEST(RelocationTest, RelocatesGeneratedMachOSignedSuffixExactly) {
+  const auto Original = makeObject(llvm::Triple("x86_64-apple-macosx"));
+  auto Parsed =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Original.data()),
+                          Original.size()),
+          "signed.o"));
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Parsed);
+  ASSERT_NE(MachO, nullptr);
+  size_t RelocationOffset = 0;
+  for (const auto &Section : MachO->sections()) {
+    if (Section.relocation_begin() == Section.relocation_end())
+      continue;
+    const auto Ref = Section.relocation_begin()->getRawDataRefImpl();
+    llvm::object::DataRefImpl SectionRef;
+    SectionRef.d.a = Ref.d.a;
+    RelocationOffset = MachO->getSection64(SectionRef).reloff + Ref.d.b * 8;
+    break;
+  }
+  ASSERT_NE(RelocationOffset, 0U);
+  for (const uint32_t Type :
+       {llvm::MachO::X86_64_RELOC_SIGNED_1, llvm::MachO::X86_64_RELOC_SIGNED_2,
+        llvm::MachO::X86_64_RELOC_SIGNED_4}) {
+    auto Object = Original;
+    uint32_t Word = 0;
+    std::memcpy(&Word, Object.data() + RelocationOffset + 4, sizeof(Word));
+    Word = (Word & UINT32_C(0x0FFFFFFF)) | (Type << 28);
+    std::memcpy(Object.data() + RelocationOffset + 4, &Word, sizeof(Word));
+    auto Graph = ObjectReader::read(Object, Target::X86_64);
+    ASSERT_TRUE(Graph) << Type;
+    ASSERT_EQ(Graph->relocations().size(), 1U);
+    EXPECT_EQ(Graph->relocations()[0].Type, Type);
+    ASSERT_TRUE(layout(*Graph, 0, 4096));
+    const auto Relocation = Graph->relocations()[0];
+    ASSERT_TRUE(applyRelocations(*Graph));
+    const auto &Symbol = Graph->symbols()[Relocation.Symbol];
+    const uint64_t S =
+        Graph->sections()[Symbol.Section].Address + Symbol.Offset;
+    const uint64_t P =
+        Graph->sections()[Relocation.Section].Address + Relocation.Offset;
+    auto Value =
+        Internal::readSigned(Graph->sections()[Relocation.Section].Content,
+                             Relocation.Offset, 4, Endianness::Little);
+    ASSERT_TRUE(Value);
+    EXPECT_EQ(*Value, static_cast<int64_t>(S) - static_cast<int64_t>(P) - 4);
+  }
+}
+
 TEST(RelocationTest, DecodesImplicitAddendForX86_64Absolute) {
   auto Graph = makeRelocationGraph(1, 0, true);
   auto Content = Graph.sectionContent(0);
@@ -2843,8 +2961,9 @@ LinkGraph makeELFRelocationGraph(
     Target Architecture, Endianness Endian, uint32_t Type, uint8_t Width,
     uint64_t TargetAddress, uint64_t PatchAddress = 0x1000, uint64_t Offset = 0,
     int64_t Addend = 0, bool Implicit = false,
-    std::vector<WasmEdge::Byte> Bytes = std::vector<WasmEdge::Byte>(16)) {
-  LinkGraph Graph(Architecture, Endian);
+    std::vector<WasmEdge::Byte> Bytes = std::vector<WasmEdge::Byte>(16),
+    ObjectFormat Format = ObjectFormat::ELF) {
+  LinkGraph Graph(Architecture, Endian, Format);
   EXPECT_TRUE(Graph.beginInput("input.o"));
   auto Patch =
       Graph.addSection(Section{".text", SectionKind::Text, 4, Bytes.size(),
@@ -2855,9 +2974,8 @@ LinkGraph makeELFRelocationGraph(
   auto TargetSymbol =
       Graph.addSymbol(Symbol{"target", *TargetSection, 0, 1, false});
   EXPECT_TRUE(TargetSymbol);
-  EXPECT_TRUE(Graph.addRelocation(Relocation{*Patch, Offset, Type,
-                                             *TargetSymbol, Addend, Implicit,
-                                             ObjectFormat::ELF, Width}));
+  EXPECT_TRUE(Graph.addRelocation(Relocation{
+      *Patch, Offset, Type, *TargetSymbol, Addend, Implicit, Format, Width}));
   return Graph;
 }
 
@@ -3155,6 +3273,72 @@ TEST(AArch64RelocationTest, EncodesPageAndScaledLow12Relocations) {
     EXPECT_EQ(static_cast<bool>(Result), Test.Accepted);
     if (Test.Accepted) {
       EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 4,
+                                        Endianness::Little),
+                Test.Expected);
+    }
+  }
+}
+
+TEST(AArch64RelocationTest, EncodesMachOPageOff12InstructionClasses) {
+  struct Case {
+    uint32_t Instruction;
+    uint64_t Address;
+    uint32_t Expected;
+    bool Accepted;
+  };
+  const std::array<Case, 8> Cases{{
+      {0x39000000, 0x1ABC, 0x392AF000, true},
+      {0x79000000, 0x1ABC, 0x79157800, true},
+      {0xB9000000, 0x1ABC, 0xB90ABC00, true},
+      {0xF9000000, 0x1AB8, 0xF9055C00, true},
+      {0x3D800000, 0x1AB0, 0x3D82AC00, true},
+      {0xF9000000, 0x1ABC, 0, false},
+      {0x3D800000, 0x1AB8, 0, false},
+      {0xD503201F, 0x1ABC, 0, false},
+  }};
+  for (const auto &Test : Cases) {
+    std::vector<WasmEdge::Byte> Bytes(16);
+    ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                        Test.Instruction));
+    auto Graph = makeELFRelocationGraph(Target::AArch64, Endianness::Little,
+                                        llvm::MachO::ARM64_RELOC_PAGEOFF12, 4,
+                                        Test.Address, 0x1000, 0, 0, false,
+                                        std::move(Bytes), ObjectFormat::MachO);
+    auto Result = applyRelocations(Graph);
+    EXPECT_EQ(static_cast<bool>(Result), Test.Accepted);
+    if (Test.Accepted) {
+      EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 4,
+                                        Endianness::Little),
+                Test.Expected);
+    }
+  }
+}
+
+TEST(AArch64RelocationTest, AppliesSignedMachOUnsignedImplicitAddends) {
+  struct Case {
+    uint64_t Target;
+    int64_t Addend;
+    bool Accepted;
+    uint64_t Expected;
+  };
+  const std::array<Case, 4> Cases{{
+      {0x2000, -1, true, 0x1FFF},
+      {UINT64_C(0x8000000000001000), INT64_MIN, true, 0x1000},
+      {0, -1, false, 0},
+      {UINT64_MAX, 1, false, 0},
+  }};
+  for (const auto &Test : Cases) {
+    std::vector<WasmEdge::Byte> Bytes(16);
+    ASSERT_TRUE(
+        Internal::writeSigned(Bytes, 0, 8, Endianness::Little, Test.Addend));
+    auto Graph = makeELFRelocationGraph(
+        Target::AArch64, Endianness::Little, llvm::MachO::ARM64_RELOC_UNSIGNED,
+        8, Test.Target, 0x1000, 0, Test.Addend == 1 ? 1 : 0, Test.Addend != 1,
+        std::move(Bytes), ObjectFormat::MachO);
+    auto Result = applyRelocations(Graph);
+    EXPECT_EQ(static_cast<bool>(Result), Test.Accepted);
+    if (Test.Accepted) {
+      EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 8,
                                         Endianness::Little),
                 Test.Expected);
     }
@@ -3943,8 +4127,7 @@ TEST(RelocationTest, ReadsLayoutsAndRelocatesCurrentMachOAndCOFFForms) {
         Internal::readSigned(Graph->sections()[Relocation.Section].Content,
                              Relocation.Offset, 4, Endianness::Little);
     ASSERT_TRUE(After);
-    EXPECT_EQ(*After,
-              S + *Before - P + (Test.Format == ObjectFormat::COFF ? -4 : 0));
+    EXPECT_EQ(*After, S + *Before - P - 4);
   }
 }
 

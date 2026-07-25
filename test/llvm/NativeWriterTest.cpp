@@ -12,6 +12,7 @@
 #include <llvm/BinaryFormat/MachO.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBufferRef.h>
 
 #include <array>
@@ -1319,24 +1320,33 @@ TEST(MachOWriterTest, BoundsSectionOrdinalsAtomically) {
 
 #if !WASMEDGE_OS_WINDOWS
 TEST(MachOWriterTest, PublishesOnlyAfterSigningAndVerification) {
-  const auto Root = std::filesystem::temp_directory_path() /
-                    ("wasmedge-macho-sign-" + std::to_string(::getpid()));
-  std::filesystem::create_directories(Root);
-  const auto Helper = Root / "sign helper";
+  llvm::SmallString<128> UniqueRoot;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("wasmedge-macho-sign", UniqueRoot));
+  const auto Root = std::filesystem::u8path(UniqueRoot.str().str());
+  struct Cleanup {
+    std::filesystem::path Root;
+    ~Cleanup() {
+      std::error_code Error;
+      std::filesystem::remove_all(Root, Error);
+    }
+  } CleanupGuard{Root};
   const auto Log = Root / "order.log";
-  {
-    std::ofstream Script(Helper);
+  auto MakeHelper = [&](std::string_view Name, std::string_view Action) {
+    const auto Path = Root / Name;
+    std::ofstream Script(Path);
     Script << "#!/bin/sh\n"
-              "printf '%s\\n' \"$1\" >> \"$WASMEDGE_SIGN_LOG\"\n"
-              "case \"$WASMEDGE_SIGN_MODE:$1\" in\n"
-              "signal:--force) kill -TERM $$ ;;\n"
-              "sign-fail:--force) exit 7 ;;\n"
-              "verify-fail:--verify) exit 8 ;;\n"
-              "esac\n"
-              "exit 0\n";
-  }
-  ASSERT_EQ(::chmod(Helper.c_str(), 0700), 0);
-  ASSERT_EQ(::setenv("WASMEDGE_SIGN_LOG", Log.c_str(), 1), 0);
+              "printf '%s\\n' \"$1\" >> \""
+           << Log.string() << "\"\n"
+           << Action << "\n";
+    Script.close();
+    EXPECT_TRUE(Script);
+    EXPECT_EQ(::chmod(Path.c_str(), 0700), 0);
+    return Path;
+  };
+  const auto Success = MakeHelper("success helper", "exit 0");
+  const auto Signaled = MakeHelper("signal helper", "kill -TERM $$");
+  const auto Failed = MakeHelper("failure helper", "exit 7");
 
   const auto Destination = Root / "library.dylib";
   const std::vector<WasmEdge::Byte> Existing{1, 2, 3};
@@ -1354,23 +1364,21 @@ TEST(MachOWriterTest, PublishesOnlyAfterSigningAndVerification) {
   Write(Destination, Existing);
 
   struct Case {
-    const char *Mode;
     std::filesystem::path Sign;
     std::filesystem::path Verify;
     const char *LogValue;
   };
   const std::array<Case, 5> Failures{{
-      {"success", Root / "missing", Helper, ""},
-      {"signal", Helper, Helper, "--force\n"},
-      {"sign-fail", Helper, Helper, "--force\n"},
-      {"success", "/bin/false", Helper, ""},
-      {"verify-fail", Helper, Helper, "--force\n--verify\n"},
+      {Root / "missing", Success, ""},
+      {Signaled, Success, "--force\n"},
+      {Failed, Success, "--force\n"},
+      {"/bin/false", Success, ""},
+      {Success, Failed, "--force\n--verify\n"},
   }};
   for (size_t I = 0; I < Failures.size(); ++I) {
     const auto Temporary = Root / ("temporary-" + std::to_string(I));
     Write(Temporary, Replacement);
     std::filesystem::remove(Log);
-    ASSERT_EQ(::setenv("WASMEDGE_SIGN_MODE", Failures[I].Mode, 1), 0);
     EXPECT_FALSE(Internal::publishMachO(Temporary, Destination,
                                         Failures[I].Sign, Failures[I].Verify));
     EXPECT_EQ(Read(Destination), Existing);
@@ -1386,14 +1394,12 @@ TEST(MachOWriterTest, PublishesOnlyAfterSigningAndVerification) {
   const auto Temporary = Root / "temporary-success";
   Write(Temporary, Replacement);
   std::filesystem::remove(Log);
-  ASSERT_EQ(::setenv("WASMEDGE_SIGN_MODE", "success", 1), 0);
-  EXPECT_TRUE(Internal::publishMachO(Temporary, Destination, Helper, Helper));
+  EXPECT_TRUE(Internal::publishMachO(Temporary, Destination, Success, Success));
   EXPECT_EQ(Read(Destination), Replacement);
   EXPECT_FALSE(std::filesystem::exists(Temporary));
   const auto LogBytes = Read(Log);
   EXPECT_EQ(std::string(LogBytes.begin(), LogBytes.end()),
             "--force\n--verify\n");
-  std::filesystem::remove_all(Root);
 }
 #endif
 
