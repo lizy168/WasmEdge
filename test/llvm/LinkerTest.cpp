@@ -4616,6 +4616,12 @@ TEST(ObjectReaderTest, AppliesMSVCFltusedPolicyOnlyToUnreferencedCOFFMarkers) {
         [](const auto &Symbol) { return Symbol.Name == "_fltused"; }));
   }
 
+  const auto GNUCOFF =
+      makeObject(llvm::Triple("x86_64-w64-windows-gnu"), false, false, "f0", {},
+                 false, false, "generic", {}, false, false, false, false, false,
+                 false, std::string(Marker));
+  EXPECT_FALSE(ObjectReader::read(GNUCOFF, Target::X86_64));
+
   constexpr std::string_view Referenced = R"(
 .data
 .p2align 3
@@ -4668,6 +4674,13 @@ TEST(ObjectReaderTest, AppliesMSVCFltusedPolicyOnlyToUnreferencedCOFFMarkers) {
   EXPECT_TRUE(ObjectReader::read(
       ARM64FP, Target::AArch64, ObjectReaderPolicy::Default,
       ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+}
+
+TEST(NativeLinkerTest, SelectsCRTMarkerPolicyFromHostABI) {
+  EXPECT_TRUE(Internal::allowUnreferencedMSVCFltused(true, true));
+  EXPECT_FALSE(Internal::allowUnreferencedMSVCFltused(true, false));
+  EXPECT_FALSE(Internal::allowUnreferencedMSVCFltused(false, true));
+  EXPECT_FALSE(Internal::allowUnreferencedMSVCFltused(false, false));
 }
 
 TEST(EHFrameTest, RequiresTypeWrapperCoverage) {

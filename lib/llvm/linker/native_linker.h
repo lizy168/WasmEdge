@@ -15,6 +15,7 @@ namespace LLVM {
 namespace Linker {
 
 namespace Internal {
+bool allowUnreferencedMSVCFltused(bool IsWindows, bool IsMSVC) noexcept;
 Expect<void> signMachO(const std::filesystem::path &Path,
                        const std::filesystem::path &SignExecutable,
                        const std::filesystem::path &VerifyExecutable) noexcept;

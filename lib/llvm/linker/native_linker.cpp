@@ -117,6 +117,11 @@ private:
 
 } // namespace
 
+bool Internal::allowUnreferencedMSVCFltused(bool IsWindows,
+                                            bool IsMSVC) noexcept {
+  return IsWindows && IsMSVC;
+}
+
 Expect<void>
 Internal::signMachO(const std::filesystem::path &Path,
                     const std::filesystem::path &SignExecutable,
@@ -215,12 +220,15 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     Loader::Loader WasmLoader(Conf);
     if (!WasmLoader.parseModule(Wasm))
       return linkError();
-#if WASMEDGE_OS_WINDOWS
-    constexpr auto InputPolicy =
-        ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused;
+#if defined(_MSC_VER)
+    constexpr bool IsMSVC = true;
 #else
-    constexpr auto InputPolicy = ObjectReaderInputPolicy::Strict;
+    constexpr bool IsMSVC = false;
 #endif
+    const auto InputPolicy =
+        Internal::allowUnreferencedMSVCFltused(WASMEDGE_OS_WINDOWS, IsMSVC)
+            ? ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused
+            : ObjectReaderInputPolicy::Strict;
     EXPECTED_TRY(auto Graph,
                  ObjectReader::read(Object, *TargetValue,
                                     Kind == OutputKind::UniversalWasm ||
