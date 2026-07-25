@@ -3101,7 +3101,7 @@ TEST(ARMRelocationTest, EncodesThumbCallBoundariesAndImplicitAddend) {
     int64_t Delta;
     bool Accepted;
   };
-  const std::array<Case, 7> Cases{{
+  const std::array<Case, 6> Cases{{
       {-INT64_C(16777216), true},
       {INT64_C(16777214), true},
       {-INT64_C(16777218), false},
