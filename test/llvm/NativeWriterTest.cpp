@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -1767,6 +1768,58 @@ TEST(MachOWriterTest, BoundsSectionOrdinalsAtomically) {
 }
 
 #if !WASMEDGE_OS_WINDOWS
+TEST(NativeWriterTest, PublishFailurePreservesDestination) {
+  llvm::SmallString<128> UniqueRoot;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("wasmedge-publish-failure",
+                                                    UniqueRoot));
+  const auto Root = std::filesystem::u8path(UniqueRoot.str().str());
+  struct Cleanup {
+    std::filesystem::path Root;
+    ~Cleanup() {
+      std::error_code Error;
+      std::filesystem::remove_all(Root, Error);
+    }
+  } CleanupGuard{Root};
+  const auto Destination = Root / "library.so";
+  const auto Temporary = Root / "library.so.tmp-test";
+  const std::vector<WasmEdge::Byte> Existing{1, 2, 3};
+  const std::vector<WasmEdge::Byte> Replacement{4, 5, 6};
+  auto Write = [](const std::filesystem::path &Path,
+                  const std::vector<WasmEdge::Byte> &Bytes) {
+    std::ofstream File(Path, std::ios_base::binary);
+    File.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+  };
+  auto Read = [](const std::filesystem::path &Path) {
+    std::ifstream File(Path, std::ios_base::binary);
+    return std::vector<WasmEdge::Byte>(std::istreambuf_iterator<char>(File),
+                                       std::istreambuf_iterator<char>());
+  };
+  Write(Destination, Existing);
+  Write(Temporary, Replacement);
+  ASSERT_EQ(::chmod(Destination.c_str(), 0751), 0);
+
+  bool Called = false;
+  EXPECT_FALSE(Internal::publishAtomically(
+      Temporary, Destination,
+      [&](const std::filesystem::path &Path) -> WasmEdge::Expect<void> {
+        Called = true;
+        EXPECT_EQ(Read(Path), Replacement);
+        return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::IllegalPath);
+      }));
+  EXPECT_TRUE(Called);
+  EXPECT_EQ(Read(Destination), Existing);
+  struct stat DestinationStat{};
+  ASSERT_EQ(::stat(Destination.c_str(), &DestinationStat), 0);
+  EXPECT_EQ(DestinationStat.st_mode & 0777, 0751);
+  EXPECT_FALSE(std::filesystem::exists(Temporary));
+  size_t Entries = 0;
+  for (const auto &Entry : std::filesystem::directory_iterator(Root)) {
+    static_cast<void>(Entry);
+    ++Entries;
+  }
+  EXPECT_EQ(Entries, 1U);
+}
+
 TEST(MachOWriterTest, PublishesOnlyAfterSigningAndVerification) {
   llvm::SmallString<128> UniqueRoot;
   ASSERT_FALSE(

@@ -9,12 +9,18 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 
 namespace WasmEdge {
 namespace LLVM {
 namespace Linker {
 
 namespace Internal {
+using BeforePublish =
+    std::function<Expect<void>(const std::filesystem::path &)>;
+Expect<void> publishAtomically(const std::filesystem::path &Temporary,
+                               const std::filesystem::path &Output,
+                               const BeforePublish &Before) noexcept;
 bool allowUnreferencedMSVCFltused(bool IsWindows, bool IsMSVC) noexcept;
 Expect<void> signMachO(const std::filesystem::path &Path,
                        const std::filesystem::path &SignExecutable,

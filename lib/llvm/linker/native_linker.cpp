@@ -122,6 +122,38 @@ bool Internal::allowUnreferencedMSVCFltused(bool IsWindows,
   return IsWindows && IsMSVC;
 }
 
+Expect<void> Internal::publishAtomically(const std::filesystem::path &Temporary,
+                                         const std::filesystem::path &Output,
+                                         const BeforePublish &Before) noexcept {
+  try {
+    struct Guard {
+      const std::filesystem::path &Path;
+      bool Published = false;
+      ~Guard() {
+        if (!Published) {
+          std::error_code Error;
+          std::filesystem::remove(Path, Error);
+        }
+      }
+    } Cleanup{Temporary};
+    EXPECTED_TRY(Before(Temporary));
+#if WASMEDGE_OS_WINDOWS
+    if (!winapi::MoveFileExW(Temporary.c_str(), Output.c_str(),
+                             winapi::MOVEFILE_REPLACE_EXISTING_))
+      return linkError();
+#else
+    std::error_code Error;
+    std::filesystem::rename(Temporary, Output, Error);
+    if (Error)
+      return linkError();
+#endif
+    Cleanup.Published = true;
+    return {};
+  } catch (...) {
+    return linkError();
+  }
+}
+
 Expect<void>
 Internal::signMachO(const std::filesystem::path &Path,
                     const std::filesystem::path &SignExecutable,
@@ -171,27 +203,10 @@ Internal::publishMachO(const std::filesystem::path &Temporary,
                        const std::filesystem::path &Output,
                        const std::filesystem::path &SignExecutable,
                        const std::filesystem::path &VerifyExecutable) noexcept {
-  try {
-    struct Guard {
-      const std::filesystem::path &Path;
-      bool Published = false;
-      ~Guard() {
-        if (!Published) {
-          std::error_code Error;
-          std::filesystem::remove(Path, Error);
-        }
-      }
-    } Cleanup{Temporary};
-    EXPECTED_TRY(signMachO(Temporary, SignExecutable, VerifyExecutable));
-    std::error_code Error;
-    std::filesystem::rename(Temporary, Output, Error);
-    if (Error)
-      return linkError();
-    Cleanup.Published = true;
-    return {};
-  } catch (...) {
-    return linkError();
-  }
+  return publishAtomically(
+      Temporary, Output, [&](const std::filesystem::path &Path) {
+        return signMachO(Path, SignExecutable, VerifyExecutable);
+      });
 }
 
 Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
@@ -291,18 +306,9 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
       return {};
     }
 #endif
-#if WASMEDGE_OS_WINDOWS
-    if (!winapi::MoveFileExW(Guard.path().c_str(), Output.c_str(),
-                             winapi::MOVEFILE_REPLACE_EXISTING_)) {
-      return linkError();
-    }
-#else
-    std::error_code Error;
-    std::filesystem::rename(Guard.path(), Output, Error);
-    if (Error) {
-      return linkError();
-    }
-#endif
+    EXPECTED_TRY(Internal::publishAtomically(
+        Guard.path(), Output,
+        [](const std::filesystem::path &) { return Expect<void>{}; }));
     Guard.publish();
     return {};
   } catch (const std::bad_alloc &) {
