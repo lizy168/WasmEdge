@@ -1273,6 +1273,50 @@ TEST(MachOWriterTest, AppliesMachOAbsolutePointersAsRebases) {
   }
 }
 
+TEST(MachOWriterTest, BoundsSectionOrdinalsAtomically) {
+  auto MakeGraph = [](size_t Count) {
+    LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::MachO);
+    EXPECT_TRUE(Graph.beginInput("many-sections.o"));
+    EXPECT_TRUE(Graph.addSection(Section{"__eh_frame",
+                                         SectionKind::Unwind,
+                                         8,
+                                         4,
+                                         0,
+                                         0,
+                                         {0, 0, 0, 0},
+                                         SectionPurpose::EHFrame}));
+    for (size_t I = 1; I < Count; ++I)
+      EXPECT_TRUE(Graph.addSection(Section{"__text" + std::to_string(I),
+                                           SectionKind::Text,
+                                           1,
+                                           1,
+                                           0,
+                                           0,
+                                           {0xC3}}));
+    return Graph;
+  };
+
+  auto Boundary = MakeGraph(UINT8_MAX);
+  ASSERT_TRUE(MachOWriter::layout(Boundary));
+  ASSERT_TRUE(applyRelocations(Boundary));
+  std::vector<WasmEdge::Byte> BoundaryBytes;
+  Writer BoundaryOutput(BoundaryBytes);
+  EXPECT_TRUE(MachOWriter::write(Boundary, BoundaryOutput));
+
+  auto Overflow = MakeGraph(static_cast<size_t>(UINT8_MAX) + 1);
+  ASSERT_TRUE(MachOWriter::layout(Overflow));
+  ASSERT_TRUE(applyRelocations(Overflow));
+  const std::vector<WasmEdge::Byte> Existing{1, 2, 3};
+  auto Bytes = Existing;
+  Writer Output(Bytes);
+  EXPECT_FALSE(MachOWriter::write(Overflow, Output));
+  EXPECT_EQ(Bytes, Existing);
+  auto SecondBytes = Existing;
+  Writer SecondOutput(SecondBytes);
+  EXPECT_FALSE(MachOWriter::write(Overflow, SecondOutput));
+  EXPECT_EQ(SecondBytes, Existing);
+}
+
 #if !WASMEDGE_OS_WINDOWS
 TEST(MachOWriterTest, PublishesOnlyAfterSigningAndVerification) {
   const auto Root = std::filesystem::temp_directory_path() /

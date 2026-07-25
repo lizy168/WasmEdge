@@ -316,6 +316,10 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
   try {
     if (!supported(Graph) || !Graph.relocationsApplied() || !Graph.validate())
       return fail();
+    if (Graph.sections().size() > UINT8_MAX ||
+        Graph.symbols().size() > UINT32_MAX ||
+        loadCommandSize(Graph) > UINT32_MAX)
+      return fail();
     for (const auto &Value : Graph.rebases())
       if (Value.Format != ObjectFormat::MachO || Value.Width != 8 ||
           Value.Type != (Graph.target() == Target::X86_64
@@ -400,6 +404,12 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
     auto Segments = segments(Graph, LinkEditOffset, FileSize - LinkEditOffset);
     if (!Segments)
       return fail();
+    for (const auto &SegmentValue : *Segments) {
+      if (SegmentValue.Sections.size() > UINT32_MAX ||
+          SegmentValue.Sections.size() >
+              (UINT32_MAX - SegmentCommandSize) / SectionCommandSize)
+        return fail();
+    }
     std::vector<Byte> Bytes(static_cast<size_t>(FileSize));
     put(Bytes, 0, llvm::MachO::MH_MAGIC_64, 4);
     put(Bytes, 4,
@@ -422,7 +432,7 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
 
     uint64_t Command = HeaderSize;
     std::vector<uint8_t> SectionOrdinals(Graph.sections().size());
-    uint8_t Ordinal = 1;
+    uint32_t Ordinal = 1;
     for (const auto &SegmentValue : *Segments) {
       put(Bytes, Command, llvm::MachO::LC_SEGMENT_64, 4);
       put(Bytes, Command + 4,
@@ -448,7 +458,7 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
         put(Bytes, SectionCommand + 52, alignmentPower(SectionValue.Alignment),
             4);
         put(Bytes, SectionCommand + 64, sectionFlags(SectionValue), 4);
-        SectionOrdinals[Id] = Ordinal++;
+        SectionOrdinals[Id] = static_cast<uint8_t>(Ordinal++);
         SectionCommand += SectionCommandSize;
       }
       Command += SegmentCommandSize +
