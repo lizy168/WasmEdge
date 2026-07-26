@@ -471,7 +471,7 @@ size_t elf64RelocationSectionHeader(const std::vector<WasmEdge::Byte> &Bytes) {
     auto Name = Section.getName();
     EXPECT_TRUE(static_cast<bool>(Name));
     if (Name &&
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 16
         (Name->starts_with(".rela") || Name->starts_with(".rel"))) {
 #else
         (Name->startswith(".rela") || Name->startswith(".rel"))) {
@@ -1013,7 +1013,7 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
   std::set<std::string> Sections;
   for (const auto &Section : MachO->sections()) {
     auto Name = Section.getName();
-    ASSERT_TRUE(Name);
+    ASSERT_TRUE(static_cast<bool>(Name));
     Sections.emplace(Name->str());
   }
   EXPECT_TRUE(Sections.count("__eh_frame"));

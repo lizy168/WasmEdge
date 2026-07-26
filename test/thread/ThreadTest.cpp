@@ -276,7 +276,7 @@ TEST(AOTCompile, IndependentCompilersRunConcurrently) {
        0x09, 0x01, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x00, 0x00,
        0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x1d, 0x0b},
   }};
-  constexpr std::array<uint32_t, 2> Answers{11, 29};
+  constexpr std::array<uint32_t, 2> ExpectedValues{11, 29};
   constexpr size_t Iterations = 8;
   TempDirectory Root;
   std::promise<void> Start;
@@ -310,7 +310,7 @@ TEST(AOTCompile, IndependentCompilersRunConcurrently) {
           return false;
         auto Result = VM.execute("value");
         if (!Result || Result->size() != 1 ||
-            (*Result)[0].first.get<uint32_t>() != Answers[Thread])
+            (*Result)[0].first.get<uint32_t>() != ExpectedValues[Thread])
           return false;
         VM.cleanup();
         std::error_code Error;
