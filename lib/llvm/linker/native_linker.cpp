@@ -20,6 +20,7 @@
 
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Process.h>
 
 #include <array>
 #include <optional>
@@ -79,7 +80,7 @@ Expect<TempFile> createUniqueSibling(const std::filesystem::path &Output) {
   const auto Model = Output.u8string() + ".tmp-%%%%%%";
   if (llvm::sys::fs::createUniqueFile(Model, File, Path)) {
     if (File != -1) {
-      llvm::sys::fs::closeFile(File);
+      llvm::sys::Process::SafelyCloseFileDescriptor(File);
     }
     std::error_code Error;
     std::filesystem::remove(std::filesystem::path(Path.str().str()), Error);
@@ -94,7 +95,7 @@ public:
       : Path(std::move(Value)), File(File) {}
   ~TempGuard() {
     if (File != -1)
-      llvm::sys::fs::closeFile(File);
+      llvm::sys::Process::SafelyCloseFileDescriptor(File);
     if (!Published) {
       std::error_code Error;
       std::filesystem::remove(Path, Error);

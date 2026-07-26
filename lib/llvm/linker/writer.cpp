@@ -5,6 +5,7 @@
 
 #include <limits>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Process.h>
 #include <llvm/Support/raw_ostream.h>
 #if WASMEDGE_OS_WINDOWS
 #include <io.h>
@@ -30,17 +31,14 @@ Writer::Writer(const std::filesystem::path &Path) noexcept
 Writer::Writer(int FileDescriptor) : FileDescriptor(FileDescriptor) {
   try {
     DescriptorStream =
-        std::make_unique<llvm::raw_fd_ostream>(FileDescriptor, false);
+        std::make_unique<llvm::raw_fd_ostream>(FileDescriptor, true);
   } catch (...) {
-    llvm::sys::fs::closeFile(FileDescriptor);
+    llvm::sys::Process::SafelyCloseFileDescriptor(FileDescriptor);
     throw;
   }
 }
 
-Writer::~Writer() {
-  if (FileDescriptor != -1)
-    llvm::sys::fs::closeFile(FileDescriptor);
-}
+Writer::~Writer() = default;
 
 Expect<void> Writer::writeByte(uint8_t Data) {
   if (Buffer != nullptr) {
@@ -126,21 +124,24 @@ Expect<void> Writer::close() {
     return {};
   }
   if (DescriptorStream) {
+    if (FileDescriptor == -1)
+      return {};
     DescriptorStream->flush();
-    if (DescriptorStream->has_error())
-      return writeError();
+    bool Failed = DescriptorStream->has_error();
 #if WASMEDGE_OS_WINDOWS
     if (::_commit(FileDescriptor) != 0)
-      return writeError();
+      Failed = true;
 #else
     if (::fsync(FileDescriptor) != 0)
-      return writeError();
+      Failed = true;
 #endif
-    if (DescriptorStream->has_error() ||
-        llvm::sys::fs::closeFile(FileDescriptor))
-      return writeError();
+    DescriptorStream->close();
     FileDescriptor = -1;
-    return {};
+    if (DescriptorStream->has_error()) {
+      DescriptorStream->clear_error();
+      Failed = true;
+    }
+    return Failed ? writeError() : Expect<void>{};
   }
   Stream.flush();
   if (!Stream) {

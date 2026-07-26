@@ -6,6 +6,7 @@
 #include "linker/native_linker.h"
 #include "linker/pe_writer.h"
 #include "linker/relocation.h"
+#include "linker/writer.h"
 
 #include <gtest/gtest.h>
 
@@ -27,7 +28,9 @@
 #include <set>
 #include <string>
 #include <vector>
-#if !WASMEDGE_OS_WINDOWS
+#if WASMEDGE_OS_WINDOWS
+#include <io.h>
+#else
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -1765,6 +1768,36 @@ TEST(MachOWriterTest, BoundsSectionOrdinalsAtomically) {
   Writer SecondOutput(SecondBytes);
   EXPECT_FALSE(MachOWriter::write(Overflow, SecondOutput));
   EXPECT_EQ(SecondBytes, Existing);
+}
+
+TEST(NativeWriterTest, OwnsDescriptorUntilClose) {
+  llvm::SmallString<128> Path;
+  int File = -1;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueFile("wasmedge-writer-%%%%%%", File, Path));
+  struct Cleanup {
+    llvm::SmallString<128> Path;
+    ~Cleanup() { llvm::sys::fs::remove(Path); }
+  } CleanupGuard{Path};
+  const std::array<WasmEdge::Byte, 4> Bytes{0x00, 0x7F, 0x80, 0xFF};
+
+  {
+    Writer Output(File);
+    ASSERT_TRUE(Output.write(Bytes));
+    ASSERT_TRUE(Output.close());
+    EXPECT_TRUE(Output.close());
+  }
+
+#if WASMEDGE_OS_WINDOWS
+  EXPECT_EQ(::_close(File), -1);
+#else
+  EXPECT_EQ(::close(File), -1);
+#endif
+  std::ifstream Input(std::filesystem::u8path(Path.str().str()),
+                      std::ios_base::binary);
+  const std::vector<WasmEdge::Byte> Actual{
+      std::istreambuf_iterator<char>(Input), std::istreambuf_iterator<char>()};
+  EXPECT_EQ(Actual, std::vector<WasmEdge::Byte>(Bytes.begin(), Bytes.end()));
 }
 
 #if !WASMEDGE_OS_WINDOWS

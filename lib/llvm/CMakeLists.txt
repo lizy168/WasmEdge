@@ -30,10 +30,6 @@ set(WASMEDGE_LLVM_SOURCES
   linker/pe_writer.cpp
   linker/object_reader.cpp
   linker/relocation.cpp
-  linker/relocation_aarch64.cpp
-  linker/relocation_arm.cpp
-  linker/relocation_riscv.cpp
-  linker/relocation_s390x.cpp
   linker/relocation_x86_64.cpp
   linker/universal_wasm_writer.cpp
   linker/writer.cpp
@@ -50,14 +46,32 @@ set(WASMEDGE_LLVM_LINKER_SOURCES
   linker/pe_writer.cpp
   linker/object_reader.cpp
   linker/relocation.cpp
-  linker/relocation_aarch64.cpp
-  linker/relocation_arm.cpp
-  linker/relocation_riscv.cpp
-  linker/relocation_s390x.cpp
   linker/relocation_x86_64.cpp
   linker/universal_wasm_writer.cpp
   linker/writer.cpp
 )
+
+set(WASMEDGE_LINKER_HAS_AARCH64 0)
+set(WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS 0)
+if(WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND WASMEDGE_LLVM_SOURCES linker/relocation_aarch64.cpp)
+  list(APPEND WASMEDGE_LLVM_LINKER_SOURCES linker/relocation_aarch64.cpp)
+  set(WASMEDGE_LINKER_HAS_AARCH64 1)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND WASMEDGE_LLVM_SOURCES
+    linker/relocation_arm.cpp
+    linker/relocation_riscv.cpp
+    linker/relocation_s390x.cpp
+  )
+  list(APPEND WASMEDGE_LLVM_LINKER_SOURCES
+    linker/relocation_arm.cpp
+    linker/relocation_riscv.cpp
+    linker/relocation_s390x.cpp
+  )
+  set(WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS 1)
+endif()
 if(MSVC)
   set_source_files_properties(${WASMEDGE_LLVM_LINKER_SOURCES}
     PROPERTIES COMPILE_OPTIONS /EHsc)
@@ -117,6 +131,11 @@ else()
 endif()
 
 wasmedge_setup_target(wasmedgeLLVM)
+
+target_compile_definitions(wasmedgeLLVM PRIVATE
+  WASMEDGE_LINKER_HAS_AARCH64=${WASMEDGE_LINKER_HAS_AARCH64}
+  WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS=${WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS}
+)
 
 target_include_directories(wasmedgeLLVM
   PRIVATE

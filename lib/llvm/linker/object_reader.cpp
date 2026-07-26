@@ -5,6 +5,11 @@
 
 #include "common/spdlog.h"
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#endif
+
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/ELF.h>
 #include <llvm/BinaryFormat/MachO.h>
@@ -969,3 +974,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
 } // namespace Linker
 } // namespace LLVM
 } // namespace WasmEdge
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif

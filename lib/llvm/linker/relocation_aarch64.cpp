@@ -46,8 +46,52 @@ Expect<RelocationResult> fail(const Relocation &Value,
   return Unexpect(ErrCode::Value::IllegalPath);
 }
 
-bool signedBits(int128_t Value, unsigned Bits) {
-  const int128_t Limit = int128_t(1) << (Bits - 1);
+bool addUnsigned(uint64_t Left, uint64_t Right, uint64_t &Result) noexcept {
+  if (Right > UINT64_MAX - Left)
+    return false;
+  Result = Left + Right;
+  return true;
+}
+
+bool addSigned(uint64_t Base, int64_t Delta, uint64_t &Result) noexcept {
+  if (Delta >= 0)
+    return addUnsigned(Base, static_cast<uint64_t>(Delta), Result);
+  const uint64_t Magnitude = static_cast<uint64_t>(-(Delta + 1)) + 1;
+  if (Magnitude > Base)
+    return false;
+  Result = Base - Magnitude;
+  return true;
+}
+
+bool addSigned(int64_t Left, int64_t Right, int64_t &Result) noexcept {
+  if ((Right > 0 && Left > INT64_MAX - Right) ||
+      (Right < 0 && Left < INT64_MIN - Right))
+    return false;
+  Result = Left + Right;
+  return true;
+}
+
+bool signedDelta(uint64_t Left, uint64_t Right, int64_t &Result) noexcept {
+  if (Left >= Right) {
+    const uint64_t Difference = Left - Right;
+    if (Difference > static_cast<uint64_t>(INT64_MAX))
+      return false;
+    Result = static_cast<int64_t>(Difference);
+    return true;
+  }
+  const uint64_t Difference = Right - Left;
+  const uint64_t MinimumMagnitude = UINT64_C(1) << 63;
+  if (Difference > MinimumMagnitude)
+    return false;
+  Result = Difference == MinimumMagnitude ? INT64_MIN
+                                          : -static_cast<int64_t>(Difference);
+  return true;
+}
+
+bool signedBits(int64_t Value, unsigned Bits) noexcept {
+  if (Bits == 64)
+    return true;
+  const int64_t Limit = INT64_C(1) << (Bits - 1);
   return Value >= -Limit && Value < Limit;
 }
 
@@ -88,16 +132,18 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
         return fail(Rel, "cannot decode implicit addend");
       Addend += static_cast<int64_t>(*Value);
     }
-    const int128_t S = int128_t(Graph.sections()[Symbol.Section].Address) +
-                       Symbol.Offset + Addend;
-    const int128_t P =
-        int128_t(Graph.sections()[Rel.Section].Address) + Rel.Offset;
+    uint64_t S = 0;
+    uint64_t P = 0;
+    if (!addUnsigned(Graph.sections()[Symbol.Section].Address, Symbol.Offset,
+                     S) ||
+        !addSigned(S, Addend, S) ||
+        !addUnsigned(Graph.sections()[Rel.Section].Address, Rel.Offset, P))
+      return fail(Rel, "relocation address overflows");
     if (Rel.Format == ObjectFormat::COFF &&
         Rel.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR32NB) {
       if (S < PEImageBase || S - PEImageBase > UINT32_MAX ||
           !writeUnsigned(Bytes, Rel.Offset, InstructionWidth,
-                         Endianness::Little,
-                         static_cast<uint64_t>(S - PEImageBase))) {
+                         Endianness::Little, S - PEImageBase)) {
         return fail(Rel, "ADDR32NB relocation overflows");
       }
       continue;
@@ -109,9 +155,8 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
         (Rel.Format == ObjectFormat::COFF &&
          Rel.Type == llvm::COFF::IMAGE_REL_ARM64_ADDR64)) {
       constexpr uint8_t DoubleWordWidth = 8;
-      if (S < 0 || S > UINT64_MAX ||
-          !writeUnsigned(Bytes, Rel.Offset, DoubleWordWidth, Endianness::Little,
-                         static_cast<uint64_t>(S))) {
+      if (!writeUnsigned(Bytes, Rel.Offset, DoubleWordWidth, Endianness::Little,
+                         S)) {
         return fail(Rel, "absolute relocation overflows");
       }
       if (hasRebaseOverlap(Result.Rebases, Rel.Section, Rel.Offset,
@@ -126,10 +171,10 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
         Rel.Type == llvm::ELF::R_AARCH64_PREL64) {
       constexpr uint8_t DoubleWordWidth = 8;
       constexpr unsigned DoubleWordBits = 64;
-      const int128_t Value = S - P;
-      if (!signedBits(Value, DoubleWordBits) ||
+      int64_t Value = 0;
+      if (!signedDelta(S, P, Value) || !signedBits(Value, DoubleWordBits) ||
           !writeSigned(Bytes, Rel.Offset, DoubleWordWidth, Endianness::Little,
-                       static_cast<int64_t>(Value))) {
+                       Value)) {
         return fail(Rel, "PREL64 relocation overflows");
       }
       continue;
@@ -137,10 +182,10 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
     if (Rel.Format == ObjectFormat::ELF &&
         Rel.Type == llvm::ELF::R_AARCH64_PREL32) {
       constexpr unsigned WordBits = 32;
-      const int128_t Value = S - P;
-      if (!signedBits(Value, WordBits) ||
+      int64_t Value = 0;
+      if (!signedDelta(S, P, Value) || !signedBits(Value, WordBits) ||
           !writeSigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little,
-                       static_cast<int64_t>(Value))) {
+                       Value)) {
         return fail(Rel, "PREL32 relocation overflows");
       }
       continue;
@@ -174,10 +219,15 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       if ((Instruction & BranchOpcodeMask) != Opcode) {
         return fail(Rel, "invalid branch instruction");
       }
-      int128_t Value = S - P;
-      if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF)
-        Value += signExtend(Instruction & BranchImmediateMask, 26)
-                 << BranchImmediateShift;
+      int64_t Value = 0;
+      if (!signedDelta(S, P, Value))
+        return fail(Rel, "branch displacement overflows");
+      if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF &&
+          !addSigned(Value,
+                     signExtend(Instruction & BranchImmediateMask, 26)
+                         << BranchImmediateShift,
+                     Value))
+        return fail(Rel, "branch displacement overflows");
       if ((Value & InstructionAlignmentMask) != 0 ||
           !signedBits(Value, BranchDisplacementBits)) {
         return fail(Rel, "branch displacement overflows");
@@ -204,12 +254,15 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
       if ((Instruction & AdrpOpcodeMask) != AdrpOpcode) {
         return fail(Rel, "invalid ADRP instruction");
       }
-      int128_t Pages = (S >> PageShift) - (P >> PageShift);
+      int64_t Pages = 0;
+      if (!signedDelta(S >> PageShift, P >> PageShift, Pages))
+        return fail(Rel, "ADRP page displacement overflows");
       if (Rel.AddendIsImplicit && Rel.Format == ObjectFormat::COFF) {
         const uint32_t Raw =
             ((Instruction >> AdrpImmediateLowShift) & 3) |
             ((Instruction >> AdrpImmediateHighShift) & AdrpImmediateHighMask);
-        Pages += signExtend(Raw, PageDisplacementBits);
+        if (!addSigned(Pages, signExtend(Raw, PageDisplacementBits), Pages))
+          return fail(Rel, "ADRP page displacement overflows");
       }
       if (!signedBits(Pages, PageDisplacementBits)) {
         return fail(Rel, "ADRP page displacement overflows");
@@ -283,7 +336,7 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
           (Instruction & Encoding.OpcodeMask) != Encoding.Opcode) {
         return fail(Rel, "invalid low12 instruction");
       }
-      const uint64_t Low = static_cast<uint64_t>(S) & PageOffsetMask;
+      const uint64_t Low = S & PageOffsetMask;
       if ((Low & ((UINT64_C(1) << value(Encoding.Scale)) - 1)) != 0) {
         return fail(Rel, "unaligned low12 relocation");
       }

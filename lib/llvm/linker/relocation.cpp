@@ -152,16 +152,24 @@ Expect<void> applyRelocations(LinkGraph &Graph) {
     Result = Internal::applyX86_64(Graph);
     break;
   case Target::ARM:
+#if WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS
     Result = Internal::applyARM(Graph);
+#endif
     break;
   case Target::AArch64:
+#if WASMEDGE_LINKER_HAS_AARCH64
     Result = Internal::applyAArch64(Graph);
+#endif
     break;
   case Target::RISCV64:
+#if WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS
     Result = Internal::applyRISCV(Graph);
+#endif
     break;
   case Target::S390X:
+#if WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS
     Result = Internal::applyS390X(Graph);
+#endif
     break;
   default:
     spdlog::error("native linker: unsupported target {}"sv,
