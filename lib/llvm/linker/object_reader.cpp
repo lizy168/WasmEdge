@@ -128,7 +128,7 @@ bool isSupportedFormat(const llvm::object::ObjectFile &Object) noexcept {
 }
 
 uint64_t sectionAlignment(const llvm::object::SectionRef &Section) noexcept {
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 16
   return Internal::normalizeSectionAlignment(Section.getAlignment().value());
 #else
   return Internal::normalizeSectionAlignment(Section.getAlignment());
