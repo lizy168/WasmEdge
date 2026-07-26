@@ -232,7 +232,8 @@ bool normalizePData(const LinkGraph &Graph, OutputSection &PData) {
   size_t Offset = 0;
   for (const auto &Entry : Entries) {
     std::copy(Entry.Bytes.begin(), Entry.Bytes.end(),
-              PData.Content.begin() + Offset);
+              PData.Content.begin() +
+                  static_cast<std::vector<Byte>::difference_type>(Offset));
     Offset += EntrySize;
   }
   return true;
@@ -259,6 +260,15 @@ bool appendSection(std::vector<OutputSection> &Sections, std::string Name,
   RVA = NextRVA;
   FileOffset = NextFile;
   return true;
+}
+
+bool fitsSize(uint64_t Value) noexcept {
+#if SIZE_MAX < UINT64_MAX
+  return Value <= SIZE_MAX;
+#else
+  (void)Value;
+  return true;
+#endif
 }
 
 } // namespace
@@ -359,14 +369,15 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
       const uint64_t Offset = InputRVA64 - Section.RVA;
       uint64_t End = 0;
       if (InputRVA64 < Section.RVA || !add(Offset, Input.VirtualSize, End) ||
-          End > UINT32_MAX || End > std::numeric_limits<size_t>::max())
+          End > UINT32_MAX || !fitsSize(End))
         return fail();
       Section.VirtualSize =
           std::max(Section.VirtualSize, static_cast<uint32_t>(End));
       if (Input.Kind != SectionKind::BSS) {
         Section.Content.resize(static_cast<size_t>(End));
         std::copy(Input.Content.begin(), Input.Content.end(),
-                  Section.Content.begin() + static_cast<size_t>(Offset));
+                  Section.Content.begin() +
+                      static_cast<std::vector<Byte>::difference_type>(Offset));
       }
       Section.Characteristics = characteristics(Name);
     }
@@ -433,8 +444,7 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
       if (!add(ExportSize, Name.size() + 1, ExportSize))
         return fail();
     }
-    if (ExportSize > UINT32_MAX ||
-        ExportSize > std::numeric_limits<size_t>::max())
+    if (ExportSize > UINT32_MAX || !fitsSize(ExportSize))
       return fail();
     std::vector<Byte> EData(static_cast<size_t>(ExportSize));
     if (RVA > UINT32_MAX)
@@ -523,7 +533,7 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
                        RelocSize))
       return fail();
     if (Sections.size() > UINT16_MAX || RVA > UINT32_MAX ||
-        FileOffset > std::numeric_limits<size_t>::max())
+        !fitsSize(FileOffset))
       return fail();
 
     const uint32_t HeaderSize = Sections.front().FileOffset;
@@ -613,7 +623,8 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
       const size_t Header =
           Optional + OptionalHeaderSize + I * SectionHeaderSize;
       std::copy(Section.Name.begin(), Section.Name.end(),
-                Bytes.begin() + Header);
+                Bytes.begin() +
+                    static_cast<std::vector<Byte>::difference_type>(Header));
       put(Bytes, Header + 8, Section.VirtualSize, 4);
       put(Bytes, Header + 12, Section.RVA, 4);
       put(Bytes, Header + 16, Section.FileSize, 4);

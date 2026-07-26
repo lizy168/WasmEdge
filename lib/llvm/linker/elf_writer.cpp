@@ -9,6 +9,7 @@
 #include <llvm/BinaryFormat/ELF.h>
 
 #include <algorithm>
+#include <cassert>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -48,12 +49,27 @@ bool multiply(uint64_t Left, uint64_t Right, uint64_t &Result) noexcept {
 }
 
 bool vectorSize(uint64_t Value) noexcept {
-  return Value <= std::numeric_limits<size_t>::max();
+#if SIZE_MAX < UINT64_MAX
+  return Value <= SIZE_MAX;
+#else
+  static_cast<void>(Value);
+  return true;
+#endif
+}
+
+std::vector<Byte>::iterator iteratorAt(std::vector<Byte> &Bytes,
+                                       uint64_t Offset) noexcept {
+  assert(Offset <= Bytes.size());
+  return Bytes.begin() +
+         static_cast<std::vector<Byte>::difference_type>(Offset);
 }
 
 bool align(uint64_t Value, uint64_t Alignment, uint64_t &Result) noexcept {
   const uint64_t Mask = Alignment - 1;
-  return add(Value, Mask, Result) && ((Result &= ~Mask), true);
+  if (!add(Value, Mask, Result))
+    return false;
+  Result &= ~Mask;
+  return true;
 }
 
 bool boundedAdd(uint64_t Value, uint64_t Increment, uint64_t Maximum,
@@ -177,7 +193,8 @@ uint64_t get(Span<const Byte> Bytes, uint64_t Offset, uint8_t Width,
 
 uint32_t hash(std::string_view Name) noexcept {
   uint32_t Result = 0;
-  for (const unsigned char Character : Name) {
+  for (const char CharacterValue : Name) {
+    const auto Character = static_cast<unsigned char>(CharacterValue);
     Result = (Result << 4) + Character;
     const uint32_t High = Result & UINT32_C(0xF0000000);
     if (High != 0)
@@ -913,9 +930,12 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     uint64_t SectionHeadersSize = 0;
     if (!multiply(Sections.size(), SectionHeaderSize, SectionHeadersSize) ||
         !boundedAdd(SectionHeaderOffset, SectionHeadersSize, ClassMaximum,
-                    FileSize) ||
-        FileSize > std::numeric_limits<size_t>::max())
+                    FileSize))
       return fail();
+#if SIZE_MAX < UINT64_MAX
+    if (FileSize > SIZE_MAX)
+      return fail();
+#endif
 
     struct Segment {
       uint32_t Type;
@@ -1059,7 +1079,7 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
       if (SectionValue.Type != llvm::ELF::SHT_NOBITS &&
           !SectionValue.Content.empty())
         std::copy(SectionValue.Content.begin(), SectionValue.Content.end(),
-                  Bytes.begin() + SectionValue.Offset);
+                  iteratorAt(Bytes, SectionValue.Offset));
       const uint64_t Offset = SectionHeaderOffset + I * SectionHeaderSize;
       put(Bytes, Offset, SectionNameOffsets[I], 4, Endian);
       put(Bytes, Offset + 4, SectionValue.Type, 4, Endian);

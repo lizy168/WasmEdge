@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#endif
+#include <llvm/Support/JSON.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
 #include "linker/elf_writer.h"
 #include "linker/macho_writer.h"
 #include "linker/native_linker.h"
@@ -664,16 +673,21 @@ TEST(PEWriterTest, RejectsDuplicateAndOverlappingRuntimeFunctions) {
 
 TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
   const std::array<ELFCase, 5> Cases{{
-      {Target::ARM, Endianness::Little, llvm::ELF::EM_ARM,
-       llvm::ELF::R_ARM_RELATIVE, false},
-      {Target::X86_64, Endianness::Little, llvm::ELF::EM_X86_64,
-       llvm::ELF::R_X86_64_RELATIVE, true},
-      {Target::AArch64, Endianness::Little, llvm::ELF::EM_AARCH64,
-       llvm::ELF::R_AARCH64_RELATIVE, true},
-      {Target::RISCV64, Endianness::Little, llvm::ELF::EM_RISCV,
-       llvm::ELF::R_RISCV_RELATIVE, true},
-      {Target::S390X, Endianness::Big, llvm::ELF::EM_S390,
-       llvm::ELF::R_390_RELATIVE, true},
+      {Target::ARM, Endianness::Little,
+       static_cast<uint16_t>(llvm::ELF::EM_ARM),
+       static_cast<uint32_t>(llvm::ELF::R_ARM_RELATIVE), false},
+      {Target::X86_64, Endianness::Little,
+       static_cast<uint16_t>(llvm::ELF::EM_X86_64),
+       static_cast<uint32_t>(llvm::ELF::R_X86_64_RELATIVE), true},
+      {Target::AArch64, Endianness::Little,
+       static_cast<uint16_t>(llvm::ELF::EM_AARCH64),
+       static_cast<uint32_t>(llvm::ELF::R_AARCH64_RELATIVE), true},
+      {Target::RISCV64, Endianness::Little,
+       static_cast<uint16_t>(llvm::ELF::EM_RISCV),
+       static_cast<uint32_t>(llvm::ELF::R_RISCV_RELATIVE), true},
+      {Target::S390X, Endianness::Big,
+       static_cast<uint16_t>(llvm::ELF::EM_S390),
+       static_cast<uint32_t>(llvm::ELF::R_390_RELATIVE), true},
   }};
   for (const auto &Test : Cases) {
     auto Graph = makeELFGraph(Test);
@@ -827,13 +841,18 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
       uint64_t EntrySize;
     };
     const std::array<DynamicSectionCase, 4> DynamicSections{{
-        {llvm::ELF::DT_HASH, 0, 0, ".hash", 4},
-        {llvm::ELF::DT_STRTAB, llvm::ELF::DT_STRSZ, 0, ".dynstr", 1},
-        {llvm::ELF::DT_SYMTAB, 0, llvm::ELF::DT_SYMENT, ".dynsym",
+        {static_cast<uint64_t>(llvm::ELF::DT_HASH), 0, 0, ".hash", 4},
+        {static_cast<uint64_t>(llvm::ELF::DT_STRTAB),
+         static_cast<uint64_t>(llvm::ELF::DT_STRSZ), 0, ".dynstr", 1},
+        {static_cast<uint64_t>(llvm::ELF::DT_SYMTAB), 0,
+         static_cast<uint64_t>(llvm::ELF::DT_SYMENT), ".dynsym",
          Test.Is64 ? 24U : 16U},
-        {Test.Is64 ? llvm::ELF::DT_RELA : llvm::ELF::DT_REL,
-         Test.Is64 ? llvm::ELF::DT_RELASZ : llvm::ELF::DT_RELSZ,
-         Test.Is64 ? llvm::ELF::DT_RELAENT : llvm::ELF::DT_RELENT,
+        {Test.Is64 ? static_cast<uint64_t>(llvm::ELF::DT_RELA)
+                   : static_cast<uint64_t>(llvm::ELF::DT_REL),
+         Test.Is64 ? static_cast<uint64_t>(llvm::ELF::DT_RELASZ)
+                   : static_cast<uint64_t>(llvm::ELF::DT_RELSZ),
+         Test.Is64 ? static_cast<uint64_t>(llvm::ELF::DT_RELAENT)
+                   : static_cast<uint64_t>(llvm::ELF::DT_RELENT),
          Test.Is64 ? ".rela.dyn" : ".rel.dyn", Test.Is64 ? 24U : 8U},
     }};
     for (const auto &Expected : DynamicSections) {
@@ -1017,7 +1036,8 @@ TEST(ELFWriterTest, WritesARMExidxAndHardFloatABI) {
   ASSERT_TRUE(ELFWriter::write(Graph, Output));
   if (const char *Fixture = std::getenv("WASMEDGE_ARM_ELF_FIXTURE")) {
     std::ofstream File(Fixture, std::ios_base::binary);
-    File.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+    File.write(reinterpret_cast<const char *>(Bytes.data()),
+               static_cast<std::streamsize>(Bytes.size()));
     ASSERT_TRUE(File);
   }
   EXPECT_EQ(readInteger(Bytes, 36, 4, Endianness::Little),
@@ -1269,8 +1289,8 @@ TEST(ELFWriterTest, AcceptsIndirectPersonalityWithRelativeSlot) {
           static_cast<uint32_t>(FunctionDelta) >> (I * 8));
     }
     if (HasRebase) {
-      ASSERT_TRUE(
-          Graph.addRebase(Rebase{*Data, 0, llvm::ELF::R_X86_64_64, 0, 8}));
+      ASSERT_TRUE(Graph.addRebase(Rebase{
+          *Data, 0, static_cast<uint32_t>(llvm::ELF::R_X86_64_64), 0, 8}));
     }
     ASSERT_TRUE(applyRelocations(Graph));
     std::vector<WasmEdge::Byte> Bytes;
@@ -1402,8 +1422,9 @@ TEST(ELFWriterTest, RejectsELF32GeneratedMetadataOverflowAtomically) {
 }
 
 TEST(ELFWriterTest, RejectsUnsupportedRebasesAndInvalidState) {
-  const ELFCase Test{Target::X86_64, Endianness::Little, llvm::ELF::EM_X86_64,
-                     llvm::ELF::R_X86_64_RELATIVE, true};
+  const ELFCase Test{Target::X86_64, Endianness::Little,
+                     static_cast<uint16_t>(llvm::ELF::EM_X86_64),
+                     static_cast<uint32_t>(llvm::ELF::R_X86_64_RELATIVE), true};
   auto Graph = makeELFGraph(Test);
   ASSERT_TRUE(ELFWriter::layout(Graph));
   ASSERT_TRUE(applyRelocations(Graph));
@@ -1451,16 +1472,18 @@ LinkGraph makeMachOGraph(Target Architecture) {
       Graph.addSymbol(Symbol{"_f0", *Text, 0, 4, true, std::nullopt, true}));
   EXPECT_TRUE(
       Graph.addSymbol(Symbol{"_value", *Data, 0, 8, true, std::nullopt, true}));
-  EXPECT_TRUE(Graph.addRebase(Rebase{*Data, 0,
-                                     Architecture == Target::X86_64
-                                         ? llvm::MachO::X86_64_RELOC_UNSIGNED
-                                         : llvm::MachO::ARM64_RELOC_UNSIGNED,
-                                     0, 8, ObjectFormat::MachO}));
-  EXPECT_TRUE(Graph.addRebase(Rebase{*Pointer, 0,
-                                     Architecture == Target::X86_64
-                                         ? llvm::MachO::X86_64_RELOC_UNSIGNED
-                                         : llvm::MachO::ARM64_RELOC_UNSIGNED,
-                                     0, 8, ObjectFormat::MachO}));
+  EXPECT_TRUE(Graph.addRebase(
+      Rebase{*Data, 0,
+             Architecture == Target::X86_64
+                 ? static_cast<uint32_t>(llvm::MachO::X86_64_RELOC_UNSIGNED)
+                 : static_cast<uint32_t>(llvm::MachO::ARM64_RELOC_UNSIGNED),
+             0, 8, ObjectFormat::MachO}));
+  EXPECT_TRUE(Graph.addRebase(
+      Rebase{*Pointer, 0,
+             Architecture == Target::X86_64
+                 ? static_cast<uint32_t>(llvm::MachO::X86_64_RELOC_UNSIGNED)
+                 : static_cast<uint32_t>(llvm::MachO::ARM64_RELOC_UNSIGNED),
+             0, 8, ObjectFormat::MachO}));
   return Graph;
 }
 
@@ -1820,7 +1843,8 @@ TEST(NativeWriterTest, PublishFailurePreservesDestination) {
   auto Write = [](const std::filesystem::path &Path,
                   const std::vector<WasmEdge::Byte> &Bytes) {
     std::ofstream File(Path, std::ios_base::binary);
-    File.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+    File.write(reinterpret_cast<const char *>(Bytes.data()),
+               static_cast<std::streamsize>(Bytes.size()));
   };
   auto Read = [](const std::filesystem::path &Path) {
     std::ifstream File(Path, std::ios_base::binary);
@@ -1888,7 +1912,8 @@ TEST(MachOWriterTest, PublishesOnlyAfterSigningAndVerification) {
   auto Write = [](const std::filesystem::path &Path,
                   const std::vector<WasmEdge::Byte> &Bytes) {
     std::ofstream File(Path, std::ios_base::binary);
-    File.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+    File.write(reinterpret_cast<const char *>(Bytes.data()),
+               static_cast<std::streamsize>(Bytes.size()));
   };
   auto Read = [](const std::filesystem::path &Path) {
     std::ifstream File(Path, std::ios_base::binary);

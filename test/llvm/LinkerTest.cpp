@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#endif
+#include <llvm/Support/JSON.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
 #include "linker/eh_frame.h"
 #include "linker/elf_writer.h"
 #include "linker/layout.h"
@@ -32,7 +41,19 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
+#if LLVM_VERSION_MAJOR >= 13
 #include <llvm/MC/TargetRegistry.h>
+#else
+#include <llvm/Support/TargetRegistry.h>
+#endif
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4267)
+#endif
+#include <llvm/MC/MCSection.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #if LLVM_VERSION_MAJOR >= 19
 #include <llvm/MC/MCELFExtras.h>
 #endif
@@ -2201,7 +2222,7 @@ TEST(RelocationFieldTest, AllowsMisalignmentAndRejectsBoundsAndOverflow) {
   EXPECT_FALSE(Internal::readUnsigned(Bytes, 0, 3, Endianness::Little));
   EXPECT_FALSE(
       Internal::readUnsigned(Bytes, UINT64_MAX, 1, Endianness::Little));
-  for (const uint8_t Width : {1, 2, 4, 8}) {
+  for (const uint8_t Width : std::array<uint8_t, 4>{1, 2, 4, 8}) {
     const uint64_t Offset = Bytes.size() - Width + 1;
     EXPECT_FALSE(
         Internal::readUnsigned(Bytes, Offset, Width, Endianness::Little));
@@ -2214,8 +2235,9 @@ TEST(RelocationFieldTest, AllowsMisalignmentAndRejectsBoundsAndOverflow) {
   EXPECT_FALSE(Internal::writeUnsigned(Bytes, 0, 1, Endianness::Little, 256));
   EXPECT_FALSE(Internal::writeSigned(Bytes, 0, 1, Endianness::Little, 128));
   EXPECT_FALSE(Internal::writeSigned(Bytes, 0, 1, Endianness::Little, -129));
-  for (const uint8_t Width : {1, 2, 4}) {
-    const uint8_t Bits = Width * 8;
+  for (const uint8_t Width : std::array<uint8_t, 3>{1, 2, 4}) {
+    const uint8_t Bits =
+        static_cast<uint8_t>(static_cast<uint32_t>(Width) * 8U);
     EXPECT_FALSE(Internal::writeUnsigned(Bytes, 0, Width, Endianness::Little,
                                          UINT64_C(1) << Bits));
     const int64_t Maximum = (INT64_C(1) << (Bits - 1)) - 1;
@@ -3461,6 +3483,43 @@ TEST(RISCVRelocationTest, ReadsGeneratedSymbolDifferenceObject) {
                                        llvm::ELF::R_RISCV_SUB32}));
 }
 
+TEST(RISCVRelocationTest, ReadsGeneratedByteSymbolDifferenceObject) {
+  constexpr std::string_view Assembly = R"(
+    .pushsection .rodata.symbol_begin,"a",@progbits
+  begin:
+    .byte 0
+    .popsection
+    .pushsection .rodata.symbol_end,"a",@progbits
+  end:
+    .byte 0
+    .popsection
+    .pushsection .rodata.symbol_difference,"a",@progbits
+  symbol_difference:
+    .byte end - begin
+    .popsection
+  )";
+  const auto Object =
+      makeObject(llvm::Triple("riscv64-unknown-linux-gnu"), false, false, "f0",
+                 {}, true, true, "generic-rv64", "+a", false, false, false,
+                 false, false, false, Assembly.data());
+  auto Graph = ObjectReader::read(Object, Target::RISCV64);
+  ASSERT_TRUE(Graph);
+  std::set<uint32_t> Types;
+  for (const auto &Relocation : Graph->relocations()) {
+    if (Relocation.Type == llvm::ELF::R_RISCV_ADD8 ||
+        Relocation.Type == llvm::ELF::R_RISCV_SET8 ||
+        Relocation.Type == llvm::ELF::R_RISCV_SUB8) {
+      Types.insert(Relocation.Type);
+      EXPECT_EQ(Relocation.PatchSize, 1U);
+      EXPECT_FALSE(Relocation.PCRelative);
+    }
+  }
+  EXPECT_TRUE(Types == (std::set<uint32_t>{llvm::ELF::R_RISCV_ADD8,
+                                           llvm::ELF::R_RISCV_SUB8}) ||
+              Types == (std::set<uint32_t>{llvm::ELF::R_RISCV_SET8,
+                                           llvm::ELF::R_RISCV_SUB8}));
+}
+
 TEST(RISCVRelocationTest, AppliesSymbolDifferencePairsModulo32InEitherOrder) {
   struct Case {
     uint64_t AddOffset;
@@ -3692,8 +3751,9 @@ TEST(RISCVRelocationTest, ChecksCallPltSignedRange) {
         Test.Delta < 0 ? PatchAddress - static_cast<uint64_t>(-Test.Delta)
                        : PatchAddress + static_cast<uint64_t>(Test.Delta);
     auto Graph = makeELFRelocationGraph(
-        Target::RISCV64, Endianness::Little, llvm::ELF::R_RISCV_CALL_PLT, 8,
-        TargetAddress, PatchAddress, 0, 0, false, std::move(Bytes));
+        Target::RISCV64, Endianness::Little,
+        static_cast<uint32_t>(llvm::ELF::R_RISCV_CALL_PLT), 8, TargetAddress,
+        PatchAddress, 0, 0, false, std::move(Bytes));
     const auto Snapshot = Graph;
     EXPECT_EQ(static_cast<bool>(applyRelocations(Graph)), Test.Accepted);
     if (!Test.Accepted) {
@@ -3850,12 +3910,14 @@ TEST(RelocationTest, ReadsAndRelocatesGeneratedLinuxObjectsForEveryTarget) {
           ASSERT_TRUE(static_cast<bool>(Object));
           for (const auto &Section : (*Object)->sections()) {
             for (const auto &Relocation : Section.relocations()) {
+              ASSERT_LE(Relocation.getType(), UINT32_MAX);
               GeneratedTypes.insert(Relocation.getType());
               EXPECT_TRUE(Test.SupportedTypes.count(Relocation.getType()) != 0)
                   << Test.Triple << " unexpected relocation "
                   << Relocation.getType();
-              ASSERT_TRUE(expectedELFPatchWidth(Test.Architecture,
-                                                Relocation.getType()))
+              ASSERT_TRUE(expectedELFPatchWidth(
+                  Test.Architecture,
+                  static_cast<uint32_t>(Relocation.getType())))
                   << Test.Triple << " relocation " << Relocation.getType();
             }
           }

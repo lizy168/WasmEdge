@@ -24,10 +24,21 @@ bool extendsBeyond(uint64_t Offset, uint64_t Size, uint64_t Limit) noexcept {
   return Offset > Limit || Size > Limit - Offset;
 }
 
+bool isRISCVSymbolDifferenceAdd(const Relocation &Value) noexcept {
+  return (Value.PatchSize == 1 && (Value.Type == llvm::ELF::R_RISCV_ADD8 ||
+                                   Value.Type == llvm::ELF::R_RISCV_SET8)) ||
+         (Value.PatchSize == 4 && Value.Type == llvm::ELF::R_RISCV_ADD32);
+}
+
+bool isRISCVSymbolDifferenceSub(const Relocation &Value) noexcept {
+  return (Value.PatchSize == 1 && Value.Type == llvm::ELF::R_RISCV_SUB8) ||
+         (Value.PatchSize == 4 && Value.Type == llvm::ELF::R_RISCV_SUB32);
+}
+
 bool isRISCVSymbolDifference(const Relocation &Value) noexcept {
-  return Value.Format == ObjectFormat::ELF && Value.PatchSize == 4 &&
-         (Value.Type == llvm::ELF::R_RISCV_ADD32 ||
-          Value.Type == llvm::ELF::R_RISCV_SUB32);
+  return Value.Format == ObjectFormat::ELF &&
+         (isRISCVSymbolDifferenceAdd(Value) ||
+          isRISCVSymbolDifferenceSub(Value));
 }
 
 bool composeRISCVSymbolDifference(const Relocation &Left,
@@ -35,7 +46,10 @@ bool composeRISCVSymbolDifference(const Relocation &Left,
   return isRISCVSymbolDifference(Left) && isRISCVSymbolDifference(Right) &&
          Left.Section == Right.Section && Left.Offset == Right.Offset &&
          Left.Format == Right.Format && Left.PatchSize == Right.PatchSize &&
-         Left.Type != Right.Type;
+         ((isRISCVSymbolDifferenceAdd(Left) &&
+           isRISCVSymbolDifferenceSub(Right)) ||
+          (isRISCVSymbolDifferenceSub(Left) &&
+           isRISCVSymbolDifferenceAdd(Right)));
 }
 
 template <typename T, typename Size>
@@ -168,6 +182,10 @@ std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
   }
   if (TargetValue == Target::RISCV64) {
     switch (Type) {
+    case llvm::ELF::R_RISCV_ADD8:
+    case llvm::ELF::R_RISCV_SUB8:
+    case llvm::ELF::R_RISCV_SET8:
+      return BytePatch;
     case llvm::ELF::R_RISCV_64:
     case llvm::ELF::R_RISCV_CALL:
     case llvm::ELF::R_RISCV_CALL_PLT:

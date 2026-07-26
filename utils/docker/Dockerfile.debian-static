@@ -47,7 +47,7 @@ EOT
 RUN xx-apt-get install --no-install-recommends -y \
     xx-cxx-essentials \
     libpolly-${LLVM_VERSION}-dev \
-    libncurses5-dev zlib1g-dev
+    libncurses5-dev zlib1g-dev libzstd-dev
 
 # Make a cmake toolchain file
 RUN cat <<EOT > /toolchain.cmake

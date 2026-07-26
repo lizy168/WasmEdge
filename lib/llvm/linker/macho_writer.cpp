@@ -7,8 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstring>
-#include <limits>
 #include <numeric>
 #include <tuple>
 #include <vector>
@@ -43,7 +43,10 @@ bool add(uint64_t A, uint64_t B, uint64_t &Result) noexcept {
 
 bool align(uint64_t Value, uint64_t Alignment, uint64_t &Result) noexcept {
   const uint64_t Mask = Alignment - 1;
-  return add(Value, Mask, Result) && ((Result &= ~Mask), true);
+  if (!add(Value, Mask, Result))
+    return false;
+  Result &= ~Mask;
+  return true;
 }
 
 uint64_t pageSize(Target Architecture) noexcept {
@@ -83,9 +86,16 @@ void put(std::vector<Byte> &Bytes, uint64_t Offset, uint64_t Value,
     Bytes[Offset + I] = static_cast<Byte>(Value >> (I * 8));
 }
 
+std::vector<Byte>::iterator iteratorAt(std::vector<Byte> &Bytes,
+                                       uint64_t Offset) noexcept {
+  assert(Offset <= Bytes.size());
+  return Bytes.begin() +
+         static_cast<std::vector<Byte>::difference_type>(Offset);
+}
+
 void putName(std::vector<Byte> &Bytes, uint64_t Offset, std::string_view Name) {
   std::copy_n(Name.begin(), std::min<size_t>(Name.size(), 16),
-              Bytes.begin() + Offset);
+              iteratorAt(Bytes, Offset));
 }
 
 void appendULEB(std::vector<Byte> &Bytes, uint64_t Value) {
@@ -223,35 +233,42 @@ std::optional<std::vector<Segment>> segments(const LinkGraph &Graph,
     DataStart = TextSize;
   return std::vector<Segment>{
       {"__TEXT", 0, TextSize, 0, TextSize,
-       llvm::MachO::VM_PROT_READ | llvm::MachO::VM_PROT_EXECUTE,
-       llvm::MachO::VM_PROT_READ | llvm::MachO::VM_PROT_EXECUTE,
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ) |
+           static_cast<uint32_t>(llvm::MachO::VM_PROT_EXECUTE),
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ) |
+           static_cast<uint32_t>(llvm::MachO::VM_PROT_EXECUTE),
        std::move(Text)},
       {"__DATA_CONST", ConstantStart,
        Constant.empty() ? 0 : ConstantEnd - ConstantStart, ConstantStart,
        Constant.empty() ? 0 : ConstantFileEnd - ConstantStart,
-       llvm::MachO::VM_PROT_READ | llvm::MachO::VM_PROT_WRITE,
-       llvm::MachO::VM_PROT_READ, std::move(Constant)},
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ) |
+           static_cast<uint32_t>(llvm::MachO::VM_PROT_WRITE),
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ), std::move(Constant)},
       {"__DATA", DataStart, Data.empty() ? 0 : DataEnd - DataStart, DataStart,
        Data.empty() || DataFileEnd <= DataStart ? 0 : DataFileEnd - DataStart,
-       llvm::MachO::VM_PROT_READ | llvm::MachO::VM_PROT_WRITE,
-       llvm::MachO::VM_PROT_READ | llvm::MachO::VM_PROT_WRITE, std::move(Data)},
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ) |
+           static_cast<uint32_t>(llvm::MachO::VM_PROT_WRITE),
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ) |
+           static_cast<uint32_t>(llvm::MachO::VM_PROT_WRITE),
+       std::move(Data)},
       {"__LINKEDIT",
        LinkEditOffset,
        LinkEditSize,
        LinkEditOffset,
        LinkEditSize,
-       llvm::MachO::VM_PROT_READ,
-       llvm::MachO::VM_PROT_READ,
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ),
+       static_cast<uint32_t>(llvm::MachO::VM_PROT_READ),
        {}}};
 }
 
 uint32_t sectionFlags(const Section &SectionValue) noexcept {
   if (SectionValue.Kind == SectionKind::BSS)
-    return llvm::MachO::S_ZEROFILL;
+    return static_cast<uint32_t>(llvm::MachO::S_ZEROFILL);
   if (SectionValue.Kind == SectionKind::Text)
-    return llvm::MachO::S_REGULAR | llvm::MachO::S_ATTR_PURE_INSTRUCTIONS |
-           llvm::MachO::S_ATTR_SOME_INSTRUCTIONS;
-  return llvm::MachO::S_REGULAR;
+    return static_cast<uint32_t>(llvm::MachO::S_REGULAR) |
+           static_cast<uint32_t>(llvm::MachO::S_ATTR_PURE_INSTRUCTIONS) |
+           static_cast<uint32_t>(llvm::MachO::S_ATTR_SOME_INSTRUCTIONS);
+  return static_cast<uint32_t>(llvm::MachO::S_REGULAR);
 }
 
 uint32_t alignmentPower(uint64_t Alignment) noexcept {
@@ -323,9 +340,9 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
     for (const auto &Value : Graph.rebases())
       if (Value.Format != ObjectFormat::MachO || Value.Width != 8 ||
           Value.Type !=
-              static_cast<uint32_t>(Graph.target() == Target::X86_64
-                                        ? llvm::MachO::X86_64_RELOC_UNSIGNED
-                                        : llvm::MachO::ARM64_RELOC_UNSIGNED))
+              (Graph.target() == Target::X86_64
+                   ? static_cast<uint32_t>(llvm::MachO::X86_64_RELOC_UNSIGNED)
+                   : static_cast<uint32_t>(llvm::MachO::ARM64_RELOC_UNSIGNED)))
         return fail();
 
     auto Exports = exportTrie(Graph);
@@ -350,8 +367,9 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
     }
     std::vector<Byte> RebaseStream;
     if (!Graph.rebases().empty()) {
-      RebaseStream.push_back(llvm::MachO::REBASE_OPCODE_SET_TYPE_IMM |
-                             llvm::MachO::REBASE_TYPE_POINTER);
+      RebaseStream.push_back(static_cast<Byte>(
+          static_cast<uint8_t>(llvm::MachO::REBASE_OPCODE_SET_TYPE_IMM) |
+          static_cast<uint8_t>(llvm::MachO::REBASE_TYPE_POINTER)));
       std::vector<const Linker::Rebase *> Ordered;
       for (const auto &Value : Graph.rebases())
         Ordered.push_back(&Value);
@@ -372,16 +390,19 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
             SegmentAddress = std::min(SegmentAddress, SectionValue.Address);
         if (SegmentAddress == UINT64_MAX)
           return fail();
-        RebaseStream.push_back(
-            llvm::MachO::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB |
-            SegmentIndex);
+        RebaseStream.push_back(static_cast<Byte>(
+            static_cast<uint8_t>(
+                llvm::MachO::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB) |
+            SegmentIndex));
         const uint64_t Address =
             Graph.sections()[Value->Section].Address + Value->Offset;
         if (Address < SegmentAddress)
           return fail();
         appendULEB(RebaseStream, Address - SegmentAddress);
-        RebaseStream.push_back(llvm::MachO::REBASE_OPCODE_DO_REBASE_IMM_TIMES |
-                               1);
+        RebaseStream.push_back(static_cast<Byte>(
+            static_cast<uint8_t>(
+                llvm::MachO::REBASE_OPCODE_DO_REBASE_IMM_TIMES) |
+            uint8_t{1}));
       }
       RebaseStream.push_back(llvm::MachO::REBASE_OPCODE_DONE);
     }
@@ -400,8 +421,12 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
       return fail();
     uint64_t StringOffset = SymbolOffset + Symbols.size() * 16;
     uint64_t FileSize = StringOffset + Strings.size();
-    if (FileSize > std::numeric_limits<size_t>::max() || FileSize > UINT32_MAX)
+    if (FileSize > UINT32_MAX)
       return fail();
+#if SIZE_MAX < UINT64_MAX
+    if (FileSize > SIZE_MAX)
+      return fail();
+#endif
     auto Segments = segments(Graph, LinkEditOffset, FileSize - LinkEditOffset);
     if (!Segments)
       return fail();
@@ -495,7 +520,7 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
     put(Bytes, Command + 16, UINT32_C(0x10000), 4);
     put(Bytes, Command + 20, UINT32_C(0x10000), 4);
     std::copy(InstallName.begin(), InstallName.end(),
-              Bytes.begin() + Command + DylibCommandPrefixSize);
+              iteratorAt(Bytes, Command + DylibCommandPrefixSize));
     Command += dylibCommandSize();
     put(Bytes, Command, llvm::MachO::LC_BUILD_VERSION, 4);
     put(Bytes, Command + 4, BuildVersionCommandSize, 4);
@@ -506,10 +531,11 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
     for (const auto &SectionValue : Graph.sections())
       if (SectionValue.Kind != SectionKind::BSS)
         std::copy(SectionValue.Content.begin(), SectionValue.Content.end(),
-                  Bytes.begin() + SectionValue.FileOffset);
+                  iteratorAt(Bytes, SectionValue.FileOffset));
     std::copy(RebaseStream.begin(), RebaseStream.end(),
-              Bytes.begin() + RebaseOffset);
-    std::copy(Exports->begin(), Exports->end(), Bytes.begin() + ExportOffset);
+              iteratorAt(Bytes, RebaseOffset));
+    std::copy(Exports->begin(), Exports->end(),
+              iteratorAt(Bytes, ExportOffset));
     for (size_t I = 0; I < Symbols.size(); ++I) {
       const auto &Value = *Symbols[I];
       const uint64_t Offset = SymbolOffset + I * 16;
@@ -520,7 +546,7 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
       put(Bytes, Offset + 8,
           Graph.sections()[Value.Section].Address + Value.Offset, 8);
     }
-    std::copy(Strings.begin(), Strings.end(), Bytes.begin() + StringOffset);
+    std::copy(Strings.begin(), Strings.end(), iteratorAt(Bytes, StringOffset));
     EXPECTED_TRY(Output.write(Bytes));
     return Output.close();
   } catch (...) {

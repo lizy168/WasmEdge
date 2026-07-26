@@ -51,10 +51,16 @@ Expect<RelocationResult> applyRISCV(const LinkGraph &Graph) {
            std::pair<const Relocation *, const Relocation *>>
       SymbolDifferences;
   for (const auto &Rel : Graph.relocations()) {
-    if (Rel.Type == llvm::ELF::R_RISCV_ADD32 ||
+    if (Rel.Type == llvm::ELF::R_RISCV_ADD8 ||
+        Rel.Type == llvm::ELF::R_RISCV_SET8 ||
+        Rel.Type == llvm::ELF::R_RISCV_SUB8 ||
+        Rel.Type == llvm::ELF::R_RISCV_ADD32 ||
         Rel.Type == llvm::ELF::R_RISCV_SUB32) {
       auto &Pair = SymbolDifferences[{Rel.Section, Rel.Offset}];
-      (Rel.Type == llvm::ELF::R_RISCV_ADD32 ? Pair.first : Pair.second) = &Rel;
+      (Rel.Type == llvm::ELF::R_RISCV_SUB8 ||
+               Rel.Type == llvm::ELF::R_RISCV_SUB32
+           ? Pair.second
+           : Pair.first) = &Rel;
     }
     if (Rel.Format != ObjectFormat::ELF ||
         Rel.Type != llvm::ELF::R_RISCV_PCREL_HI20) {
@@ -89,10 +95,13 @@ Expect<RelocationResult> applyRISCV(const LinkGraph &Graph) {
     if (Rel.Type == llvm::ELF::R_RISCV_RELAX) {
       continue;
     }
-    if (Rel.Type == llvm::ELF::R_RISCV_SUB32) {
+    if (Rel.Type == llvm::ELF::R_RISCV_SUB8 ||
+        Rel.Type == llvm::ELF::R_RISCV_SUB32) {
       continue;
     }
-    if (Rel.Type == llvm::ELF::R_RISCV_ADD32) {
+    if (Rel.Type == llvm::ELF::R_RISCV_ADD8 ||
+        Rel.Type == llvm::ELF::R_RISCV_SET8 ||
+        Rel.Type == llvm::ELF::R_RISCV_ADD32) {
       const auto Pair = SymbolDifferences.find({Rel.Section, Rel.Offset});
       if (Pair == SymbolDifferences.end() || Pair->second.first == nullptr ||
           Pair->second.second == nullptr) {
@@ -109,19 +118,19 @@ Expect<RelocationResult> applyRISCV(const LinkGraph &Graph) {
       };
       uint64_t AddAddress = 0;
       uint64_t SubAddress = 0;
+      const uint8_t Width = Rel.PatchSize;
       const auto Original =
-          readUnsigned(Bytes, Rel.Offset, InstructionWidth, Endianness::Little);
+          readUnsigned(Bytes, Rel.Offset, Width, Endianness::Little);
       if (!Original || !address(*Pair->second.first, AddAddress) ||
           !address(*Pair->second.second, SubAddress)) {
         return fail(Rel, "invalid symbol difference relocation");
       }
-      uint32_t Value = static_cast<uint32_t>(*Original);
-      Value += static_cast<uint32_t>(AddAddress) +
-               static_cast<uint32_t>(Pair->second.first->Addend);
-      Value -= static_cast<uint32_t>(SubAddress) +
-               static_cast<uint32_t>(Pair->second.second->Addend);
-      if (!writeUnsigned(Bytes, Rel.Offset, InstructionWidth,
-                         Endianness::Little, Value)) {
+      uint64_t Value = Rel.Type == llvm::ELF::R_RISCV_SET8 ? 0 : *Original;
+      Value += AddAddress + static_cast<uint64_t>(Pair->second.first->Addend);
+      Value -= SubAddress + static_cast<uint64_t>(Pair->second.second->Addend);
+      if (Width < sizeof(Value))
+        Value &= (UINT64_C(1) << (Width * 8)) - 1;
+      if (!writeUnsigned(Bytes, Rel.Offset, Width, Endianness::Little, Value)) {
         return fail(Rel, "cannot encode symbol difference");
       }
       continue;

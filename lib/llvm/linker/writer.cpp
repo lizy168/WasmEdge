@@ -46,7 +46,7 @@ Expect<void> Writer::writeByte(uint8_t Data) {
     return {};
   }
   if (DescriptorStream) {
-    DescriptorStream->write(static_cast<char>(Data));
+    DescriptorStream->write(Data);
     return DescriptorStream->has_error() ? writeError() : Expect<void>{};
   }
   Stream.put(static_cast<char>(Data));

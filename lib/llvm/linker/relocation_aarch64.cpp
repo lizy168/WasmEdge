@@ -228,7 +228,7 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
                          << BranchImmediateShift,
                      Value))
         return fail(Rel, "branch displacement overflows");
-      if ((Value & InstructionAlignmentMask) != 0 ||
+      if ((Value & static_cast<int64_t>(InstructionAlignmentMask)) != 0 ||
           !signedBits(Value, BranchDisplacementBits)) {
         return fail(Rel, "branch displacement overflows");
       }

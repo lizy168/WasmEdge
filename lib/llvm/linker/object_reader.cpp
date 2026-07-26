@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The WasmEdge Authors
 
-#include "linker/object_reader.h"
-
-#include "common/spdlog.h"
-
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4244)
 #endif
+#include <llvm/Support/JSON.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+#include "linker/object_reader.h"
+
+#include "common/spdlog.h"
 
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/ELF.h>
@@ -565,6 +569,9 @@ relocationMetadata(const llvm::object::ObjectFile &Object,
   constexpr uint8_t DoubleWordPatch = 8;
   constexpr unsigned MachORelocationLengthMax = 3;
   RelocationMetadata Metadata;
+  if (Relocation.getType() > UINT32_MAX) {
+    return std::nullopt;
+  }
   const uint32_t Type = static_cast<uint32_t>(Relocation.getType());
   if (const auto *MachO =
           llvm::dyn_cast<llvm::object::MachOObjectFile>(&Object)) {
@@ -948,16 +955,22 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
         }
       }
       const auto [Addend, Implicit] = relocationAddend(Object, InputRelocation);
-      const auto PatchSize =
-          relocationPatchSize(objectFormat(Object), *ActualTarget,
-                              static_cast<uint32_t>(InputRelocation.getType()),
-                              Metadata->PatchSize);
+      if (InputRelocation.getType() > UINT32_MAX) {
+        return fail<LinkGraph>("relocation type is out of range");
+      }
+      const uint32_t Type = static_cast<uint32_t>(InputRelocation.getType());
+      const auto PatchSize = relocationPatchSize(
+          objectFormat(Object), *ActualTarget, Type, Metadata->PatchSize);
       if (!PatchSize) {
+        spdlog::error(
+            "object reader: unsupported relocation patch size: format={}, "
+            "target={}, type={}, metadata size={}"sv,
+            static_cast<uint32_t>(objectFormat(Object)),
+            static_cast<uint32_t>(*ActualTarget), Type, Metadata->PatchSize);
         return fail<LinkGraph>("unsupported relocation patch size");
       }
       auto Added = Graph.addRelocation(Relocation{
-          Section->second, InputRelocation.getOffset(),
-          static_cast<uint32_t>(InputRelocation.getType()), Symbol->second,
+          Section->second, InputRelocation.getOffset(), Type, Symbol->second,
           Addend, Implicit, objectFormat(Object), *PatchSize,
           Metadata->PCRelative, Metadata->External, Metadata->Scattered});
       if (!Added) {
@@ -974,7 +987,3 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
 } // namespace Linker
 } // namespace LLVM
 } // namespace WasmEdge
-
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif

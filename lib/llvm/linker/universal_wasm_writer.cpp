@@ -25,6 +25,15 @@ namespace Linker {
 
 namespace {
 
+bool fitsSize(uint64_t Value) noexcept {
+#if SIZE_MAX < UINT64_MAX
+  return Value <= SIZE_MAX;
+#else
+  (void)Value;
+  return true;
+#endif
+}
+
 enum class AOTSectionKind : uint8_t {
   Text = 1,
   Data = 2,
@@ -129,7 +138,7 @@ Expect<std::vector<OutputSection>> outputSections(const LinkGraph &Graph) {
       return Unexpect(ErrCode::Value::IllegalPath);
     }
     const uint64_t Size = End - Output.Address;
-    if (Size > std::numeric_limits<size_t>::max()) {
+    if (!fitsSize(Size)) {
       return Unexpect(ErrCode::Value::IllegalPath);
     }
     if (Output.Kind != SectionKind::BSS) {
@@ -242,9 +251,14 @@ Expect<void> writeAddresses(Writer &Output, const LinkGraph &Graph) {
     return writeError();
   }
   if (FirstCode != std::numeric_limits<uint64_t>::max()) {
-    Codes.erase(Codes.begin(), Codes.begin() + static_cast<size_t>(FirstCode));
-    CodePresent.erase(CodePresent.begin(),
-                      CodePresent.begin() + static_cast<size_t>(FirstCode));
+    Codes.erase(
+        Codes.begin(),
+        Codes.begin() +
+            static_cast<std::vector<uint64_t>::difference_type>(FirstCode));
+    CodePresent.erase(
+        CodePresent.begin(),
+        CodePresent.begin() +
+            static_cast<std::vector<bool>::difference_type>(FirstCode));
   }
   if (std::find(CodePresent.begin(), CodePresent.end(), false) !=
       CodePresent.end())
