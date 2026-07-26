@@ -41,7 +41,7 @@
 #include <llvm/Object/MachO.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/CodeGen.h>
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 16
 #include <llvm/TargetParser/Host.h>
 #else
 #include <llvm/Support/Host.h>
@@ -195,8 +195,9 @@ std::vector<WasmEdge::Byte> makeObject(
   }();
   (void)Initialized;
   std::string Error;
+  llvm::Triple LookupTriple = Triple;
   const llvm::Target *NativeTarget =
-      llvm::TargetRegistry::lookupTarget(Triple.str(), Error);
+      llvm::TargetRegistry::lookupTarget("", LookupTriple, Error);
   EXPECT_NE(NativeTarget, nullptr) << Error;
   if (NativeTarget == nullptr) {
     return {};
@@ -540,8 +541,9 @@ std::vector<WasmEdge::Byte> makeAssemblyObject(const llvm::Triple &Triple,
   }();
   (void)Initialized;
   std::string Error;
+  llvm::Triple LookupTriple = Triple;
   const llvm::Target *Target =
-      llvm::TargetRegistry::lookupTarget(Triple.str(), Error);
+      llvm::TargetRegistry::lookupTarget("", LookupTriple, Error);
   EXPECT_NE(Target, nullptr) << Error;
   if (Target == nullptr) {
     return {};
@@ -1295,7 +1297,7 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsMalformedWasmAtomically) {
 TEST_F(LinkerOutputTest, NativeLinkerRejectsNonHostObjectFormatsAtomically) {
 #if defined(__x86_64__) || defined(_M_X64)
   constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
-                                                     0x01, 0x00, 0x00, 0x00};
+                                                    0x01, 0x00, 0x00, 0x00};
 #if WASMEDGE_OS_LINUX
   const std::array<const char *, 2> Triples{"x86_64-apple-macosx",
                                             "x86_64-pc-windows-msvc"};
@@ -4693,11 +4695,16 @@ TEST(EHFrameTest, DecodesStrictInt64SLEB128) {
 }
 
 TEST(EHFrameTest, ChecksResolvedAddressArithmetic) {
+  EXPECT_EQ(Internal::resolveMachOFDEAddress(0, 0, 0, INT64_MAX),
+            static_cast<uint64_t>(INT64_MAX));
+  EXPECT_EQ(Internal::resolveMachOFDEAddress(UINT64_MAX, 0, 0, INT64_MIN),
+            static_cast<uint64_t>(INT64_MAX));
   EXPECT_EQ(Internal::resolveMachOFDEAddress(UINT64_MAX - 10, 4, 3, 2),
             UINT64_MAX - 1);
   EXPECT_FALSE(Internal::resolveMachOFDEAddress(UINT64_MAX - 10, 8, 3, 1));
   EXPECT_EQ(Internal::resolveMachOFDEAddress(5, 4, 3, -2), 10U);
   EXPECT_FALSE(Internal::resolveMachOFDEAddress(0, 0, 1, -2));
+  EXPECT_FALSE(Internal::resolveMachOFDEAddress(0, 0, 0, INT64_MIN));
 }
 
 TEST(EHFrameTest, RejectsMalformedRecordsAtomically) {

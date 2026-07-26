@@ -560,7 +560,7 @@ TEST(PEWriterTest, RejectsSymbolsReferencingSortedRuntimeFunctions) {
       static_cast<uint32_t>(Graph.sections()[0].Address - ImageBase);
   const uint32_t XDataRVA =
       static_cast<uint32_t>(Graph.sections()[5].Address - ImageBase);
-  for (const auto [Offset, Value] : std::array<std::pair<size_t, uint32_t>, 3>{
+  for (const auto &[Offset, Value] : std::array<std::pair<size_t, uint32_t>, 3>{
            {{0, TextRVA}, {4, TextRVA + 4}, {8, XDataRVA}}})
     for (uint8_t I = 0; I < 4; ++I)
       (*PData)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));

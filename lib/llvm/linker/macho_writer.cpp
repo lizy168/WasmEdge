@@ -322,9 +322,10 @@ Expect<void> MachOWriter::write(const LinkGraph &Graph,
       return fail();
     for (const auto &Value : Graph.rebases())
       if (Value.Format != ObjectFormat::MachO || Value.Width != 8 ||
-          Value.Type != (Graph.target() == Target::X86_64
-                             ? llvm::MachO::X86_64_RELOC_UNSIGNED
-                             : llvm::MachO::ARM64_RELOC_UNSIGNED))
+          Value.Type !=
+              static_cast<uint32_t>(Graph.target() == Target::X86_64
+                                        ? llvm::MachO::X86_64_RELOC_UNSIGNED
+                                        : llvm::MachO::ARM64_RELOC_UNSIGNED))
         return fail();
 
     auto Exports = exportTrie(Graph);

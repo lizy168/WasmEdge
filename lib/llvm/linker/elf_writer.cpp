@@ -741,10 +741,10 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     for (size_t I = 0; I < Exports.size(); ++I) {
       const auto &SymbolValue = *Exports[I];
       const uint64_t Offset = (I + 1) * SymbolSize;
-      const uint8_t Type =
+      const uint8_t Type = static_cast<uint8_t>(
           Graph.sections()[SymbolValue.Section].Kind == SectionKind::Text
               ? llvm::ELF::STT_FUNC
-              : llvm::ELF::STT_OBJECT;
+              : llvm::ELF::STT_OBJECT);
       if (Wide) {
         put(DynSym, Offset, NameOffsets[I], 4, Endian);
         DynSym[Offset + 4] = llvm::ELF::STB_GLOBAL << 4 | Type;
@@ -1001,13 +1001,13 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     Bytes[1] = ELFMagic1;
     Bytes[2] = ELFMagic2;
     Bytes[3] = ELFMagic3;
-    Bytes[llvm::ELF::EI_CLASS] =
-        Wide ? llvm::ELF::ELFCLASS64 : llvm::ELF::ELFCLASS32;
-    Bytes[llvm::ELF::EI_DATA] = Endian == Endianness::Little
-                                    ? llvm::ELF::ELFDATA2LSB
-                                    : llvm::ELF::ELFDATA2MSB;
-    Bytes[llvm::ELF::EI_VERSION] = llvm::ELF::EV_CURRENT;
-    Bytes[llvm::ELF::EI_OSABI] = llvm::ELF::ELFOSABI_NONE;
+    Bytes[llvm::ELF::EI_CLASS] = static_cast<uint8_t>(
+        Wide ? llvm::ELF::ELFCLASS64 : llvm::ELF::ELFCLASS32);
+    Bytes[llvm::ELF::EI_DATA] = static_cast<uint8_t>(
+        Endian == Endianness::Little ? llvm::ELF::ELFDATA2LSB
+                                     : llvm::ELF::ELFDATA2MSB);
+    Bytes[llvm::ELF::EI_VERSION] = static_cast<uint8_t>(llvm::ELF::EV_CURRENT);
+    Bytes[llvm::ELF::EI_OSABI] = static_cast<uint8_t>(llvm::ELF::ELFOSABI_NONE);
     put(Bytes, 16, llvm::ELF::ET_DYN, 2, Endian);
     put(Bytes, 18, machine(Graph.target()), 2, Endian);
     put(Bytes, 20, llvm::ELF::EV_CURRENT, 4, Endian);

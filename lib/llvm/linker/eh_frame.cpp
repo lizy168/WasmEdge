@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <charconv>
 #include <cstring>
-#include <limits>
 #include <map>
 #include <set>
 #include <string_view>
@@ -35,6 +34,61 @@ bool readU64(Span<const Byte> Bytes, size_t Offset, uint64_t &Value) noexcept {
   if (Offset > Bytes.size() || Bytes.size() - Offset < sizeof(Value))
     return false;
   std::memcpy(&Value, Bytes.data() + Offset, sizeof(Value));
+  return true;
+}
+
+bool addUnsigned(uint64_t Left, uint64_t Right, uint64_t &Result) noexcept {
+  if (Right > UINT64_MAX - Left)
+    return false;
+  Result = Left + Right;
+  return true;
+}
+
+bool addSigned(uint64_t Base, int64_t Delta, uint64_t &Result) noexcept {
+  if (Delta >= 0)
+    return addUnsigned(Base, static_cast<uint64_t>(Delta), Result);
+  const uint64_t Magnitude = static_cast<uint64_t>(-(Delta + 1)) + 1;
+  if (Magnitude > Base)
+    return false;
+  Result = Base - Magnitude;
+  return true;
+}
+
+bool addAddressDelta(uint64_t First, uint64_t Second, uint64_t Third,
+                     int64_t Delta, uint64_t &Result) noexcept {
+  if (Delta < 0) {
+    uint64_t Magnitude = static_cast<uint64_t>(-(Delta + 1)) + 1;
+    const uint64_t FromThird = std::min(Third, Magnitude);
+    Third -= FromThird;
+    Magnitude -= FromThird;
+    const uint64_t FromSecond = std::min(Second, Magnitude);
+    Second -= FromSecond;
+    Magnitude -= FromSecond;
+    const uint64_t FromFirst = std::min(First, Magnitude);
+    First -= FromFirst;
+    Magnitude -= FromFirst;
+    if (Magnitude != 0)
+      return false;
+    Delta = 0;
+  }
+  return addUnsigned(First, Second, Result) &&
+         addUnsigned(Result, Third, Result) && addSigned(Result, Delta, Result);
+}
+
+bool signedDelta(uint64_t Left, uint64_t Right, int64_t &Result) noexcept {
+  if (Left >= Right) {
+    const uint64_t Difference = Left - Right;
+    if (Difference > static_cast<uint64_t>(INT64_MAX))
+      return false;
+    Result = static_cast<int64_t>(Difference);
+    return true;
+  }
+  const uint64_t Difference = Right - Left;
+  const uint64_t MinimumMagnitude = UINT64_C(1) << 63;
+  if (Difference > MinimumMagnitude)
+    return false;
+  Result = Difference == MinimumMagnitude ? INT64_MIN
+                                          : -static_cast<int64_t>(Difference);
   return true;
 }
 
@@ -193,10 +247,10 @@ Expect<int64_t> decodeSLEB128(Span<const Byte> Bytes) {
 Expect<uint64_t> resolveMachOFDEAddress(uint64_t LoadBase,
                                         uint64_t SectionAddress, uint64_t Field,
                                         int64_t Delta) {
-  const int128_t Value = int128_t(LoadBase) + SectionAddress + Field + Delta;
-  if (Value < 0 || Value > UINT64_MAX)
+  uint64_t Value = 0;
+  if (!addAddressDelta(LoadBase, SectionAddress, Field, Delta, Value))
     return Unexpect(ErrCode::Value::IllegalPath);
-  return static_cast<uint64_t>(Value);
+  return Value;
 }
 
 } // namespace Internal
@@ -228,11 +282,10 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
       uint64_t Raw = 0;
       if (!readU64(Content[I], Field, Raw))
         return fail();
-      const int128_t TargetValue = int128_t(Sections[I].InputAddress) + Field +
-                                   static_cast<int64_t>(Raw);
-      if (TargetValue < 0 || TargetValue > UINT64_MAX)
+      uint64_t Target = 0;
+      if (!addAddressDelta(Sections[I].InputAddress, Field, 0,
+                           static_cast<int64_t>(Raw), Target))
         return fail();
-      const uint64_t Target = static_cast<uint64_t>(TargetValue);
       const auto Symbol = std::find_if(
           Graph.symbols().begin(), Graph.symbols().end(),
           [&](const auto &Value) {
@@ -256,30 +309,31 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
       const auto &Symbol = Graph.symbols()[Relocation.Symbol];
       if (Symbol.Section >= Sections.size())
         return fail();
-      const int128_t Delta = int128_t(Sections[Symbol.Section].Address) +
-                             Symbol.Offset - int128_t(Sections[I].Address) -
-                             Relocation.Offset;
-      if (Delta < std::numeric_limits<int64_t>::min() ||
-          Delta > std::numeric_limits<int64_t>::max())
+      uint64_t SymbolAddress = 0;
+      uint64_t FieldAddress = 0;
+      int64_t Delta = 0;
+      if (!addUnsigned(Sections[Symbol.Section].Address, Symbol.Offset,
+                       SymbolAddress) ||
+          !addUnsigned(Sections[I].Address, Relocation.Offset, FieldAddress) ||
+          !signedDelta(SymbolAddress, FieldAddress, Delta))
         return fail();
       if (!Internal::writeSigned(Content[I], Relocation.Offset, PointerWidth,
-                                 Endianness::Little,
-                                 static_cast<int64_t>(Delta)))
+                                 Endianness::Little, Delta))
         return fail();
       Remove[J] = true;
     }
     for (const auto &[Field, SymbolId] : References) {
       const auto &Symbol = Graph.symbols()[SymbolId];
-      const int128_t S =
-          int128_t(Sections[Symbol.Section].Address) + Symbol.Offset;
-      const int128_t P = int128_t(Sections[I].Address) + Field;
-      const int128_t Delta = S - P;
-      if (Delta < std::numeric_limits<int64_t>::min() ||
-          Delta > std::numeric_limits<int64_t>::max())
+      uint64_t SymbolAddress = 0;
+      uint64_t FieldAddress = 0;
+      int64_t Delta = 0;
+      if (!addUnsigned(Sections[Symbol.Section].Address, Symbol.Offset,
+                       SymbolAddress) ||
+          !addUnsigned(Sections[I].Address, Field, FieldAddress) ||
+          !signedDelta(SymbolAddress, FieldAddress, Delta))
         return fail();
       if (!Internal::writeSigned(Content[I], Field, PointerWidth,
-                                 Endianness::Little,
-                                 static_cast<int64_t>(Delta)))
+                                 Endianness::Little, Delta))
         return fail();
     }
     EXPECTED_TRY(parse(Content[I]));
@@ -303,11 +357,11 @@ Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph) {
       continue;
     if (Symbol.Section >= Graph.sections().size())
       return fail();
-    const int128_t Address =
-        int128_t(Graph.sections()[Symbol.Section].Address) + Symbol.Offset;
-    if (Address < 0 || Address > UINT64_MAX)
+    uint64_t Address = 0;
+    if (!addUnsigned(Graph.sections()[Symbol.Section].Address, Symbol.Offset,
+                     Address))
       return fail();
-    RequiredAddresses.insert(static_cast<uint64_t>(Address));
+    RequiredAddresses.insert(Address);
   }
   if (!std::includes(FDEAddresses.begin(), FDEAddresses.end(),
                      RequiredAddresses.begin(), RequiredAddresses.end()))
