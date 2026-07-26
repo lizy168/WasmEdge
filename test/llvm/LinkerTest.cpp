@@ -1293,9 +1293,9 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsMalformedWasmAtomically) {
 }
 
 TEST_F(LinkerOutputTest, NativeLinkerRejectsNonHostObjectFormatsAtomically) {
-  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
-                                                    0x01, 0x00, 0x00, 0x00};
 #if defined(__x86_64__) || defined(_M_X64)
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                     0x01, 0x00, 0x00, 0x00};
 #if WASMEDGE_OS_LINUX
   const std::array<const char *, 2> Triples{"x86_64-apple-macosx",
                                             "x86_64-pc-windows-msvc"};

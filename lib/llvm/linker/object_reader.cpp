@@ -336,7 +336,7 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
       return false;
     }
     const bool IsCrel =
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 16
         Type == llvm::ELF::SHT_CREL;
 #else
         false;
@@ -369,7 +369,7 @@ bool validELFRelocations(Span<const Byte> Buffer) noexcept {
     }
     const uint64_t SymbolCount = SymbolSize / SymbolEntrySize;
     if (IsCrel) {
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 16
       uint64_t DeclaredCount = 0;
       uint64_t DecodedCount = 0;
       bool ValidSymbols = true;
@@ -444,7 +444,7 @@ bool isAllocatable(const llvm::object::ObjectFile &Object,
 
 SectionPurpose sectionPurpose(const llvm::object::ObjectFile &Object,
                               llvm::StringRef Name) noexcept {
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 13
   if (Name == ".ARM.exidx" || Name.starts_with(".ARM.exidx."))
 #else
   if (Name == ".ARM.exidx" || Name.startswith(".ARM.exidx."))
@@ -452,7 +452,7 @@ SectionPurpose sectionPurpose(const llvm::object::ObjectFile &Object,
     return SectionPurpose::ARMExidx;
   if (Name.contains("eh_frame"))
     return SectionPurpose::EHFrame;
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 18
   if (Name.starts_with(".pdata"))
     return SectionPurpose::PData;
   if (Name.starts_with(".xdata"))
@@ -632,7 +632,7 @@ parseCOFFExports(std::string_view Input) {
       std::tie(Token, Directives) = Directives.split(' ');
     }
     if (Token.size() < COFFExportPrefix.size() ||
-#if LLVM_VERSION_MAJOR >= 19
+#if LLVM_VERSION_MAJOR >= 18
         !Token.take_front(COFFExportPrefix.size())
              .equals_insensitive(COFFExportPrefix)) {
 #else
@@ -811,7 +811,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
           IgnorableUndefinedSymbols.insert(InputSymbol.getRawDataRefImpl());
           continue;
         }
-        spdlog::error("object reader: undefined symbol '{}'"sv, Name);
+        spdlog::error("object reader: undefined symbol '{}'"sv, Name.str());
         return Unexpect(ErrCode::Value::IllegalPath);
       }
       continue;
@@ -819,7 +819,7 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     auto InputSection = InputSymbol.getSection();
     if (!InputSection) {
       spdlog::error("object reader: cannot read section for symbol '{}': {}"sv,
-                    Name, llvm::toString(InputSection.takeError()));
+                    Name.str(), llvm::toString(InputSection.takeError()));
       return Unexpect(ErrCode::Value::IllegalPath);
     }
     if (*InputSection == Object.section_end()) {
